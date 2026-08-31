@@ -62,3 +62,13 @@ Environment=DISABLE_LOG_STATS=0
 python3 scripts/collect_mtp.py > my-run.tsv
 python3 scripts/verify_mtp_identity.py my-run.tsv
 ```
+
+## `hamster-int8.html` и `hamster-awq-truncated.html`
+
+Результаты проверки на настоящей задаче (раздел 11 в `../results.md`): обе
+сборки Qwen3.8-27B просили написать одностраничную сцену на Three.js. Промпт
+один и тот же, `temperature 0.6`, `reasoning_effort=low`, сервер пустой.
+
+Восьмибитная выдала целую страницу за 9251 токен. Четырёхбитная не дошла до
+результата за 32000 — файл обрывается на строке `/* ==== SCENE`, до неё только
+вспомогательные функции. Оба файла лежат как есть, ничего не правили.
