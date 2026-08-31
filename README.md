@@ -36,10 +36,16 @@ bash install.sh             # поставить
 | хочу | беру | движок | скорость |
 |---|---|---|---:|
 | **максимум скорости** | [`QuantTrio/Qwen3.6-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) · 20.4 ГБ | vLLM **0.2.1-pre3** | **99.6 t/s** на коде, 87.0 на прозе |
-| **самую умную из быстрых** | [`twolven/Qwen3.8-27B-abliterated-AWQ-MTP`](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP) · 18.2 ГБ | vLLM **0.2.1-pre3** | **89.2** на коде, 70.1 на прозе |
+| **самую умную из быстрых** | [`twolven/Qwen3.8-27B-abliterated-AWQ-MTP`](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP) · 18.2 ГБ | vLLM **0.2.1-pre3** | **99.4** на коде, 74.8 на прозе |
 | **самую умную вообще** | [`lmstudio-community/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-Flash-Next-GGUF) Q4_K_M · 111 ГБ | llama.cpp | 17.7 t/s, контекст 262144 |
 
 Движок для 27B — **только vLLM**: на llama.cpp та же модель даёт 30 t/s вместо 79.7. А Flash-Next наоборот, **только llama.cpp**: vLLM его архитектуру не знает вовсе.
+
+> Числа сняты на **пустом** сервере при `reasoning_effort=low`. Обе оговорки
+> существенны: на занятом сервере при `MAX_NUM_SEQS=1` замер меряет очередь
+> (у нас 44 вместо 61), а при `xhigh` модель генерит непредсказуемое
+> рассуждение, на котором черновик MTP угадывает хуже, и скорость падает.
+> Разбор в [`docs/results.md`](docs/results.md), разделы 8-10.
 
 **Числа в таблице — средние по длинному ответу, а не потолок.** Мгновенная
 скорость на том же стенде ходит от 45 до **119.7 t/s**, и ходит она по точной
