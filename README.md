@@ -38,6 +38,7 @@ bash install.sh             # поставить
 | **максимум скорости** | [`QuantTrio/Qwen3.6-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) · 20.4 ГБ | vLLM **0.2.1-pre3** | **99.6 t/s** на коде, 87.0 на прозе |
 | **самую умную из быстрых** | [`twolven/Qwen3.8-27B-abliterated-AWQ-MTP`](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP) · 18.2 ГБ | vLLM **0.2.1-pre3** | **99.4** на коде, 74.8 на прозе |
 | **самую умную вообще** | [`lmstudio-community/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-Flash-Next-GGUF) Q4_K_M · 111 ГБ | llama.cpp | 17.7 t/s, контекст 262144 |
+| **её же поточнее** | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q6_K_XL · 158 ГБ | llama.cpp | 14.5 t/s, нужно 160 ГБ ОЗУ |
 
 Движок для 27B — **только vLLM**: на llama.cpp та же модель даёт 30 t/s вместо 79.7. А Flash-Next наоборот, **только llama.cpp**: vLLM его архитектуру не знает вовсе.
 
