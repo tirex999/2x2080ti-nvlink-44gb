@@ -1,0 +1,954 @@
+
+
+Here's the complete single-file project — save as `index.html` and open in any modern browser (needs internet for the Three.js CDN and fonts).
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Low-Poly Hamster Playground</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: 'Nunito', sans-serif;
+    background: #ffedd2;
+    opacity: 0; transition: opacity .7s ease;
+  }
+  body.ready { opacity: 1; }
+  #app, #app canvas { position: fixed; inset: 0; display: block; }
+  #app canvas { cursor: grab; }
+
+  .vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 2;
+    background: radial-gradient(ellipse at 50% 38%, transparent 52%, rgba(90,45,20,.20) 100%);
+  }
+
+  .ui { position: fixed; inset: 0; pointer-events: none; z-index: 3; color: #3b2b20; }
+
+  /* ---------- title sticker ---------- */
+  .title-card {
+    position: absolute; top: 18px; left: 18px;
+    background: #fff9ee; border: 3px solid #3b2b20; border-radius: 16px;
+    box-shadow: 0 6px 0 rgba(59,43,32,.85);
+    padding: 12px 18px 13px; transform: rotate(-1.4deg);
+    transition: transform .25s ease;
+  }
+  .title-card:hover { transform: rotate(0deg) scale(1.02); }
+  .title-card h1 {
+    font-family: 'Fredoka', sans-serif; font-weight: 700;
+    font-size: clamp(19px, 2.6vw, 28px); letter-spacing: .4px; line-height: 1.1;
+  }
+  .title-card .paw { display: inline-block; animation: wiggle 3.2s ease-in-out infinite; }
+  .title-card p { font-size: 12.5px; font-weight: 700; color: #a3805f; margin-top: 3px; }
+  @keyframes wiggle { 0%,100% { transform: rotate(-10deg); } 50% { transform: rotate(12deg) translateY(-2px); } }
+
+  /* ---------- stat chips ---------- */
+  .stats { position: absolute; top: 18px; right: 18px; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .chip {
+    background: #fff9ee; border: 3px solid #3b2b20; border-radius: 999px;
+    box-shadow: 0 4px 0 rgba(59,43,32,.85);
+    padding: 6px 14px; font-size: 13px; font-weight: 800;
+    display: flex; gap: 7px; align-items: center;
+  }
+  .chip b { font-family: 'Fredoka', sans-serif; font-size: 16px; color: #e2603f; min-width: 18px; text-align: center; }
+
+  /* ---------- crew roster ---------- */
+  .roster {
+    position: absolute; bottom: 18px; left: 18px; width: 236px;
+    background: #fff9ee; border: 3px solid #3b2b20; border-radius: 16px;
+    box-shadow: 0 6px 0 rgba(59,43,32,.85);
+    padding: 11px 14px 12px;
+  }
+  .roster h2 {
+    font-family: 'Fredoka', sans-serif; font-size: 11px; font-weight: 600;
+    letter-spacing: 3px; color: #c09a72; margin-bottom: 7px;
+  }
+  .row { display: flex; align-items: center; gap: 8px; padding: 3.5px 0; }
+  .row .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3b2b20; flex: none; }
+  .row .name { font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: 14px; width: 62px; flex: none; }
+  .row .act { display: inline-block; font-size: 12px; font-weight: 800; color: #6b543f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .act.pop { animation: pop .35s ease; }
+  @keyframes pop { 0% { transform: scale(.7); } 60% { transform: scale(1.18); } 100% { transform: scale(1); } }
+
+  /* ---------- dock ---------- */
+  .dock { position: absolute; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+  .hint {
+    background: rgba(255,249,238,.88); border: 2px solid #3b2b20; border-radius: 999px;
+    padding: 6px 13px; font-size: 11.5px; font-weight: 800; color: #6b543f;
+  }
+  .btns { display: flex; gap: 10px; }
+  .btn {
+    pointer-events: auto; cursor: pointer;
+    font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: 15px;
+    padding: 10px 18px; border-radius: 999px;
+    border: 3px solid #3b2b20; box-shadow: 0 5px 0 #3b2b20;
+    transition: transform .12s ease, box-shadow .12s ease, background .25s ease;
+  }
+  .btn:hover { transform: translateY(-2px); box-shadow: 0 7px 0 #3b2b20; }
+  .btn:active { transform: translateY(3px); box-shadow: 0 2px 0 #3b2b20; }
+  .btn.snack { background: #ffd166; color: #3b2b20; }
+  .btn.night { background: #bcd9ff; color: #22315e; }
+  .btn.night.on { background: #39406e; color: #ffe9b8; border-color: #14172e; box-shadow: 0 5px 0 #14172e; }
+  .btn.night.on:hover { box-shadow: 0 7px 0 #14172e; }
+  .btn.night.on:active { box-shadow: 0 2px 0 #14172e; }
+
+  @media (max-width: 640px) {
+    .hint { display: none; }
+    .roster { width: 190px; }
+    .stats .chip { padding: 4px 10px; font-size: 11.5px; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="vignette"></div>
+
+<div class="ui">
+  <header class="title-card">
+    <h1><span class="paw">🐹</span> Low-Poly Hamster Playground</h1>
+    <p>four tiny friends · one very serious wheel</p>
+  </header>
+
+  <div class="stats">
+    <div class="chip">🌀 <b id="rpmVal">0</b> rpm</div>
+    <div class="chip">🥕 <b id="snackVal">0</b> snacks</div>
+    <div class="chip">💛 <b id="loveVal">0</b> pats</div>
+  </div>
+
+  <aside class="roster"><h2>THE CREW</h2><div id="rosterList"></div></aside>
+
+  <footer class="dock">
+    <div class="hint">drag to orbit · scroll to zoom · click a hamster for a pat</div>
+    <div class="btns">
+      <button class="btn snack" id="btnSnack">🥕 Drop a snack</button>
+      <button class="btn night" id="btnNight">🌙 Night mode</button>
+    </div>
+  </footer>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+/* ============================== CONSTANTS ============================== */
+const BED_TOP = 0.64;                 // y of the bedding surface
+const BX = 4.4, BZ = 2.95;            // roaming bounds (|x|, |z|)
+const WHEEL_X = -3.3, WHEEL_Z = -1.6;
+const WHEEL_CENTER   = new THREE.Vector3(WHEEL_X, BED_TOP + 1.24, WHEEL_Z);
+const WHEEL_APPROACH = { x: WHEEL_X, z: -0.15 };
+const BOWL_POS  = new THREE.Vector3(3.3, 0, -2.15);
+const BOWL_STAND = { x: 3.3, z: -1.3 };
+const TUN_X = 2.6, TUN_Z = 1.7;
+const TUN_WEST_P = new THREE.Vector3(1.0, BED_TOP, TUN_Z);
+const TUN_EAST_P = new THREE.Vector3(4.2, BED_TOP, TUN_Z);
+const OBSTACLES = [
+  { x1: TUN_X-1.5, z1: TUN_Z-0.95, x2: TUN_X+1.5, z2: TUN_Z+0.95 },   // tunnel
+  { x1: WHEEL_X-1.1, z1: WHEEL_Z-1.15, x2: WHEEL_X+1.1, z2: WHEEL_Z+1.15 }, // wheel
+  { x1: 2.7, z1: -2.75, x2: 3.9, z2: -1.5 },                          // bowl
+];
+const COL = {
+  day:   { bg: new THREE.Color('#ffedd2'), sky: new THREE.Color('#fff6df'), gnd: new THREE.Color('#ffd9a8'), ground: new THREE.Color('#a5dcc3') },
+  night: { bg: new THREE.Color('#252e57'), sky: new THREE.Color('#8fa3e8'), gnd: new THREE.Color('#2a3560'), ground: new THREE.Color('#3c4a78') },
+};
+
+/* ============================== RENDERER / SCENE ============================== */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = COL.day.bg.clone();
+scene.fog = new THREE.Fog(COL.day.bg.clone(), 18, 44);
+
+const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 120);
+camera.position.set(8.5, 6.5, 10.5);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.2, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 5;
+controls.maxDistance = 22;
+controls.maxPolarAngle = Math.PI * 0.47;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.7;
+controls.addEventListener('start', () => { controls.autoRotate = false; });
+
+/* ============================== LIGHTS ============================== */
+const hemi = new THREE.HemisphereLight(COL.day.sky, COL.day.gnd, 1.0);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight('#fff1cf', 1.7);
+sun.position.set(7, 11, 5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -10; sun.shadow.camera.right = 10;
+sun.shadow.camera.top = 10;   sun.shadow.camera.bottom = -10;
+sun.shadow.camera.near = 2;   sun.shadow.camera.far = 30;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+const lamp = new THREE.PointLight('#ffb45e', 0, 16, 0);
+lamp.position.set(0, 3.4, 0);
+scene.add(lamp);
+
+// hanging bulb fixture
+const bulbMat = new THREE.MeshStandardMaterial({ color: '#fff2c8', emissive: '#ffb45e', emissiveIntensity: 0, roughness: .4, flatShading: true });
+const wire = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 1.6, 5), new THREE.MeshStandardMaterial({ color: '#4a3728', flatShading: true }));
+wire.position.set(0, 4.6, 0);
+const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), bulbMat);
+bulb.position.set(0, 3.75, 0);
+scene.add(wire, bulb);
+
+// stars (visible at night)
+const starGeo = new THREE.BufferGeometry();
+{
+  const pts = [];
+  for (let i = 0; i < 220; i++) {
+    const th = Math.random() * Math.PI * 2, ph = Math.acos(Math.random() * 0.85), r = 28 + Math.random() * 8;
+    pts.push(r * Math.sin(ph) * Math.cos(th), r * Math.cos(ph) + 2, r * Math.sin(ph) * Math.sin(th));
+  }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+}
+const starMat = new THREE.PointsMaterial({ color: '#fff3c9', size: 0.22, transparent: true, opacity: 0, fog: false });
+scene.add(new THREE.Points(starGeo, starMat));
+
+/* ============================== MATERIAL HELPER ============================== */
+const mat = (color, opts = {}) => new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: .9, metalness: 0, ...opts });
+const sph = (r, w = 8, h = 6) => new THREE.SphereGeometry(r, w, h);
+
+/* ============================== OUTDOORS ============================== */
+const groundMat = mat(COL.day.ground);
+const ground = new THREE.Mesh(new THREE.CircleGeometry(18, 48), groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+function makePlant(leaf, accent) {
+  const g = new THREE.Group();
+  const pot = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.24, 0.42, 7), mat('#e0805f'));
+  pot.position.y = 0.21;
+  const b1 = new THREE.Mesh(new THREE.IcosahedronGeometry(0.42, 0), mat(leaf));
+  b1.position.y = 0.78;
+  const b2 = new THREE.Mesh(new THREE.IcosahedronGeometry(0.28, 0), mat(accent));
+  b2.position.set(0.26, 1.08, 0.08);
+  g.add(pot, b1, b2);
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  return g;
+}
+const p1 = makePlant('#58b368', '#7ec96f'); p1.position.set(-6.2, 0, 2.8);
+const p2 = makePlant('#7ec96f', '#ff9fb0'); p2.position.set(6.4, 0, -1.6); p2.scale.setScalar(0.85);
+const p3 = makePlant('#58b368', '#ffd166'); p3.position.set(5.6, 0, 4.4);  p3.scale.setScalar(0.7);
+scene.add(p1, p2, p3);
+for (let i = 0; i < 5; i++) {
+  const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.14 + Math.random() * 0.1, 0), mat('#c9c2b4'));
+  const a = Math.random() * Math.PI * 2, r = 6 + Math.random() * 5;
+  rock.position.set(Math.cos(a) * r, 0.1, Math.sin(a) * r);
+  rock.rotation.set(Math.random(), Math.random(), Math.random());
+  rock.castShadow = true;
+  scene.add(rock);
+}
+
+// painted sign
+function drawSign(ctx) {
+  ctx.clearRect(0, 0, 512, 170);
+  ctx.fillStyle = '#fff6de'; ctx.fillRect(0, 0, 512, 170);
+  ctx.strokeStyle = '#8c5a3c'; ctx.lineWidth = 14; ctx.strokeRect(7, 7, 498, 156);
+  ctx.fillStyle = '#3b2b20'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '700 76px Fredoka, "Trebuchet MS", sans-serif';
+  ctx.fillText('HAMMY PARK', 256, 74);
+  ctx.fillStyle = '#ff8a5c';
+  const paw = (cx, cy) => {
+    ctx.beginPath(); ctx.arc(cx, cy + 8, 10, 0, 7); ctx.fill();
+    for (let i = 0; i < 3; i++) {
+      const a = -Math.PI / 2 + (i - 1) * 0.7;
+      ctx.beginPath(); ctx.arc(cx + Math.cos(a) * 15, cy + Math.sin(a) * 15 - 4, 5, 0, 7); ctx.fill();
+    }
+  };
+  paw(86, 118); paw(426, 118);
+}
+const signCanvas = document.createElement('canvas'); signCanvas.width = 512; signCanvas.height = 170;
+drawSign(signCanvas.getContext('2d'));
+const signTex = new THREE.CanvasTexture(signCanvas);
+signTex.colorSpace = THREE.SRGBColorSpace;
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => { drawSign(signCanvas.getContext('2d')); signTex.needsUpdate = true; });
+}
+{
+  const sign = new THREE.Group();
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.12, 1.7, 7), mat('#8c5a3c'));
+  post.position.y = 0.85;
+  const board = new THREE.Mesh(new RoundedBoxGeometry(2.7, 0.95, 0.14, 2, 0.06), mat('#b07a4a'));
+  board.position.y = 1.95;
+  const face = new THREE.Mesh(new THREE.PlaneGeometry(2.45, 0.8), new THREE.MeshStandardMaterial({ map: signTex, roughness: .8 }));
+  face.position.set(0, 1.95, 0.075);
+  sign.add(post, board, face);
+  sign.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  sign.position.set(5.4, 0, 4.0);
+  sign.rotation.y = -0.65;
+  scene.add(sign);
+}
+
+/* ============================== CAGE ============================== */
+const cage = new THREE.Group();
+scene.add(cage);
+
+const tray = new THREE.Mesh(new RoundedBoxGeometry(10.4, 0.6, 7.4, 3, 0.16), mat('#b07a4a'));
+tray.position.y = 0.3;
+tray.castShadow = tray.receiveShadow = true;
+cage.add(tray);
+
+const bedding = new THREE.Mesh(new RoundedBoxGeometry(9.7, 0.26, 6.7, 2, 0.1), mat('#f2ddb0'));
+bedding.position.y = 0.51;
+bedding.receiveShadow = true;
+cage.add(bedding);
+
+// wood shavings
+{
+  const flakes = new THREE.InstancedMesh(new THREE.BoxGeometry(0.34, 0.035, 0.13), mat('#e6cd97'), 70);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), s = new THREE.Vector3(1, 1, 1);
+  for (let i = 0; i < 70; i++) {
+    e.set((Math.random() - 0.5) * 0.25, Math.random() * Math.PI, (Math.random() - 0.5) * 0.25);
+    q.setFromEuler(e);
+    m.compose(new THREE.Vector3((Math.random() * 2 - 1) * 4.5, BED_TOP + 0.015, (Math.random() * 2 - 1) * 3.1), q, s);
+    flakes.setMatrixAt(i, m);
+  }
+  flakes.receiveShadow = true;
+  cage.add(flakes);
+}
+
+// wire fence
+const FENCE_H = 2.3, FENCE_TOP = 0.6 + FENCE_H;
+{
+  const barMat = mat('#d7dde4', { roughness: .5, metalness: .35 });
+  const positions = [];
+  for (let x = -4.9; x <= 4.91; x += 0.55) { positions.push([x, 3.4], [x, -3.4]); }
+  for (let z = -3.35; z <= 3.36; z += 0.55) { positions.push([4.9, z], [-4.9, z]); }
+  const bars = new THREE.InstancedMesh(new THREE.BoxGeometry(0.055, FENCE_H, 0.055), barMat, positions.length);
+  const m = new THREE.Matrix4();
+  positions.forEach((p, i) => { m.makeTranslation(p[0], 0.6 + FENCE_H / 2, p[1]); bars.setMatrixAt(i, m); });
+  bars.castShadow = true;
+  cage.add(bars);
+
+  const railMat = barMat;
+  const railX = new THREE.BoxGeometry(10.5, 0.1, 0.1);
+  const railZ = new THREE.BoxGeometry(0.1, 0.1, 7.5);
+  [FENCE_TOP, 0.6 + FENCE_H * 0.5].forEach(y => {
+    [[0, 3.4, railX], [0, -3.4, railX], [4.9, 0, railZ], [-4.9, 0, railZ]].forEach(([x, z, g]) => {
+      const r = new THREE.Mesh(g, railMat);
+      r.position.set(x, y, z); r.castShadow = true;
+      cage.add(r);
+    });
+  });
+  const postGeo = new THREE.BoxGeometry(0.22, 2.5, 0.22);
+  const postMat = mat('#8c5a3c');
+  [[4.9, 3.4], [4.9, -3.4], [-4.9, 3.4], [-4.9, -3.4]].forEach(([x, z]) => {
+    const p = new THREE.Mesh(postGeo, postMat);
+    p.position.set(x, 1.8, z); p.castShadow = true;
+    cage.add(p);
+  });
+}
+
+/* ============================== PROPS ============================== */
+// --- wheel ---
+let wheelSpeed = 0, wheelOwner = null;
+const wheelSpin = new THREE.Group();
+{
+  const rig = new THREE.Group();
+  rig.position.set(WHEEL_X, BED_TOP, WHEEL_Z);
+  const wood = mat('#8c5a3c');
+  const base = new THREE.Mesh(new RoundedBoxGeometry(1.5, 0.16, 1.5, 2, 0.06), wood);
+  base.position.y = 0.08;
+  const legGeo = new THREE.CylinderGeometry(0.07, 0.07, 1.08, 7);
+  const legA = new THREE.Mesh(legGeo, wood); legA.position.set(0, 0.70, 0.55);
+  const legB = new THREE.Mesh(legGeo, wood); legB.position.set(0, 0.70, -0.55);
+  const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.5, 7), mat('#4a3728'));
+  axle.rotation.z = Math.PI / 2; axle.position.y = 1.24;
+  rig.add(base, legA, legB, axle);
+
+  wheelSpin.position.set(0, 1.24, 0);
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(1.05, 0.11, 8, 20), mat('#ff7d6b'));
+  rim.rotation.y = Math.PI / 2;
+  const runway = new THREE.Mesh(new THREE.TorusGeometry(0.82, 0.05, 6, 18), mat('#ffd166'));
+  runway.rotation.y = Math.PI / 2;
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.3, 8), mat('#4a3728'));
+  hub.rotation.z = Math.PI / 2;
+  wheelSpin.add(rim, runway, hub);
+  const spokeGeo = new THREE.CylinderGeometry(0.045, 0.045, 1.9, 6);
+  for (let i = 0; i < 5; i++) {
+    const s = new THREE.Mesh(spokeGeo, mat('#ff9f8e'));
+    s.rotation.x = i * Math.PI / 5;
+    wheelSpin.add(s);
+  }
+  rig.add(wheelSpin);
+  rig.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  scene.add(rig);
+}
+
+// --- tunnel ---
+{
+  const g = new THREE.CylinderGeometry(0.6, 0.6, 2.3, 10, 1, true, 0, Math.PI);
+  g.rotateZ(Math.PI / 2);
+  const tunnel = new THREE.Mesh(g, mat('#5bc8af', { side: THREE.DoubleSide }));
+  tunnel.position.set(TUN_X, BED_TOP + 0.6, TUN_Z);
+  tunnel.castShadow = true;
+  scene.add(tunnel);
+}
+
+// --- food bowl ---
+{
+  const bowl = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.36, 0.3, 10, 1, true), mat('#ff9fb0', { side: THREE.DoubleSide }));
+  bowl.position.set(BOWL_POS.x, BED_TOP + 0.15, BOWL_POS.z);
+  bowl.castShadow = true;
+  scene.add(bowl);
+  for (let i = 0; i < 6; i++) {
+    const seed = new THREE.Mesh(new THREE.DodecahedronGeometry(0.07, 0), mat('#a06a3a'));
+    const a = Math.random() * Math.PI * 2, r = Math.random() * 0.3;
+    seed.position.set(BOWL_POS.x + Math.cos(a) * r, BED_TOP + 0.22, BOWL_POS.z + Math.sin(a) * r);
+    seed.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    scene.add(seed);
+  }
+}
+
+/* ============================== HAMSTERS ============================== */
+function makeHamster(name, body, belly) {
+  const g = new THREE.Group();
+  const mBody = mat(body), mBelly = mat(belly), mDark = mat('#3b2b20'), mPink = mat('#ff9fb0'), mWhite = mat('#ffffff', { roughness: .3 });
+  const add = (geo, m, x, y, z, sx = 1, sy = sx, sz = sx) => {
+    const mesh = new THREE.Mesh(geo, m);
+    mesh.position.set(x, y, z); mesh.scale.set(sx, sy, sz); mesh.castShadow = true;
+    g.add(mesh); return mesh;
+  };
+  add(sph(1, 9, 7), mBody, 0, 0.30, -0.06, 0.30, 0.27, 0.36);           // body
+  add(sph(1, 8, 6), mBelly, 0, 0.26, 0.16, 0.17, 0.15, 0.16);          // chest
+  const head  = add(sph(0.24, 9, 7), mBody, 0, 0.42, 0.30);            // head
+  add(sph(0.07, 7, 5), mBody, -0.15, 0.62, 0.22);
+  add(sph(0.07, 7, 5), mBody,  0.15, 0.62, 0.22);                      // ears
+  add(sph(0.035, 6, 5), mPink, -0.16, 0.62, 0.25);
+  add(sph(0.035, 6, 5), mPink,  0.16, 0.62, 0.25);                     // inner ears
+  const eyeL = add(sph(0.042, 7, 5), mDark, -0.10, 0.46, 0.49);
+  const eyeR = add(sph(0.042, 7, 5), mDark,  0.10, 0.46, 0.49);
+  add(sph(0.014, 5, 4), mWhite, -0.085, 0.475, 0.525);
+  add(sph(0.014, 5, 4), mWhite,  0.085, 0.475, 0.525);                 // glints
+  add(sph(0.03, 6, 5), mPink, 0, 0.40, 0.535);                         // nose
+  const cheekL = add(sph(0.07, 7, 5), mBelly, -0.185, 0.35, 0.42);
+  const cheekR = add(sph(0.07, 7, 5), mBelly,  0.185, 0.35, 0.42);
+  const armL  = add(sph(0.06, 7, 5), mBelly, -0.15, 0.16, 0.20);
+  const armR  = add(sph(0.06, 7, 5), mBelly,  0.15, 0.16, 0.20);
+  const footL = add(sph(0.065, 7, 5), mBelly, -0.13, 0.085, -0.26);
+  const footR = add(sph(0.065, 7, 5), mBelly,  0.13, 0.085, -0.26);
+  add(sph(0.05, 6, 5), mBody, 0, 0.30, -0.42);                         // tail nub
+
+  g.userData = {
+    isHamster: true, name, defColor: body,
+    head, eyeL, eyeR, cheekL, cheekR, armL, armR, footL, footR,
+    state: 'wander', timer: 0, purpose: null, snack: null, eatSnack: null,
+    tx: 0, tz: 0, heading: Math.random() * Math.PI * 2,
+    phase: Math.random() * 10, moving: false, fast: false,
+    baseY: BED_TOP, blinkT: 1 + Math.random() * 3, blink: 0,
+    bounce: 0, hover: 1, hoverTarget: 1, cheek: 1, chewPhase: 0,
+    from: null, enterDur: 0.55, exitDur: 0.5, tunnelK: 0, tunnelFrom: null, tunnelTo: null, tunnelDir: 1,
+    actEl: null,
+  };
+  return g;
+}
+
+const DEFS = [
+  ['Biscuit', '#f5a94b', '#ffe3b3'],
+  ['Mochi',   '#f6ead9', '#fff7ee'],
+  ['Peanut',  '#9c6b45', '#d3a377'],
+  ['Nibbles', '#a9b7c6', '#eef3f8'],
+];
+const SPAWNS = [[-2.6, -1.4], [1.6, -1.6], [-1.8, 1.4], [2.9, -0.4]];
+const hamsters = DEFS.map(([n, b, bl], i) => {
+  const h = makeHamster(n, b, bl);
+  h.position.set(SPAWNS[i][0], BED_TOP, SPAWNS[i][1]);
+  scene.add(h);
+  return h;
+});
+const hamsterRoots = hamsters;
+
+/* ---------- roster UI ---------- */
+const rosterList = document.getElementById('rosterList');
+hamsters.forEach(h => {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `<span class="dot" style="background:${h.userData.defColor}"></span>
+                   <span class="name">${h.userData.name}</span>
+                   <span class="act">waking up…</span>`;
+  rosterList.appendChild(row);
+  h.userData.actEl = row.querySelector('.act');
+});
+function setAct(h, text) {
+  const el = h.userData.actEl; if (!el) return;
+  el.textContent = text;
+  el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop');
+}
+
+/* ============================== BEHAVIOR ============================== */
+const blocked = (x, z) => OBSTACLES.some(o => x > o.x1 && x < o.x2 && z > o.z1 && z < o.z2);
+const inBounds = (x, z) => Math.abs(x) < BX && Math.abs(z) < BZ;
+function randPoint() {
+  for (let i = 0; i < 14; i++) {
+    const x = (Math.random() * 2 - 1) * (BX - 0.2), z = (Math.random() * 2 - 1) * (BZ - 0.2);
+    if (!blocked(x, z)) return { x, z };
+  }
+  return { x: 0, z: 0 };
+}
+function lerpAngle(a, b, t) {
+  let d = (b - a) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return a + d * Math.min(1, t);
+}
+function steerTo(h, tx, tz, dt, arrive) {
+  const dx = tx - h.position.x, dz = tz - h.position.z;
+  if (Math.hypot(dx, dz) < arrive) return true;
+  const desired = Math.atan2(dx, dz), look = 0.55;
+  let chosen = null;
+  for (const off of [0, 0.55, -0.55, 1.1, -1.1, 1.7, -1.7]) {
+    const a = desired + off;
+    const px = h.position.x + Math.sin(a) * look, pz = h.position.z + Math.cos(a) * look;
+    if (inBounds(px, pz) && !blocked(px, pz)) { chosen = a; break; }
+  }
+  if (chosen === null) chosen = desired + Math.PI;
+  h.userData.heading = lerpAngle(h.userData.heading, chosen, 7 * dt);
+  h.position.x = THREE.MathUtils.clamp(h.position.x + Math.sin(h.userData.heading) * 1.1 * dt, -BX, BX);
+  h.position.z = THREE.MathUtils.clamp(h.position.z + Math.cos(h.userData.heading) * 1.1 * dt, -BZ, BZ);
+  return false;
+}
+function setState(h, s, dur = 0, log) {
+  const u = h.userData;
+  u.state = s; u.timer = dur;
+  if (log !== undefined) setAct(h, log);
+}
+function go(h, p, purpose, log) {
+  const u = h.userData;
+  u.purpose = purpose; u.snack = null; u.tx = p.x; u.tz = p.z;
+  setState(h, 'wander', 0, log);
+}
+function goTunnel(h) {
+  const u = h.userData;
+  u.purpose = 'tunnel'; u.tunnelDir = Math.random() < 0.5 ? 1 : -1;
+  u.tx = u.tunnelDir > 0 ? TUN_WEST_P.x : TUN_EAST_P.x; u.tz = TUN_Z;
+  setState(h, 'wander', 0, 'off to the tunnel');
+}
+function chooseNext(h) {
+  const u = h.userData;
+  u.purpose = null; u.snack = null;
+  const r = Math.random();
+  if (r < 0.40)              go(h, randPoint(), null, 'wandering');
+  else if (r < 0.58)         setState(h, 'pause', 1.2 + Math.random() * 2.2, 'daydreaming');
+  else if (r < 0.72)         go(h, BOWL_STAND, 'bowl', 'off to the bowl');
+  else if (r < 0.86 && !wheelOwner) go(h, WHEEL_APPROACH, 'wheel', 'zoomies to the wheel!');
+  else                       goTunnel(h);
+}
+function beginWheel(h) {
+  const u = h.userData;
+  if (wheelOwner) { chooseNext(h); return; }
+  wheelOwner = h;
+  u.state = 'wheelEnter'; u.timer = u.enterDur = 0.55;
+  u.from = h.position.clone();
+  setAct(h, 'climbing in…');
+}
+
+function updateHamster(h, dt, t) {
+  const u = h.userData;
+  u.moving = false; u.fast = false;
+
+  // blink
+  u.blinkT -= dt;
+  if (u.blinkT <= 0) { u.blink = 0.12; u.blinkT = 2 + Math.random() * 3; }
+  if (u.blink > 0) u.blink -= dt;
+  const eyeS = u.blink > 0 ? 0.15 : 1;
+  u.eyeL.scale.y = eyeS; u.eyeR.scale.y = eyeS;
+
+  switch (u.state) {
+    case 'wander': {
+      const arrived = steerTo(h, u.tx, u.tz, dt, 0.28);
+      u.moving = !arrived;
+      if (arrived) {
+        if (u.purpose === 'bowl') { u.eatPoint = BOWL_POS; setState(h, 'eat', 2.5 + Math.random() * 2, 'munching'); }
+        else if (u.purpose === 'wheel') beginWheel(h);
+        else if (u.purpose === 'tunnel') {
+          u.state = 'inTunnel'; u.tunnelK = 0;
+          u.tunnelFrom = h.position.clone();
+          u.tunnelTo = u.tunnelDir > 0 ? TUN_EAST_P : TUN_WEST_P;
+          u.heading = u.tunnelDir > 0 ? Math.PI / 2 : -Math.PI / 2;
+          setAct(h, 'hiding in the tunnel');
+        }
+        else if (u.purpose === 'snack') {
+          u.eatPoint = new THREE.Vector3(u.snack.x, 0, u.snack.z);
+          u.eatSnack = u.snack;
+          setState(h, 'eat', 2 + Math.random(), 'munching');
+        }
+        else setState(h, 'pause', 1 + Math.random() * 2.5, 'daydreaming');
+      }
+      break;
+    }
+    case 'pause': {
+      u.timer -= dt;
+      if (u.timer <= 0) chooseNext(h);
+      break;
+    }
+    case 'eat': {
+      u.timer -= dt;
+      u.heading = lerpAngle(u.heading, Math.atan2(u.eatPoint.x - h.position.x, u.eatPoint.z - h.position.z), 8 * dt);
+      u.chewPhase += dt * 9;
+      if (u.timer <= 0) {
+        if (u.eatSnack) { removeSnack(u.eatSnack); snacksEaten++; updateStats(); }
+        u.eatSnack = null;
+        chooseNext(h);
+      }
+      break;
+    }
+    case 'wheelEnter': {
+      u.timer -= dt;
+      const k = 1 - Math.max(0, u.timer) / u.enterDur, e = k * k * (3 - 2 * k);
+      h.position.lerpVectors(u.from, WHEEL_CENTER, e);
+      u.heading = lerpAngle(u.heading, Math.PI, 8 * dt);
+      u.moving = true; u.phase += dt * 10;
+      if (u.timer <= 0) { u.state = 'wheelRun'; u.timer = 4.5 + Math.random() * 3.5; setAct(h, 'RUNNING THE WHEEL 🌀'); }
+      break;
+    }
+    case 'wheelRun': {
+      u.timer -= dt;
+      u.moving = true; u.fast = true; u.phase += dt * 15;
+      h.position.y = WHEEL_CENTER.y + Math.abs(Math.sin(u.phase)) * 0.05;
+      if (u.timer <= 0) {
+        u.state = 'wheelExit'; u.timer = u.exitDur = 0.5;
+        u.from = h.position.clone(); wheelOwner = null;
+        setAct(h, 'hopping off');
+      }
+      break;
+    }
+    case 'wheelExit': {
+      u.timer -= dt;
+      const k = 1 - Math.max(0, u.timer) / u.exitDur;
+      h.position.lerpVectors(u.from, new THREE.Vector3(WHEEL_APPROACH.x, BED_TOP, WHEEL_APPROACH.z), k);
+      h.position.y = THREE.MathUtils.lerp(WHEEL_CENTER.y, BED_TOP, k) + Math.sin(k * Math.PI) * 0.5;
+      u.heading = lerpAngle(u.heading, 0, 6 * dt);
+      u.moving = true; u.phase += dt * 10;
+      if (u.timer <= 0) { u.baseY = BED_TOP; chooseNext(h); }
+      break;
+    }
+    case 'inTunnel': {
+      u.tunnelK = Math.min(1, u.tunnelK + dt / 3.2);
+      h.position.lerpVectors(u.tunnelFrom, u.tunnelTo, u.tunnelK);
+      h.position.y = BED_TOP + Math.abs(Math.sin(u.phase += dt * 8)) * 0.02;
+      u.moving = true;
+      if (u.tunnelK >= 1) chooseNext(h);
+      break;
+    }
+  }
+
+  // ----- shared animation -----
+  const selfY = ['wheelEnter', 'wheelRun', 'wheelExit', 'inTunnel'].includes(u.state);
+  if (!selfY) {
+    h.position.y = u.baseY + (u.moving ? Math.abs(Math.sin(u.phase)) * 0.035 : Math.sin(t * 2.2 + u.phase) * 0.012);
+  }
+  if (u.moving && !u.fast) u.phase += dt * 9;
+  const sw = u.moving ? Math.sin(u.phase) * (u.fast ? 0.06 : 0.045) : 0;
+  u.armL.position.y = 0.16 + sw;  u.armR.position.y = 0.16 - sw;
+  u.footL.position.y = 0.085 - sw * 0.8; u.footR.position.y = 0.085 + sw * 0.8;
+  h.rotation.y = u.heading;
+
+  // head: chewing / idle sway
+  if (u.state === 'eat') {
+    u.head.position.y = 0.42 + Math.sin(u.chewPhase) * 0.02;
+    u.head.position.z = 0.30 + Math.abs(Math.sin(u.chewPhase)) * 0.015;
+    u.head.rotation.y *= 0.9;
+  } else {
+    u.head.position.y += (0.42 - u.head.position.y) * Math.min(1, 10 * dt);
+    u.head.position.z += (0.30 - u.head.position.z) * Math.min(1, 10 * dt);
+    const sway = u.state === 'pause' ? Math.sin(t * 1.5 + u.phase) * 0.18 : 0;
+    u.head.rotation.y += (sway - u.head.rotation.y) * Math.min(1, 6 * dt);
+  }
+
+  // cheeks
+  u.cheek = THREE.MathUtils.lerp(u.cheek, u.state === 'eat' ? 1.7 : 1, Math.min(1, 5 * dt));
+  u.cheekL.scale.setScalar(u.cheek); u.cheekR.scale.setScalar(u.cheek);
+
+  // hover + pat-bounce squash & stretch
+  u.hover = THREE.MathUtils.lerp(u.hover, u.hoverTarget, Math.min(1, 10 * dt));
+  let s = 1;
+  if (u.bounce > 0) { u.bounce = Math.max(0, u.bounce - dt * 2.4); s = 1 + 0.35 * Math.sin(Math.PI * (1 - u.bounce)); }
+  h.scale.set(u.hover * (2 - s), u.hover * s, u.hover * (2 - s));
+}
+
+function separation(dt) {
+  const special = s => s.startsWith('wheel') || s === 'inTunnel';
+  for (let i = 0; i < hamsters.length; i++) for (let j = i + 1; j < hamsters.length; j++) {
+    const a = hamsters[i], b = hamsters[j], ua = a.userData, ub = b.userData;
+    if (special(ua.state) || special(ub.state)) continue;
+    const dx = a.position.x - b.position.x, dz = a.position.z - b.position.z;
+    const d = Math.hypot(dx, dz);
+    if (d > 0.001 && d < 0.6) {
+      const push = (0.6 - d) * Math.min(1, 6 * dt) * 0.5;
+      a.position.x += dx / d * push; a.position.z += dz / d * push;
+      b.position.x -= dx / d * push; b.position.z -= dz / d * push;
+    }
+  }
+}
+
+/* ============================== SNACKS ============================== */
+const snacks = [];
+let snacksEaten = 0;
+function makeCarrot() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.42, 7), mat('#ff8a3d'));
+  body.rotation.x = Math.PI; body.position.y = 0.21;
+  g.add(body);
+  for (let i = 0; i < 3; i++) {
+    const leaf = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.16, 5), mat('#6fbf5a'));
+    leaf.position.set((i - 1) * 0.06, 0.48, 0);
+    leaf.rotation.z = (i - 1) * 0.5;
+    g.add(leaf);
+  }
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  return g;
+}
+function dropSnack() {
+  if (snacks.length >= 4) return;
+  let p = null;
+  for (let i = 0; i < 24; i++) {
+    const x = (Math.random() * 2 - 1) * (BX - 0.3), z = (Math.random() * 2 - 1) * (BZ - 0.3);
+    if (!blocked(x, z)) { p = { x, z }; break; }
+  }
+  if (!p) return;
+  const mesh = makeCarrot();
+  mesh.position.set(p.x, 3.2, p.z);
+  scene.add(mesh);
+  snacks.push({ mesh, x: p.x, z: p.z, vy: 0, landed: false, owner: null });
+}
+function removeSnack(s) {
+  scene.remove(s.mesh);
+  const i = snacks.indexOf(s);
+  if (i >= 0) snacks.splice(i, 1);
+}
+function updateSnacks(dt) {
+  for (const s of snacks) {
+    if (!s.landed) {
+      s.vy -= 14 * dt;
+      s.mesh.position.y += s.vy * dt;
+      if (s.mesh.position.y <= BED_TOP + 0.21) {
+        s.mesh.position.y = BED_TOP + 0.21;
+        s.landed = true; s.mesh.scale.set(1.15, 0.8, 1.15);
+      }
+    } else if (s.mesh.scale.y < 1) {
+      s.mesh.scale.y += (1 - s.mesh.scale.y) * Math.min(1, 10 * dt);
+      s.mesh.scale.x = s.mesh.scale.z = 2 - s.mesh.scale.y;
+    }
+    if (s.landed && !s.owner) {
+      let best = null, bd = Infinity;
+      for (const h of hamsters) {
+        const u = h.userData;
+        if ((u.state === 'wander' || u.state === 'pause') && !u.purpose) {
+          const d = (h.position.x - s.x) ** 2 + (h.position.z - s.z) ** 2;
+          if (d < bd) { bd = d; best = h; }
+        }
+      }
+      if (best) {
+        s.owner = best;
+        const u = best.userData;
+        u.purpose = 'snack'; u.snack = s; u.tx = s.x; u.tz = s.z;
+        setAct(best, 'smells a carrot! 🥕');
+      }
+    }
+  }
+}
+
+/* ============================== BUBBLES ============================== */
+const bubbles = [];
+function pathRound(x, a, b, w, hh, r) {
+  x.beginPath();
+  x.moveTo(a + r, b);
+  x.arcTo(a + w, b, a + w, b + hh, r);
+  x.arcTo(a + w, b + hh, a, b + hh, r);
+  x.arcTo(a, b + hh, a, b, r);
+  x.arcTo(a, b, a + w, b, r);
+  x.closePath();
+}
+function bubble(h, text) {
+  const c = document.createElement('canvas'); c.width = 160; c.height = 140;
+  const x = c.getContext('2d');
+  x.lineJoin = 'round';
+  const bx = 10, by = 8, bw = 140, bh = 92;
+  x.fillStyle = '#fff'; x.strokeStyle = '#3b2b20'; x.lineWidth = 7;
+  pathRound(x, bx, by, bw, bh, 34); x.fill();
+  x.beginPath(); x.moveTo(70, by + bh - 2); x.lineTo(86, by + bh + 26); x.lineTo(100, by + bh - 2);
+  x.closePath(); x.fill();
+  x.beginPath(); x.moveTo(66, by + bh); x.lineTo(86, by + bh + 26); x.lineTo(104, by + bh); x.stroke();
+  pathRound(x, bx, by, bw, bh, 34); x.stroke();
+  x.fillStyle = '#e2603f';
+  x.font = '700 52px Fredoka, "Trebuchet MS", sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(text, 80, by + bh / 2 + 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+  spr.position.copy(h.position).add(new THREE.Vector3(0, 1.05, 0));
+  spr.scale.set(0.85, 0.75, 1);
+  scene.add(spr);
+  bubbles.push({ spr, t: 0 });
+}
+
+/* ============================== INTERACTION ============================== */
+const ray = new THREE.Raycaster();
+const mouse = new THREE.Vector2(10, 10);
+let loveCount = 0, downX = 0, downY = 0;
+const dom = renderer.domElement;
+
+dom.addEventListener('pointermove', e => {
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+});
+dom.addEventListener('pointerdown', e => { downX = e.clientX; downY = e.clientY; });
+dom.addEventListener('click', e => {
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(hamsterRoots, true);
+  if (!hits.length) return;
+  let o = hits[0].object;
+  while (o && !o.userData.isHamster) o = o.parent;
+  if (!o) return;
+  o.userData.bounce = 1;
+  loveCount++; updateStats();
+  bubble(o, ['♥', '!', '♪', 'yum!'][Math.floor(Math.random() * 4)]);
+  setAct(o, '💛 loves you!');
+});
+
+function hoverCheck() {
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(hamsterRoots, true);
+  let hov = null;
+  if (hits.length) {
+    let o = hits[0].object;
+    while (o && !o.userData.isHamster) o = o.parent;
+    hov = o;
+  }
+  for (const h of hamsters) h.userData.hoverTarget = (h === hov) ? 1.07 : 1;
+  dom.style.cursor = hov ? 'pointer' : 'grab';
+}
+
+/* ============================== UI ============================== */
+const rpmEl = document.getElementById('rpmVal');
+const snackEl = document.getElementById('snackVal');
+const loveEl = document.getElementById('loveVal');
+function updateStats() { snackEl.textContent = snacksEaten; loveEl.textContent = loveCount; }
+
+document.getElementById('btnSnack').addEventListener('click', dropSnack);
+let night = false, nightT = 0;
+const btnNight = document.getElementById('btnNight');
+btnNight.addEventListener('click', () => {
+  night = !night;
+  btnNight.classList.toggle('on', night);
+  btnNight.textContent = night ? '☀️ Day mode' : '🌙 Night mode';
+});
+
+/* ============================== INIT INTENTS ============================== */
+go(hamsters[0], WHEEL_APPROACH, 'wheel', 'zoomies to the wheel!');
+go(hamsters[1], BOWL_STAND, 'bowl', 'off to the bowl');
+go(hamsters[2], randPoint(), null, 'wandering');
+go(hamsters[3], randPoint(), null, 'wandering');
+updateStats();
+
+/* ============================== MAIN LOOP ============================== */
+const clock = new THREE.Clock();
+let statT = 0;
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  controls.update();
+
+  for (const h of hamsters) updateHamster(h, dt, t);
+  separation(dt);
+  updateSnacks(dt);
+
+  // wheel physics
+  const target = (wheelOwner && wheelOwner.userData.state === 'wheelRun') ? 7 : 0;
+  wheelSpeed += (target - wheelSpeed) * Math.min(1, (target > wheelSpeed ? 2.5 : 1.2) * dt);
+  if (target === 0 && Math.abs(wheelSpeed) < 0.02) wheelSpeed = 0;
+  wheelSpin.rotation.x -= wheelSpeed * dt;
+
+  // bubbles
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.t += dt;
+    b.spr.position.y += dt * 0.5;
+    b.spr.material.opacity = 1 - b.t / 1.1;
+    if (b.t > 1.1) {
+      scene.remove(b.spr);
+      b.spr.material.map.dispose();
+      b.spr.material.dispose();
+      bubbles.splice(i, 1);
+    }
+  }
+
+  // day / night blend
+  nightT = THREE.MathUtils.clamp(nightT + (night ? dt : -dt) / 0.9, 0, 1);
+  scene.background.copy(COL.day.bg).lerp(COL.night.bg, nightT);
+  scene.fog.color.copy(scene.background);
+  hemi.intensity = THREE.MathUtils.lerp(1.0, 0.35, nightT);
+  hemi.color.copy(COL.day.sky).lerp(COL.night.sky, nightT);
+  hemi.groundColor.copy(COL.day.gnd).lerp(COL.night.gnd, nightT);
+  sun.intensity = THREE.MathUtils.lerp(1.7, 0.35, nightT);
+  lamp.intensity = THREE.MathUtils.lerp(0, 2.6, nightT);
+  starMat.opacity = nightT;
+  groundMat.color.copy(COL.day.ground).lerp(COL.night.ground, nightT);
+  bulbMat.emissiveIntensity = nightT * 2;
+
+  // stats + hover
+  statT += dt;
+  if (statT > 0.25) { statT = 0; rpmEl.textContent = Math.round(wheelSpeed * 60 / (Math.PI * 2)); }
+  hoverCheck();
+
+  renderer.render(scene, camera);
+}
+tick();
+document.body.classList.add('ready');
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
+```
+
+**What's inside:**
+
+- **The cage** — rounded wooden tray, tan bedding with scattered shavings, instanced wire fence with rails and posts, all casting soft shadows.
+- **Four named hamsters** (Biscuit, Mochi, Peanut, Nibbles) built from faceted spheres with blinking eyes, swaying heads, swinging legs, and puffing cheeks when they eat.
+- **Autonomous behavior** — a small state machine: wandering with obstacle-avoidance steering, daydreaming pauses, munching at the bowl, hiding through the teal tunnel, and taking turns on the wheel (climb in → run → hop off, with the wheel spinning up and coasting down).
+- **Interactivity** — orbit/zoom camera (gently auto-rotates until you grab it), click any hamster for a squash-and-stretch pat + speech bubble, **Drop a snack** sends a carrot falling for the nearest free hamster, and **Night mode** blends the whole scene to dusk with stars and a glowing hanging bulb.
+- **Live HUD** — a "crew roster" that narrates what each hamster is doing right now, plus wheel RPM, snacks eaten, and pats given.
+
+Everything is procedural (no external assets), so it loads instantly and runs stably — just open the file.
