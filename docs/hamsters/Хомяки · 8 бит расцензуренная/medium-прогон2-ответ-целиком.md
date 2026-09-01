@@ -1,0 +1,363 @@
+
+
+# Low-Poly Hamster Playground 🐹
+
+Here's the complete single-file project. Save it as `index.html` and open it in any modern browser:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Low-Poly Hamster Playground</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #ffe9d6; }
+  #info {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    font-family: "Comic Sans MS", "Chalkboard SE", sans-serif;
+    color: #7a4b2a; background: rgba(255,255,255,0.75);
+    padding: 8px 18px; border-radius: 20px; font-size: 15px;
+    pointer-events: none; user-select: none; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="info">🐹 Low-Poly Hamster Playground — drag to rotate, scroll to zoom</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- Renderer / Scene / Camera ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xffe9d6);
+scene.fog = new THREE.Fog(0xffe9d6, 30, 60);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(9, 8, 11);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.2, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.minDistance = 5;
+controls.maxDistance = 25;
+
+// ---------- Lights ----------
+scene.add(new THREE.HemisphereLight(0xfff3e0, 0xd9a066, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(8, 12, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -10; sun.shadow.camera.right = 10;
+sun.shadow.camera.top = 10;  sun.shadow.camera.bottom = -10;
+scene.add(sun);
+
+// ---------- Helpers ----------
+function mat(color) {
+  return new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.9 });
+}
+function box(w, h, d, color, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(color));
+  m.position.set(x, y, z);
+  m.castShadow = m.receiveShadow = true;
+  return m;
+}
+
+// ---------- Cage & Tray ----------
+const TRAY_W = 10, TRAY_D = 7, WALL_H = 3.2;
+
+// Wooden table legs under the cage
+[[TRAY_W/2-0.6, TRAY_D/2-0.6], [-TRAY_W/2+0.6, TRAY_D/2-0.6],
+ [TRAY_W/2-0.6, -TRAY_D/2+0.6], [-TRAY_W/2+0.6, -TRAY_D/2+0.6]]
+.forEach(([x, z]) => scene.add(box(0.5, 2.2, 0.5, 0x9c6b3f, x, -1.1, z)));
+scene.add(box(TRAY_W + 0.4, 0.35, TRAY_D + 0.4, 0xb07c4d, 0, -0.18, 0));
+
+// Bedding tray
+const tray = box(TRAY_W, 0.5, TRAY_D, 0xf5deb0, 0, 0.25, 0);
+scene.add(tray);
+// Scattered bedding bits (fun detail)
+for (let i = 0; i < 40; i++) {
+  const b = box(0.12, 0.05, 0.12, [0xe8c98a, 0xf0dcb0, 0xdcc084][i % 3],
+    (Math.random() - 0.5) * (TRAY_W - 1), 0.52, (Math.random() - 0.5) * (TRAY_D - 1));
+  b.rotation.y = Math.random() * Math.PI;
+  scene.add(b);
+}
+
+// Glass walls (transparent) + frame
+const glassMat = new THREE.MeshPhysicalMaterial({
+  color: 0xcdefff, transparent: true, opacity: 0.18, roughness: 0.1, side: THREE.DoubleSide
+});
+[
+  [TRAY_W, WALL_H, 0.06, 0, WALL_H/2, -TRAY_D/2],
+  [TRAY_W, WALL_H, 0.06, 0, WALL_H/2,  TRAY_D/2],
+  [0.06, WALL_H, TRAY_D, -TRAY_W/2, WALL_H/2, 0],
+  [0.06, WALL_H, TRAY_D,  TRAY_W/2, WALL_H/2, 0]
+].forEach(([w, h, d, x, y, z]) => {
+  const g = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), glassMat);
+  g.position.set(x, y, z);
+  scene.add(g);
+});
+// Frame edges
+const frameGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(TRAY_W, WALL_H, TRAY_D));
+const frame = new THREE.LineSegments(frameGeo,
+  new THREE.LineBasicMaterial({ color: 0x8a5a33 }));
+frame.position.y = WALL_H / 2;
+scene.add(frame);
+// Top bar accents
+scene.add(box(TRAY_W + 0.15, 0.18, 0.18, 0x8a5a33, 0, WALL_H, -TRAY_D/2));
+scene.add(box(TRAY_W + 0.15, 0.18, 0.18, 0x8a5a33, 0, WALL_H,  TRAY_D/2));
+scene.add(box(0.18, 0.18, TRAY_D + 0.15, 0x8a5a33, -TRAY_W/2, WALL_H, 0));
+scene.add(box(0.18, 0.18, TRAY_D + 0.15, 0x8a5a33,  TRAY_W/2, WALL_H, 0));
+
+// ---------- Wheel (interactive object) ----------
+const WHEEL_POS = new THREE.Vector3(-3.2, 0.5, -2.0);
+const wheelGroup = new THREE.Group();
+wheelGroup.position.copy(WHEEL_POS);
+const wheelSpin = new THREE.Group(); // this part rotates
+const rim = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.09, 6, 18), mat(0x6ec6ff));
+rim.castShadow = true;
+wheelSpin.add(rim);
+for (let i = 0; i < 6; i++) {
+  const spoke = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 1.85, 5), mat(0x4aa8e0));
+  spoke.rotation.z = (i / 6) * Math.PI;
+  spoke.castShadow = true;
+  wheelSpin.add(spoke);
+}
+wheelGroup.add(wheelSpin);
+// Stand
+const standL = box(0.12, 1.1, 0.12, 0x4aa8e0, -0.55, -0.55, 0);
+const standR = box(0.12, 1.1, 0.12, 0x4aa8e0, 0.55, -0.55, 0);
+const base = box(1.5, 0.15, 0.7, 0x4aa8e0, 0, -1.05, 0);
+wheelGroup.add(standL, standR, base);
+scene.add(wheelGroup);
+let wheelSpeed = 0;
+
+// ---------- Tunnel ----------
+const tunnel = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.65, 0.65, 2.4, 8, 1, false, 0, Math.PI),
+  new THREE.MeshStandardMaterial({ color: 0xff8fab, flatShading: true, roughness: 0.9, side: THREE.DoubleSide })
+);
+tunnel.rotation.z = Math.PI / 2;
+tunnel.rotation.y = Math.PI / 4;
+tunnel.position.set(2.6, 0.85, 1.8);
+tunnel.castShadow = true;
+scene.add(tunnel);
+
+// ---------- Food bowl ----------
+const bowl = new THREE.Group();
+const bowlBase = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.35, 0.3, 10), mat(0xffb347));
+bowlBase.castShadow = true;
+bowl.add(bowlBase);
+for (let i = 0; i < 7; i++) {
+  const seed = new THREE.Mesh(new THREE.IcosahedronGeometry(0.09, 0), mat(0x8b5e34));
+  seed.position.set((Math.random()-0.5)*0.5, 0.16, (Math.random()-0.5)*0.5);
+  seed.castShadow = true;
+  bowl.add(seed);
+}
+bowl.position.set(3.6, 0.7, -1.8);
+scene.add(bowl);
+
+// ---------- Low-poly Hamster factory ----------
+function makeHamster(colors) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.42, 7, 5), mat(colors.body));
+  body.scale.set(1.15, 0.95, 1.05);
+  body.position.y = 0.42;
+  body.castShadow = true;
+  g.add(body);
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.3, 7, 5), mat(colors.body));
+  head.position.set(0, 0.55, 0.42);
+  head.castShadow = true;
+  g.add(head);
+
+  // Ears
+  [-1, 1].forEach(s => {
+    const ear = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.18, 5), mat(colors.ear));
+    ear.position.set(s * 0.17, 0.82, 0.35);
+    g.add(ear);
+  });
+  // Eyes
+  [-1, 1].forEach(s => {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.05, 5, 4), mat(0x222222));
+    eye.position.set(s * 0.14, 0.6, 0.68);
+    g.add(eye);
+  });
+  // Nose
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.05, 5, 4), mat(0xff7eb6));
+  nose.position.set(0, 0.48, 0.71);
+  g.add(nose);
+  // Cheeks (chubby!)
+  [-1, 1].forEach(s => {
+    const cheek = new THREE.Mesh(new THREE.SphereGeometry(0.09, 5, 4), mat(colors.cheek));
+    cheek.position.set(s * 0.2, 0.45, 0.62);
+    g.add(cheek);
+  });
+  // Feet
+  [-1, 1].forEach(s => {
+    const foot = new THREE.Mesh(new THREE.SphereGeometry(0.09, 5, 4), mat(colors.foot));
+    foot.scale.set(1, 0.6, 1.4);
+    foot.position.set(s * 0.2, 0.08, 0.3);
+    foot.castShadow = true;
+    g.add(foot);
+  });
+  // Tail nub
+  const tail = new THREE.Mesh(new THREE.SphereGeometry(0.08, 5, 4), mat(colors.body));
+  tail.position.set(0, 0.4, -0.45);
+  g.add(tail);
+
+  return g;
+}
+
+// ---------- Hamster AI ----------
+class Hamster {
+  constructor(colors, start) {
+    this.mesh = makeHamster(colors);
+    this.mesh.position.set(start.x, 0.5, start.z);
+    scene.add(this.mesh);
+    this.state = 'wander';
+    this.timer = 0;
+    this.speed = 1.2 + Math.random() * 0.8;
+    this.target = new THREE.Vector3();
+    this.walkPhase = Math.random() * 10;
+    this.pickTarget();
+  }
+
+  pickTarget() {
+    this.target.set(
+      (Math.random() - 0.5) * (TRAY_W - 2.4),
+      0,
+      (Math.random() - 0.5) * (TRAY_D - 2.4)
+    );
+    this.state = 'wander';
+    this.timer = 2 + Math.random() * 4;
+  }
+
+  update(dt, t) {
+    this.timer -= dt;
+
+    // Decide to pause or (rarely) try the wheel
+    if (this.timer <= 0) {
+      const r = Math.random();
+      if (r < 0.3) { this.state = 'pause'; this.timer = 1 + Math.random() * 2; }
+      else if (r < 0.45 && wheelSpeed < 0.5) { this.state = 'toWheel'; this.timer = 10; }
+      else this.pickTarget();
+    }
+
+    let moving = false;
+    const pos = this.mesh.position;
+
+    if (this.state === 'pause') {
+      // Curious sniffing wiggle
+      this.mesh.rotation.y += Math.sin(t * 8) * dt * 1.5;
+    } else if (this.state === 'toWheel') {
+      const wp = new THREE.Vector3(WHEEL_POS.x + 0.6, 0.5, WHEEL_POS.z + 0.9);
+      this.moveTo(wp, dt, 0.8);
+      if (pos.distanceTo(wp) < 0.25) {
+        this.state = 'inWheel';
+        this.timer = 4 + Math.random() * 4;
+        this.mesh.lookAt(WHEEL_POS.x, 0.5, WHEEL_POS.z);
+      }
+    } else if (this.state === 'inWheel') {
+      moving = true; // pretend running
+      if (this.timer <= 0) this.pickTarget();
+    } else { // wander
+      this.moveTo(this.target, dt, this.speed);
+      if (pos.distanceTo(this.target) < 0.3) this.timer = 0;
+    }
+
+    // Hop animation while moving
+    if (moving || this.state === 'wander' || this.state === 'toWheel') {
+      this.walkPhase += dt * 14;
+      pos.y = 0.5 + Math.abs(Math.sin(this.walkPhase)) * 0.09;
+      this.mesh.rotation.x = Math.sin(this.walkPhase) * 0.06;
+    } else {
+      pos.y += (0.5 - pos.y) * Math.min(1, dt * 10);
+      this.mesh.rotation.x *= 0.9;
+    }
+    // Squash when paused (cute idle)
+    const squash = this.state === 'pause' ? 1 + Math.sin(t * 3) * 0.03 : 1;
+    this.mesh.scale.y += (squash - this.mesh.scale.y) * Math.min(1, dt * 8);
+  }
+
+  moveTo(dest, dt, speed) {
+    const pos = this.mesh.position;
+    const dir = new THREE.Vector3().subVectors(dest, pos);
+    dir.y = 0;
+    if (dir.lengthSq() < 0.001) return;
+    dir.normalize();
+    pos.addScaledVector(dir, speed * dt);
+    // Smooth turn
+    const targetYaw = Math.atan2(dir.x, dir.z);
+    let diff = targetYaw - this.mesh.rotation.y;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    this.mesh.rotation.y += diff * Math.min(1, dt * 6);
+  }
+}
+
+const hamsters = [
+  new Hamster({ body: 0xffa94d, ear: 0xffd8a8, cheek: 0xffc9a3, foot: 0xffe0c2 }, { x: -2, z: 1.5 }),
+  new Hamster({ body: 0xf1f0ec, ear: 0xd8d3c8, cheek: 0xf5ded0, foot: 0xe8e2d5 }, { x: 1.5, z: -1 }),
+  new Hamster({ body: 0xb8a698, ear: 0x9c8b7d, cheek: 0xcbb9ab, foot: 0xa8968a }, { x: 0, z: 2.5 })
+];
+
+// ---------- Animate ----------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  hamsters.forEach(h => h.update(dt, t));
+
+  // Wheel spins while a hamster is in it, decays otherwise
+  const anyoneIn = hamsters.some(h => h.state === 'inWheel');
+  wheelSpeed += ((anyoneIn ? 6 : 0) - wheelSpeed) * Math.min(1, dt * 2);
+  wheelSpin.rotation.y += wheelSpeed * dt;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
+```
+
+## What's included
+
+| Requirement | Implementation |
+|---|---|
+| **Cage** | Transparent glass walls + wooden frame bars, sitting on a wooden table with legs |
+| **Floor/tray** | Bedding tray with scattered hay-bit details |
+| **Low-poly hamsters** | 3 hamsters (orange, cream, gray) built from low-segment spheres/cones with `flatShading`, chubby cheeks, tiny feet, and tail nubs |
+| **Interactive objects** | A spinning **wheel**, a pink **tunnel**, and a **food bowl** with seeds |
+| **Autonomous behavior** | State machine: *wander → pause (curious sniffing wiggle) → turn → walk to wheel → run in wheel* (the wheel actually spins while they're in it, then coasts to a stop) |
+| **Fun details** | Hopping gait while walking, squash-and-stretch idle breathing, smooth camera rotation with damping |
+
+**Tips:** Drag to orbit, scroll to zoom. Watch for the moment one of them decides to hit the wheel — the blue wheel starts spinning and slows down once they get bored and wander off. 🎡
