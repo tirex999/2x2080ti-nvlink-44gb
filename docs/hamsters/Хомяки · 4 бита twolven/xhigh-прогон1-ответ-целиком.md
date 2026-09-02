@@ -1,0 +1,708 @@
+
+
+Here's the complete **Low-Poly Hamster Playground** — a single `index.html` you can save and open straight in any modern browser. Five wiggly hamsters wander, nap, groom, munch seeds from a bowl, and take turns zooming a spinning wheel. Drag to orbit, scroll to zoom, and hover a hamster to see who they are and what they're up to.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Low-Poly Hamster Playground</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#aee7f5;
+    font-family:'Fredoka','Baloo 2','Comic Sans MS',system-ui,sans-serif}
+  #c{display:block;width:100%;height:100%;cursor:grab}
+  #c:active{cursor:grabbing}
+  .card{position:fixed;background:rgba(255,255,255,.86);backdrop-filter:blur(6px);
+    border-radius:16px;box-shadow:0 8px 24px rgba(60,90,60,.18);padding:12px 16px;color:#3a4a3a;z-index:5}
+  #title{top:16px;left:16px}
+  #title h1{margin:0;font-size:22px;letter-spacing:.3px}
+  #title p{margin:4px 0 0;font-size:13px;opacity:.8}
+  #hint{bottom:16px;left:16px;font-size:13px}
+  #seeds{top:16px;right:16px;font-size:14px;font-weight:600}
+  #tip{position:fixed;left:0;top:0;display:none;pointer-events:none;
+    background:rgba(38,44,38,.93);color:#fff;padding:6px 11px;border-radius:11px;
+    font-size:13px;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.28);z-index:9}
+  #tip b{color:#ffd98a}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="card" id="title">
+  <h1>🐹 Low-Poly Hamster Playground</h1>
+  <p>a cozy cage of wiggly little friends</p>
+</div>
+<div class="card" id="seeds">🌻 Seeds <span id="seedNum">5</span>/5</div>
+<div class="card" id="hint">🖱️ drag to orbit &nbsp;·&nbsp; scroll to zoom &nbsp;·&nbsp; hover a hamster for a peek</div>
+<div id="tip"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ---------------- constants & palettes ---------------- */
+const BED_TOP = 0.32;
+const BOUNDS = { minX:-2.75, maxX:2.75, minZ:-1.75, maxZ:1.75 };
+const OBSTACLES = [
+  { x:-2.3,  z:-1.3,  r:0.95 }, // wheel
+  { x:2.15, z:1.4,   r:0.60 }, // bowl
+  { x:0.1,  z:-1.55, r:0.75 }, // house
+  { x:1.7,  z:-0.2,  r:0.65 }, // tunnel
+];
+const WHEEL_SPOT = { x:-2.02, z:-1.3 };
+const EAT_SPOT   = { x:1.62,  z:1.4 };
+
+const PALETTE = [
+  { body:0xf2a35c, belly:0xffd9a8, cheek:0xffe3bd, ear:0xe08e42 },
+  { body:0xe9c9a3, belly:0xfff1dd, cheek:0xffe8cf, ear:0xd3a878 },
+  { body:0xa9b2c2, belly:0xe8ecf3, cheek:0xf3d9cf, ear:0x8f98ab },
+  { body:0xfbf4ea, belly:0xffffff, cheek:0xffd9d0, ear:0xf3e3d3 },
+  { body:0xd98e63, belly:0xffdcb8, cheek:0xffe0c2, ear:0xc07748 },
+];
+const NAMES = ['Noodle','Biscuit','Mochi','Pebble','Waffles'];
+const ACT = {
+  walk:['strolling','exploring','on a mission','sneaking around'],
+  nap:'napping 😴', groom:'grooming ✨', sniff:'sniffing around',
+  eatGo:'heading to snacks', eatMunch:'munching seeds',
+  wheelGo:'going for a spin', wheelRun:'zooming in the wheel!',
+  wheelLeave:'walking off',
+};
+
+/* ---------------- small helpers ---------------- */
+const rand = (a,b)=> a + Math.random()*(b-a);
+const pick = a => a[(Math.random()*a.length)|0];
+const lerp = (a,b,t)=> a + (b-a)*t;
+function lerpAngle(a,b,t){
+  let d = (b-a) % (Math.PI*2);
+  if(d > Math.PI) d -= Math.PI*2;
+  if(d < -Math.PI) d += Math.PI*2;
+  return a + d*t;
+}
+function easeOutBack(x){ const c1=1.70158,c3=c1+1; return 1+c3*Math.pow(x-1,3)+c1*Math.pow(x-1,2); }
+const std = (c,o={}) => new THREE.MeshStandardMaterial(Object.assign({color:c,roughness:.85,flatShading:true},o));
+
+function gradientTexture(top,bottom){
+  const c=document.createElement('canvas'); c.width=2; c.height=256;
+  const g=c.getContext('2d'); const gr=g.createLinearGradient(0,0,0,256);
+  gr.addColorStop(0,top); gr.addColorStop(1,bottom); g.fillStyle=gr; g.fillRect(0,0,2,256);
+  const t=new THREE.CanvasTexture(c); t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+function checkerTexture(a,b){
+  const c=document.createElement('canvas'); c.width=c.height=256;
+  const g=c.getContext('2d'); const s=64;
+  for(let y=0;y<4;y++)for(let x=0;x<4;x++){ g.fillStyle=(x+y)%2?b:a; g.fillRect(x*s,y*s,s,s); }
+  const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.repeat.set(11,11); t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+function makeSignTexture(){
+  const c=document.createElement('canvas'); c.width=512; c.height=224;
+  const g=c.getContext('2d');
+  g.fillStyle='#c98d55'; g.fillRect(0,0,512,224);
+  g.strokeStyle='rgba(120,70,30,.5)'; g.lineWidth=10; g.strokeRect(5,5,502,214);
+  g.strokeStyle='rgba(120,70,30,.3)'; g.lineWidth=4;
+  for(let i=1;i<3;i++){ g.beginPath(); g.moveTo(0,i*74.6); g.lineTo(512,i*74.6); g.stroke(); }
+  g.fillStyle='#fff7ea'; g.font='700 66px Fredoka, "Comic Sans MS", sans-serif';
+  g.textAlign='center'; g.textBaseline='middle'; g.fillText('🐹 HAMSTERS',256,120);
+  const t=new THREE.CanvasTexture(c); t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+
+/* ---------------- renderer / scene / camera ---------------- */
+const renderer = new THREE.WebGLRenderer({ canvas:document.getElementById('c'), antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = gradientTexture('#aee7f5','#eafbe4');
+scene.fog = new THREE.Fog(0xeafbe4, 17, 42);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(6.9, 4.7, 8.9);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.0, 0);
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.minDistance = 4.6; controls.maxDistance = 20;
+controls.maxPolarAngle = 1.46;
+controls.autoRotate = true; controls.autoRotateSpeed = 0.55;
+controls.addEventListener('start', ()=> controls.autoRotate = false);
+
+/* ---------------- lights ---------------- */
+scene.add(new THREE.HemisphereLight(0xdff3ff, 0xbfd9a8, 0.85));
+const sun = new THREE.DirectionalLight(0xfff2d6, 1.6);
+sun.position.set(7,11,5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.left=-9; sun.shadow.camera.right=9;
+sun.shadow.camera.top=9; sun.shadow.camera.bottom=-9;
+sun.shadow.camera.near=2; sun.shadow.camera.far=30;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+/* ---------------- floor + decorations ---------------- */
+{
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(48,48),
+    new THREE.MeshStandardMaterial({ map:checkerTexture('#cfe9c2','#c1d8a9'), roughness:1 }));
+  floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+
+  function tree(x,z,s){
+    const g=new THREE.Group();
+    const tr=new THREE.Mesh(new THREE.CylinderGeometry(.09*s,.13*s,.5*s,6), std(0x8a5a3b));
+    tr.position.y=.25*s;
+    const f1=new THREE.Mesh(new THREE.ConeGeometry(.55*s,.7*s,7), std(0x5da964));
+    f1.position.y=.72*s;
+    const f2=new THREE.Mesh(new THREE.ConeGeometry(.4*s,.55*s,7), std(0x6fbf72));
+    f2.position.y=1.12*s;
+    g.add(tr,f1,f2); g.position.set(x,0,z);
+    [tr,f1,f2].forEach(m=>m.castShadow=true);
+    scene.add(g);
+  }
+  function bush(x,z,s){
+    const b=new THREE.Mesh(new THREE.IcosahedronGeometry(.42*s,0), std(0x63a95f));
+    b.position.set(x,.3*s,z); b.scale.y=.72; b.castShadow=true; scene.add(b);
+  }
+  tree(-7.4,-3.6,1.15); tree(7.6,-3.2,1.0); tree(-6.6,4.6,1.2); tree(6.6,5.0,1.05); tree(0,-7.4,1.25); tree(9.4,1.5,0.95);
+  bush(-4.6,2.9,1.0); bush(4.9,2.7,0.9); bush(-4.9,-2.6,0.85); bush(4.7,-2.8,1.0);
+}
+
+/* ---------------- cage ---------------- */
+let signGroup;
+{
+  const wood = std(0xb98a5a,{roughness:.7});
+  const glass = new THREE.MeshPhongMaterial({ color:0xbfe8ff, transparent:true, opacity:0.17, shininess:80, depthWrite:false });
+
+  // tray / bedding
+  const tray = new THREE.Mesh(new THREE.BoxGeometry(6.4,0.32,4.4), std(0xe6d3a3,{roughness:.95}));
+  tray.position.y = 0.16; tray.castShadow = tray.receiveShadow = true; scene.add(tray);
+
+  // glass walls (front lower so we can look in)
+  const panels = [
+    [0, 1.32, -2.2, 6.4, 2.0, 0.06],
+    [-3.2, 1.32, 0, 0.06, 2.0, 4.4],
+    [ 3.2, 1.32, 0, 0.06, 2.0, 4.4],
+    [0, 0.87,  2.2, 6.4, 1.1, 0.06],
+  ];
+  for(const [x,y,z,w,h,d] of panels){
+    const p = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), glass);
+    p.position.set(x,y,z); p.renderOrder = 3; scene.add(p);
+  }
+
+  // wooden frame: corner posts + top & mid rails
+  const post = (x,z)=>{ const m=new THREE.Mesh(new THREE.BoxGeometry(.16,2.3,.16),wood); m.position.set(x,1.47,z); m.castShadow=true; scene.add(m); };
+  post(-3.2,-2.2); post(3.2,-2.2); post(-3.2,2.2); post(3.2,2.2);
+  const rail = (x,y,z,w,h,d)=>{ const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),wood); m.position.set(x,y,z); m.castShadow=true; scene.add(m); };
+  rail(0,2.62,-2.2,6.4,.14,.14); rail(0,2.62,2.2,6.4,.14,.14);
+  rail(-3.2,2.62,0,.14,.14,4.4); rail(3.2,2.62,0,.14,.14,4.4);
+  rail(0,1.5,-2.2,6.4,.1,.1); rail(-3.2,1.5,0,.1,.1,4.4); rail(3.2,1.5,0,.1,.1,4.4);
+  rail(0,1.42,2.2,6.4,.1,.1);
+
+  // hanging "HAMSTERS" sign
+  signGroup = new THREE.Group();
+  signGroup.position.set(0, 2.62, 2.32);
+  const board = new THREE.Mesh(new THREE.BoxGeometry(1.35,0.6,0.05), wood);
+  board.position.y = -0.55; board.castShadow = true;
+  const face = new THREE.Mesh(new THREE.PlaneGeometry(1.35,0.6),
+    new THREE.MeshStandardMaterial({ map:makeSignTexture(), roughness:.8 }));
+  face.position.set(0,-0.55,0.028);
+  const hang = new THREE.CylinderGeometry(0.014,0.014,0.55,5);
+  for(const s of [-1,1]){ const h=new THREE.Mesh(hang,wood); h.position.set(0.5*s,-0.275,0); signGroup.add(h); }
+  signGroup.add(board,face);
+  scene.add(signGroup);
+
+  // carrots + scattered seeds on the bedding
+  const carrot = new THREE.ConeGeometry(0.08,0.2,6);
+  const cMat = std(0xff8c42,{roughness:.7});
+  [[-1.1,0.9],[0.9,0.2],[-0.4,-0.9]].forEach(([x,z])=>{
+    const m=new THREE.Mesh(carrot,cMat);
+    m.rotation.x = Math.PI/2; m.position.set(x, BED_TOP+0.08, z);
+    m.castShadow = true; scene.add(m);
+  });
+  const seedDot = new THREE.SphereGeometry(0.05,7,6);
+  const sdMat = std(0xd9a45b,{roughness:.9});
+  for(let i=0;i<7;i++){
+    const m=new THREE.Mesh(seedDot,sdMat);
+    const a=Math.random()*Math.PI*2, r=Math.random()*1.6;
+    m.position.set(Math.cos(a)*r*1.4, BED_TOP+0.04, Math.sin(a)*r);
+    scene.add(m);
+  }
+}
+
+/* ---------------- interactive: wheel / bowl / house / tunnel ---------------- */
+const wheel = (()=>{
+  const g = new THREE.Group();
+  const wood = std(0xe8875a,{roughness:.8});
+  const spin = new THREE.Group();
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.55,0.055,6,18), wood);
+  rim.rotation.y = Math.PI/2;
+  spin.add(rim);
+  const spokeGeo = new THREE.BoxGeometry(0.05,0.05,0.5);
+  for(let i=0;i<6;i++){
+    const s = new THREE.Mesh(spokeGeo, wood);
+    const a = i*Math.PI/3;
+    s.position.set(0,0,0.275);
+    s.rotation.x = a;
+    spin.add(s);
+  }
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.09,0.14,10), wood);
+  hub.rotation.z = Math.PI/2;
+  spin.add(hub);
+  g.add(spin);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(0.9,0.06,0.5), wood);
+  base.position.y = -0.52; g.add(base);
+  const upGeo = new THREE.BoxGeometry(0.07,0.5,0.07);
+  for(const s of [-1,1]){ const u=new THREE.Mesh(upGeo,wood); u.position.set(0.3*s,-0.25,0); g.add(u); }
+  const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.035,0.035,0.72,8), wood);
+  axle.rotation.z = Math.PI/2; g.add(axle);
+  g.traverse(o=>{ if(o.isMesh) o.castShadow = true; });
+  g.position.set(-2.3, 0.87, -1.3);
+  scene.add(g);
+  return { group:g, spin };
+})();
+
+const bowl = (()=>{
+  const g = new THREE.Group();
+  const outer = new THREE.Mesh(new THREE.CylinderGeometry(0.30,0.22,0.16,12), std(0x7fc8f2,{roughness:.6}));
+  outer.position.y = 0.08; outer.castShadow = true;
+  const inner = new THREE.Mesh(new THREE.CircleGeometry(0.26,12), std(0x3f7fa8,{roughness:.8}));
+  inner.rotation.x = -Math.PI/2; inner.position.y = 0.145;
+  g.add(outer,inner);
+  g.position.set(2.15, BED_TOP, 1.4);
+  scene.add(g);
+  const seedGeo = new THREE.SphereGeometry(0.055,7,6);
+  const seedMat = std(0xd9a45b,{roughness:.9});
+  const spots = [[0,0],[0.12,0.05],[-0.11,0.06],[0.05,-0.11],[-0.06,-0.09]];
+  const seeds = [];
+  for(const [x,z] of spots){
+    const s = new THREE.Mesh(seedGeo, seedMat);
+    s.position.set(x, 0.16, z);
+    s.userData.baseY = 0.16;
+    g.add(s); seeds.push(s);
+  }
+  return { group:g, seeds, seedGeo, seedMat, spots, count:5 };
+})();
+
+// house
+{
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.85,0.7,0.85), std(0x9ad1c0,{roughness:.8}));
+  body.position.y = 0.35; body.castShadow = true;
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(0.72,0.5,4), std(0x6fae9d,{roughness:.8}));
+  roof.position.y = 0.95; roof.rotation.y = Math.PI/4; roof.castShadow = true;
+  const door = new THREE.Mesh(new THREE.CircleGeometry(0.2,14), std(0x4a6a60,{roughness:.9}));
+  door.position.set(0,0.24,0.429);
+  g.add(body,roof,door);
+  g.position.set(0.1, BED_TOP, -1.55);
+  scene.add(g);
+}
+
+// tunnel
+{
+  const g = new THREE.Group();
+  const shell = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.42,0.42,1.1,12,1,true,0,Math.PI),
+    new THREE.MeshStandardMaterial({ color:0xff7f6e, roughness:.8, flatShading:true, side:THREE.DoubleSide }));
+  shell.rotation.x = -Math.PI/2;
+  const holder = new THREE.Group();
+  holder.add(shell);
+  holder.rotation.y = Math.PI/2;
+  g.add(holder);
+  g.traverse(o=>{ if(o.isMesh) o.castShadow = true; });
+  g.position.set(1.7, BED_TOP+0.42, -0.2);
+  scene.add(g);
+}
+
+/* ---------------- hamster model ---------------- */
+function buildHamster(pal){
+  const g = new THREE.Group();
+  const mBody = std(pal.body,{roughness:.85});
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.5,10,8), mBody);
+  body.scale.set(1,0.92,1.24); body.position.y = 0.46; body.castShadow = true;
+  g.add(body);
+
+  const belly = new THREE.Mesh(new THREE.SphereGeometry(0.42,10,8), std(pal.belly,{roughness:.9}));
+  belly.scale.set(0.9,0.7,1.0); belly.position.set(0,0.38,0.28);
+  g.add(belly);
+
+  const cheekMat = std(pal.cheek,{roughness:.9});
+  const cheeks = [];
+  for(const s of [-1,1]){
+    const c = new THREE.Mesh(new THREE.SphereGeometry(0.2,10,8), cheekMat);
+    c.position.set(0.30*s,0.40,0.40);
+    g.add(c); cheeks.push(c);
+  }
+
+  const eyeMat = new THREE.MeshStandardMaterial({ color:0x2b2430, roughness:.4 });
+  const eyes = [];
+  for(const s of [-1,1]){
+    const e = new THREE.Mesh(new THREE.SphereGeometry(0.058,8,8), eyeMat);
+    e.position.set(0.235*s,0.58,0.50);
+    g.add(e); eyes.push(e);
+  }
+
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.05,0.09,8),
+    new THREE.MeshStandardMaterial({ color:0xf27d9a, roughness:.6, flatShading:true }));
+  nose.rotation.x = Math.PI/2; nose.position.set(0,0.48,0.63);
+  g.add(nose);
+
+  const earMat = std(pal.ear,{roughness:.85});
+  const ears = [];
+  for(const s of [-1,1]){
+    const e = new THREE.Mesh(new THREE.SphereGeometry(0.11,8,7), earMat);
+    e.scale.set(1,0.62,1); e.position.set(0.19*s,0.88,0.12);
+    g.add(e); ears.push(e);
+  }
+
+  const tail = new THREE.Mesh(new THREE.SphereGeometry(0.085,8,7), mBody);
+  tail.position.set(0,0.38,-0.60);
+  g.add(tail);
+
+  const feet = [];
+  const fp = [[-0.17,0.10,0.30],[0.17,0.10,0.30],[-0.17,0.10,-0.30],[0.17,0.10,-0.30]];
+  for(const [x,y,z] of fp){
+    const f = new THREE.Mesh(new THREE.SphereGeometry(0.085,8,7), mBody);
+    f.scale.set(1,0.62,1.15); f.position.set(x,y,z);
+    f.userData.bz = z; f.userData.by = y;
+    g.add(f); feet.push(f);
+  }
+
+  return { root:g, parts:{ body, belly, cheeks, eyes, ears, nose, tail, feet }, baseScale:{x:1,y:0.92,z:1.24} };
+}
+
+/* ---------------- behavior ---------------- */
+let wheelUser = null, bowlUser = null, wheelVel = 0;
+const hamsters = [], hoverMeshes = [];
+
+function randTarget(){
+  for(let i=0;i<24;i++){
+    const x = rand(BOUNDS.minX,BOUNDS.maxX), z = rand(BOUNDS.minZ,BOUNDS.maxZ);
+    if(OBSTACLES.every(o => Math.hypot(x-o.x,z-o.z) > o.r + 0.45)) return {x,z};
+  }
+  return {x:0, z:0.5};
+}
+function pickNext(h){
+  const opts = [];
+  const add = (m,w)=>{ for(let i=0;i<w;i++) opts.push(m); };
+  add('walk',5); add('nap',2); add('groom',2); add('sniff',2);
+  if(bowlUser===null && bowl.count>0) add('eat',3);
+  if(wheelUser===null) add('wheel',3);
+  return pick(opts);
+}
+function decide(h){
+  h.modeT = 0;
+  if(h.mode==='eat' && bowlUser===h) bowlUser=null;
+  if(h.mode==='wheel' && wheelUser===h) wheelUser=null;
+  if(h.mode==='nap'){ h.squash=1; h.eyeClose=0; }
+
+  let next = pickNext(h);
+  if(next===h.mode) next = pickNext(h);
+  h.mode = next; h.ignoreObs = -1;
+
+  switch(next){
+    case 'walk': h.target = randTarget(); h.action = pick(ACT.walk); break;
+    case 'nap': h.dur = rand(2.2,4.2); h.action = ACT.nap; break;
+    case 'groom': h.dur = rand(1.1,1.9); h.action = ACT.groom; break;
+    case 'sniff': h.dur = rand(0.7,1.4); h.action = ACT.sniff; break;
+    case 'eat':
+      h.sub='go'; h.dur=3.2; h.chompT=0; h.munchPhase=0;
+      bowlUser=h; h.action=ACT.eatGo; break;
+    case 'wheel':
+      h.sub='go'; h.dur=rand(3.0,5.0); h.ignoreObs=0;
+      wheelUser=h; h.action=ACT.wheelGo; break;
+  }
+}
+
+function updateHamster(h, dt, t){
+  h.modeT += dt;
+  h.spawnT += dt;
+  let moving = false;
+
+  switch(h.mode){
+    case 'walk': {
+      const dx=h.target.x-h.pos.x, dz=h.target.z-h.pos.z, d=Math.hypot(dx,dz);
+      if(d<0.22){ h.decide(); break; }
+      h.yaw = lerpAngle(h.yaw, Math.atan2(dx,dz), 1-Math.exp(-5*dt));
+      h.phase += dt*7; moving = true;
+      break;
+    }
+    case 'nap': {
+      h.squash = lerp(h.squash, 0.62, 1-Math.exp(-4*dt));
+      h.eyeClose = lerp(h.eyeClose, 1, 1-Math.exp(-8*dt));
+      if(h.modeT>h.dur) h.decide();
+      break;
+    }
+    case 'groom': {
+      if(h.modeT>h.dur) h.decide();
+      break;
+    }
+    case 'sniff': {
+      if(h.modeT>h.dur) h.decide();
+      break;
+    }
+    case 'eat': {
+      if(h.sub==='munch'){
+        h.cheekPuff=1; h.munchPhase += dt;
+        h.dip = Math.max(0, Math.sin(h.munchPhase*5.5));
+        h.chompT += dt;
+        if(h.chompT>0.5){ h.chompT=0; if(bowl.count>0) removeSeed(); }
+        if(h.modeT>h.dur){ h.cheekPuff=0; h.dip=0; h.decide(); }
+      } else {
+        const dx=EAT_SPOT.x-h.pos.x, dz=EAT_SPOT.z-h.pos.z, d=Math.hypot(dx,dz);
+        if(d<0.2){ h.sub='munch'; h.modeT=0; h.munchPhase=0; h.chompT=0; h.action=ACT.eatMunch; }
+        else { h.yaw=lerpAngle(h.yaw,Math.atan2(dx,dz),1-Math.exp(-5*dt)); h.phase+=dt*7; moving=true; }
+      }
+      break;
+    }
+    case 'wheel': {
+      if(h.sub==='run'){
+        h.runPhase += dt;
+        h.bounce = Math.abs(Math.sin(h.runPhase*9));
+        h.phase += dt*22;
+        if(h.modeT>h.dur){ h.sub='leave'; h.modeT=0; h.target=randTarget(); h.action=ACT.wheelLeave; }
+      } else {
+        const dest = (h.sub==='go') ? WHEEL_SPOT : h.target;
+        const dx=dest.x-h.pos.x, dz=dest.z-h.pos.z, d=Math.hypot(dx,dz);
+        const arrive = (h.sub==='go') ? 0.18 : 0.22;
+        if(d<arrive){
+          if(h.sub==='go'){ h.sub='run'; h.modeT=0; h.action=ACT.wheelRun; }
+          else { h.decide(); break; }
+        } else { h.yaw=lerpAngle(h.yaw,Math.atan2(dx,dz),1-Math.exp(-5*dt)); h.phase+=dt*7; moving=true; }
+      }
+      break;
+    }
+  }
+
+  // integrate movement + obstacle repulsion
+  if(moving){
+    let px=0, pz=0;
+    for(let i=0;i<OBSTACLES.length;i++){
+      if(i===h.ignoreObs) continue;
+      const o=OBSTACLES[i];
+      const dx=h.pos.x-o.x, dz=h.pos.z-o.z, d=Math.hypot(dx,dz)||0.001;
+      const min=o.r+0.32;
+      if(d<min){ const f=(1-d/min)*2.4; px+=(dx/d)*f; pz+=(dz/d)*f; }
+    }
+    const sp=0.95;
+    const vx=Math.sin(h.yaw)*sp+px, vz=Math.cos(h.yaw)*sp+pz;
+    h.pos.x = THREE.MathUtils.clamp(h.pos.x+vx*dt, BOUNDS.minX, BOUNDS.maxX);
+    h.pos.z = THREE.MathUtils.clamp(h.pos.z+vz*dt, BOUNDS.minZ, BOUNDS.maxZ);
+  }
+
+  applyVisuals(h, dt, t, moving);
+}
+
+function applyVisuals(h, dt, t, moving){
+  const k = 1-Math.exp(-10*dt);
+  const P = h.model.parts;
+
+  // pop-in
+  h.root.scale.setScalar(easeOutBack(Math.min(1, h.spawnT/0.7)));
+
+  // breathing + nap squash
+  const br = 1 + 0.025*Math.sin(t*2.2 + h.seed);
+  P.body.scale.set(h.model.baseScale.x*br, h.model.baseScale.y*h.squash, h.model.baseScale.z*br);
+
+  // waddle / bob / dip
+  let wz=0, bob=0, dipX=0;
+  if(moving){ wz=Math.sin(h.phase)*0.10; bob=Math.abs(Math.sin(h.phase))*0.045; }
+  if(h.mode==='wheel' && h.sub==='run') bob = h.bounce*0.09;
+  if(h.mode==='eat' && h.sub==='munch') dipX = h.dip*0.30;
+  if(h.mode==='sniff') dipX = Math.sin(t*7+h.seed)*0.07;
+  if(h.mode==='groom') wz = Math.sin(t*9+h.seed)*0.13;
+
+  h.root.rotation.y = h.yaw;
+  h.root.rotation.z = lerp(h.root.rotation.z, wz, k);
+  h.root.rotation.x = lerp(h.root.rotation.x, dipX, k);
+  h.root.position.set(h.pos.x, BED_TOP + bob, h.pos.z);
+
+  // feet shuffle
+  const shuffling = moving || (h.mode==='wheel' && h.sub==='run');
+  for(let i=0;i<4;i++){
+    const f=P.feet[i], ph=h.phase+i*Math.PI/2, s=shuffling?Math.sin(ph):0;
+    f.position.z = f.userData.bz + s*0.10;
+    f.position.y = f.userData.by + Math.max(0,Math.sin(ph+Math.PI/2))*(shuffling?0.05:0);
+  }
+
+  // eyes (nap close + blink)
+  for(const e of P.eyes) e.scale.y = lerp(e.scale.y, 1-h.eyeClose*0.88, k);
+  if(t>h.nextBlink){ h.blinkUntil=t+0.13; h.nextBlink=t+rand(1.8,4.5); }
+  if(t<h.blinkUntil) for(const e of P.eyes) e.scale.y=0.12;
+
+  // cheeks puff while eating
+  const puff = h.cheekPuff ? 1+0.20*Math.max(0,Math.sin((h.munchPhase||0)*5.5)) : 1;
+  for(const c of P.cheeks) c.scale.setScalar(lerp(c.scale.x,puff,k));
+
+  // ear twitches
+  if(t>h.nextTwitch){ h.earTwist=(Math.random()<0.5?-1:1)*rand(0.5,1.0); h.twistUntil=t+0.25; h.nextTwitch=t+rand(2.5,6); }
+  for(const e of P.ears) e.rotation.z = lerp(e.rotation.z, (t<h.twistUntil)?h.earTwist:0, 1-Math.exp(-12*dt));
+}
+
+/* ---------------- bowl seeds (eat / refill) ---------------- */
+const seedNumEl = document.getElementById('seedNum');
+function updateSeedHUD(){ seedNumEl.textContent = bowl.count; }
+function removeSeed(){
+  const s = bowl.seeds.find(s=>!s.userData.dying && !s.userData.gone);
+  if(!s) return;
+  s.userData.dying = tNow;
+  bowl.count--; updateSeedHUD();
+}
+function addSeed(){
+  const occupied = new Set(bowl.seeds.filter(s=>!s.userData.gone)
+    .map(s=>Math.round(s.position.x*100)+','+Math.round(s.position.z*100)));
+  let spot = bowl.spots[0];
+  for(const sp of bowl.spots){
+    const key = Math.round(sp[0]*100)+','+Math.round(sp[1]*100);
+    if(!occupied.has(key)){ spot = sp; break; }
+  }
+  const s = new THREE.Mesh(bowl.seedGeo, bowl.seedMat);
+  s.position.set(spot[0], 1.1, spot[1]);
+  s.userData.baseY = 0.16; s.userData.falling = 0;
+  bowl.group.add(s); bowl.seeds.push(s);
+  bowl.count++; updateSeedHUD();
+}
+function updateSeeds(dt, t){
+  for(const s of bowl.seeds){
+    if(s.userData.dying && !s.userData.gone){
+      const age = t - s.userData.dying;
+      s.scale.setScalar(Math.max(0.001, 1-age/0.18));
+      if(age>0.18){ s.parent.remove(s); s.userData.gone = true; }
+    }
+    if(s.userData.falling){
+      s.userData.falling += dt;
+      const p = Math.min(1, s.userData.falling/0.45);
+      s.position.y = lerp(1.1, s.userData.baseY, p*p);
+      if(p>=1) s.userData.falling = 0;
+    }
+  }
+}
+updateSeedHUD();
+
+/* ---------------- spawn hamsters ---------------- */
+function spawnHamster(i){
+  const model = buildHamster(PALETTE[i % PALETTE.length]);
+  const start = randTarget();
+  const h = {
+    model, root:model.root, name:NAMES[i],
+    pos:new THREE.Vector2(start.x,start.z),
+    yaw:Math.random()*Math.PI*2, phase:Math.random()*10,
+    mode:'walk', modeT:0, sub:'', target:randTarget(),
+    dur:3, squash:1, eyeClose:0,
+    cheekPuff:0, dip:0, bounce:0,
+    munchPhase:0, chompT:0, runPhase:0,
+    nextBlink:1+Math.random()*3, blinkUntil:0,
+    nextTwitch:2+Math.random()*4, twistUntil:0, earTwist:0,
+    seed:Math.random()*10, ignoreObs:-1,
+    spawnT:0, action:'strolling',
+  };
+  h.decide = ()=> decide(h);
+  model.root.position.set(h.pos.x, BED_TOP, h.pos.z);
+  model.root.rotation.y = h.yaw;
+  model.root.scale.setScalar(0.001);
+  scene.add(model.root);
+  model.parts.body.userData.h = h;
+  hoverMeshes.push(model.parts.body);
+  hamsters.push(h);
+  return h;
+}
+for(let i=0;i<5;i++) spawnHamster(i);
+hamsters.forEach((h,i)=>{
+  h.decide();
+  if(i%2===0){
+    h.mode='nap'; h.modeT=Math.random()*1.5; h.dur=3.2;
+    h.squash=0.7; h.eyeClose=1; h.action=ACT.nap;
+  }
+});
+
+/* ---------------- hover tooltip ---------------- */
+const tip = document.getElementById('tip');
+const ray = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let mouseMoved=false, mx=0, my=0;
+renderer.domElement.addEventListener('pointermove', e=>{ mx=e.clientX; my=e.clientY; mouseMoved=true; });
+function doHover(){
+  if(!mouseMoved) return;
+  mouseMoved=false;
+  mouse.x=(mx/innerWidth)*2-1; mouse.y=-(my/innerHeight)*2+1;
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(hoverMeshes, false);
+  if(hits.length){
+    const h = hits[0].object.userData.h;
+    tip.innerHTML = `<b>${h.name}</b> · ${h.action}`;
+    tip.style.display='block';
+    tip.style.transform=`translate(${mx+14}px,${my+14}px)`;
+    renderer.domElement.style.cursor='pointer';
+  } else {
+    tip.style.display='none';
+    renderer.domElement.style.cursor='grab';
+  }
+}
+
+/* ---------------- resize ---------------- */
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+/* ---------------- main loop ---------------- */
+const clock = new THREE.Clock();
+let tNow = 0, refillT = 0;
+function loop(){
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  tNow = t;
+
+  controls.update();
+
+  // wheel spin (driven by whoever is running in it)
+  const wheelActive = hamsters.some(h => h.mode==='wheel' && h.sub==='run');
+  const wt = wheelActive ? 5.4 : 0;
+  wheelVel = lerp(wheelVel, wt, 1-Math.exp(-(wt?2.6:1.3)*dt));
+  wheel.spin.rotation.x -= wheelVel*dt;
+
+  // sign sway
+  signGroup.rotation.z = Math.sin(t*1.35)*0.05;
+  signGroup.rotation.x = Math.sin(t*0.9+1)*0.02;
+
+  // bowl seeds (dying + falling) + refill
+  updateSeeds(dt, t);
+  refillT += dt;
+  if(refillT>16){ refillT=0; if(bowl.count<5) addSeed(); }
+
+  // hamsters
+  for(const h of hamsters) updateHamster(h, dt, t);
+
+  doHover();
+  renderer.render(scene, camera);
+}
+loop();
+</script>
+</body>
+</html>
+```
+
+**How to run:** save the snippet as `index.html` and double‑click it (Three.js loads from a CDN, so you need an internet connection on first load).
+
+**What's inside:**
+- **Cage & tray** — a wooden‑framed, glass‑walled enclosure with a sandy bedding floor, a swaying "🐹 HAMSTERS" sign, and scattered carrots and seeds.
+- **Five low‑poly hamsters** — faceted, flat‑shaded blobs with cheeks, ears, eyes, noses, tails, and stubby feet, each in a different cute color with a silly name.
+- **Autonomous behavior** — each hamster wanders, pauses, sniffs, grooms, naps (squashing down with closed eyes), blinks, twitches its ears, and puffs its cheeks while eating.
+- **Two interactive objects** — a **hamster wheel** that spins up when a hamster runs in it (with a fast foot‑shuffle and bounce) and coasts to a stop afterward, and a **food bowl** where seeds get nibbled away one by one and periodically rain back in.
+- **Camera & UI** — damped orbit/zoom controls with a gentle auto‑rotate until you grab it, soft shadows, a pastel checkerboard yard with trees and bushes, a title card, a live seed counter, and a hover tooltip that names each hamster and reports what it's doing.
