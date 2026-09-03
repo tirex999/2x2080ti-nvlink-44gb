@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>mc.html</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:monospace}
+#game-container{position:relative;width:100%;height:100%}
+canvas{display:block}
+#crosshair{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:24px;pointer-events:none;text-shadow:0 0 2px #000;z-index:10;user-select:none}
+#hotbar{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:2px;z-index:10;user-select:none}
+.hotbar-slot{width:48px;height:48px;border:2px solid rgba(80,80,80,0.8);background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;flex-direction:column;position:relative}
+.hotbar-slot.selected{border-color:#fff}
+.slot-color{width:28px;height:28px}
+.slot-num{font-size:10px;color:#fff;margin-top:1px;text-shadow:1px 1px 1px #000}
+#overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:20;cursor:pointer}
+#overlay h1{color:#fff;font-size:48px;margin-bottom:20px;text-shadow:2px 2px 4px #000}
+#overlay .controls{color:#ccc;font-size:14px;line-height:2;text-align:left}
+#overlay .play{color:#fff;font-size:20px;margin-top:30px}
+</style>
+</head>
+<body>
+<div id="game-container">
+<canvas id="c"></canvas>
+<div id="crosshair">+</div>
+<div id="hotbar"></div>
+<div id="overlay">
+<h1>mc.html</h1>
+<div class="controls">
+WASD — Move<br>
+Space — Jump<br>
+Left Click — Break block<br>
+Right Click — Place block<br>
+1-7 / Scroll — Select block<br>
+</div>
+<div class="play">Click to play</div>
+</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+
+// === BLOCK TYPES ===
+var AIR=0,GRASS=1,DIRT=2,STONE=3,SAND=4,WOOD=5,LEAVES=6,SNOW=7;
+var BLOCK_COLORS=[0x000000,0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff];
+var BLOCK_NAMES=['Air','Grass','Dirt','Stone','Sand','Wood','Leaves','Snow'];
+var HOTBAR_BLOCKS=[GRASS,DIRT,STONE,SAND,WOOD,LEAVES,SNOW];
+
+// === NOISE FUNCTIONS ===
+function hashCoord(ix,iy){
+ var h=(ix*374761393+iy*668265263)|0;
+ h=((h^(h>>>13))*1274126177)|0;
+ return((h^(h>>>16))&0x7fffffff)/0x7fffffff;
+}
+function hashCoord3(ix,iy,iz){
+ var h=(ix*374761393+iy*668265263+iz*2343623431)|0;
+ h=((h^(h>>>13))*1274126177)|0;
+ return((h^(h>>>16))&0x7fffffff)/0x7fffffff;
+}
+function smoothstep(t){return t*t*(3-2*t)}
+function lerp(a,b,t){return a+(b-a)*t}
+
+function smoothNoise2D(x,y){
+ var ix=Math.floor(x),iy=Math.floor(y);
+ var fx=x-ix,fy=y-iy;
+ var sx=smoothstep(fx),sy=smoothstep(fy);
+ var v00=hashCoord(ix,iy),v10=hashCoord(ix+1,iy);
+ var v01=hashCoord(ix,iy+1),v11=hashCoord(ix+1,iy+1);
+ return lerp(lerp(v00,v10,sx),lerp(v01,v11,sx),sy);
+}
+
+function fractalNoise2D(x,y,octaves){
+ var total=0,amp=1,freq=1,maxAmp=0;
+ for(var i=0;i<octaves;i++){
+  total+=smoothNoise2D(x*freq,y*freq)*amp;
+  maxAmp+=amp;
+  amp*=0.5;
+  freq*=2;
+ }
+ return total/maxAmp;
+}
+
+function smoothNoise3D(x,y,z){
+ var ix=Math.floor(x),iy=Math.floor(y),iz=Math.floor(z);
+ var fx=x-ix,fy=y-iy,fz=z-iz;
+ var sx=smoothstep(fx),sy=smoothstep(fy),sz=smoothstep(fz);
+ var v000=hashCoord3(ix,iy,iz),v100=hashCoord3(ix+1,iy,iz);
+ var v010=hashCoord3(ix,iy+1,iz),v110=hashCoord3(ix+1,iy+1,iz);
+ var v001=hashCoord3(ix,iy,iz+1),v101=hashCoord3(ix+1,iy,iz+1);
+ var v011=hashCoord3(ix,iy+1,iz+1),v111=hashCoord3(ix+1,iy+1,iz+1);
+ var i0=lerp(lerp(v000,v100,sx),lerp(v010,v110,sx),sy);
+ var i1=lerp(lerp(v001,v101,sx),lerp(v011,v111,sx),sy);
+ return lerp(i0,i1,sz);
+}
+
+function fractalNoise3D(x,y,z,octaves){
+ var total=0,amp=1,freq=1,maxAmp=0;
+ for(var i=0;i<octaves;i++){
+  total+=smoothNoise3D(x*freq,y*freq,z*freq)*amp;
+  maxAmp+=amp;
+  amp*=0.5;
+  freq*=2;
+ }
+ return total/maxAmp;
+}
+
+// === CHUNK SYSTEM ===
+var CHUNK_SIZE=16;
+var CHUNK_HEIGHT=80;
+var CHUNK_DATA_SIZE=CHUNK_SIZE*CHUNK_SIZE*CHUNK_HEIGHT;
+var chunks=new Map(); // key "cx,cz" -> {data:Uint8Array, mesh:Mesh|null, built:boolean}
+
+function chunkKey(cx,cz){return cx+','+cz}
+
+function localIndex(lx,ly,lz){return lx+CHUNK_SIZE*(lz+CHUNK_HEIGHT*ly)}
+
+function getBlock(wx,wy,wz){
+ if(wy<0||wy>=CHUNK_HEIGHT) return AIR;
+ var cx=Math.floor(wx/CHUNK_SIZE);
+ var cz=Math.floor(wz/CHUNK_SIZE);
+ var key=chunkKey(cx,cz);
+ var chunk=chunks.get(key);
+ if(!chunk) return AIR;
+ var lx=((wx%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+ var lz=((wz%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+ return chunk.data[localIndex(lx,wy,lz)];
+}
+
+function setBlock(wx,wy,wz,id){
+ if(wy<0||wy>=CHUNK_HEIGHT) return;
+ var cx=Math.floor(wx/CHUNK_SIZE);
+ var cz=Math.floor(wz/CHUNK_SIZE);
+ var key=chunkKey(cx,cz);
+ var chunk=chunks.get(key);
+ if(!chunk) return;
+ var lx=((wx%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+ var lz=((wz%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+ chunk.data[localIndex(lx,wy,lz)]=id;
+}
+
+// === TERRAIN GENERATION ===
+function generateChunkData(cx,cz){
+ var key=chunkKey(cx,cz);
+ if(chunks.has(key)) return;
+ var data=new Uint8Array(CHUNK_DATA_SIZE);
+ var wx0=cx*CHUNK_SIZE, wz0=cz*CHUNK_SIZE;
+ for(var lz=0;lz<CHUNK_SIZE;lz++){
+  for(var lx=0;lx<CHUNK_SIZE;lx++){
+   var wx=wx0+lx, wz=wz0+lz;
+   var m=fractalNoise2D(wx*0.004,wz*0.004,4);
+   var h=fractalNoise2D(wx*0.02,wz*0.02,4);
+   var H=Math.floor(5+m*m*58+h*10);
+   H=Math.max(0,Math.min(CHUNK_HEIGHT-1,H));
+
+   for(var y=0;y<CHUNK_HEIGHT;y++){
+    var idx=localIndex(lx,y,lz);
+    if(y===0){
+     data[idx]=STONE; // unbreakable base
+    } else if(y<H-3){
+     data[idx]=STONE;
+    } else if(y<H){
+     if(H<=16) data[idx]=SAND;
+     else if(H>=37) data[idx]=STONE;
+     else data[idx]=DIRT;
+    } else if(y===H){
+     if(H>=46) data[idx]=SNOW;
+     else if(H>=37) data[idx]=STONE;
+     else if(H<=16) data[idx]=SAND;
+     else data[idx]=GRASS;
+    } else {
+     data[idx]=AIR;
+    }
+   }
+   // Caves
+   for(var y=3;y<H-1&&y<CHUNK_HEIGHT;y++){
+    var caveNoise=fractalNoise3D(wx*0.09,y*0.09,wz*0.09,3);
+    if(caveNoise>0.67){
+     var idx=localIndex(lx,y,lz);
+     if(data[idx]!==STONE) data[idx]=AIR; // don't cave into surface
+    }
+   }
+  }
+ }
+ // Trees
+ for(var lz=0;lz<CHUNK_SIZE;lz++){
+  for(var lx=0;lx<CHUNK_SIZE;lx++){
+   var wx=wx0+lx, wz=wz0+lz;
+   var treeHash=hashCoord(wx*7+wz*13,wx*11+wz*17);
+   if(treeHash<0.02){
+    // Find surface
+    var surfY=-1;
+    for(var y=CHUNK_HEIGHT-1;y>=0;y--){
+     if(data[localIndex(lx,y,lz)]===GRASS){surfY=y;break;}
+    }
+    if(surfY<0) continue;
+    // Check trunk fits in chunk
+    if(surfY+4>=CHUNK_HEIGHT) continue;
+    if(surfY+4<0) continue;
+    // Place trunk (4 blocks)
+    for(var ty=1;ty<=4;ty++){
+     var idx=localIndex(lx,surfY+ty,lz);
+     if(idx>=0&&idx<CHUNK_DATA_SIZE) data[idx]=WOOD;
+    }
+    // Leaves: 5x5 at surfY+5 and surfY+6
+    for(var ly=0;ly<2;ly++){
+     var leafY=surfY+5+ly;
+     if(leafY>=CHUNK_HEIGHT) continue;
+     for(var dx=-2;dx<=2;dx++){
+      for(var dz=-2;dz<=2;dz++){
+       var nlx=lx+dx,nlz=lz+dz;
+       if(nlx>=0&&nlx<CHUNK_SIZE&&nlz>=0&&nlz<CHUNK_SIZE){
+        var idx=localIndex(nlx,leafY,nlz);
+        if(data[idx]===AIR) data[idx]=LEAVES;
+       }
+      }
+     }
+    }
+    // 3x3 at surfY+7
+    var leafY=surfY+7;
+    if(leafY<CHUNK_HEIGHT){
+     for(var dx=-1;dx<=1;dx++){
+      for(var dz=-1;dz<=1;dz++){
+       var nlx=lx+dx,nlz=lz+dz;
+       if(nlx>=0&&nlx<CHUNK_SIZE&&nlz>=0&&nlz<CHUNK_SIZE){
+        var idx=localIndex(nlx,leafY,nlz);
+        if(data[idx]===AIR) data[idx]=LEAVES;
+       }
+      }
+     }
+    }
+    // 1 on top at surfY+8
+    leafY=surfY+8;
+    if(leafY<CHUNK_HEIGHT){
+     var idx=localIndex(lx,leafY,lz);
+     if(data[idx]===AIR) data[idx]=LEAVES;
+    }
+   }
+  }
+ }
+ chunks.set(key,{data:data,mesh:null,built:false});
+}
+
+// === MESH BUILDING ===
+var chunkMeshes=[]; // array of active meshes for raycasting
+
+// Face definitions: [axis, sign, normal_x, normal_y, normal_z, lightMultiplier]
+// For each face: direction of neighbor to check, normal pointing outward, light factor
+var FACES=[
+ {axis:'x',sign:1,nx:1,ny:0,nz:0,light:0.8},  // +x
+ {axis:'x',sign:-1,nx:-1,ny:0,nz:0,light:0.8}, // -x
+ {axis:'z',sign:1,nx:0,ny:0,nz:1,light:0.8},  // +z
+ {axis:'z',sign:-1,nx:0,ny:0,nz:-1,light:0.8},// -z
+ {axis:'y',sign:1,nx:0,ny:1,nz:0,light:1.0},  // +y (top)
+ {axis:'y',sign:-1,nx:0,ny:-1,nz:0,light:0.55}// -y (bottom)
+];
+
+// Vertex offsets for a unit cube face (CCW winding from outside)
+var FACE_VERTS=[
+ // +x face
+ [[1,0,0],[1,1,0],[1,1,1],[1,0,0],[1,1,1],[1,0,1]],
+ // -x face
+ [[0,0,1],[0,1,1],[0,1,0],[0,0,1],[0,1,0],[0,0,0]],
+ // +z face
+ [[0,0,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1],[0,1,1]],
+ // -z face
+ [[1,0,0],[0,0,0],[0,1,0],[1,0,0],[0,1,0],[1,1,0]],
+ // +y face
+ [[0,1,0],[0,1,1],[1,1,1],[0,1,0],[1,1,1],[1,1,0]],
+ // -y face
+ [[0,0,1],[0,0,0],[1,0,0],[0,0,1],[1,0,0],[1,0,1]]
+];
+
+function buildChunkMesh(cx,cz){
+ var key=chunkKey(cx,cz);
+ var chunk=chunks.get(key);
+ if(!chunk) return;
+ if(chunk.mesh){
+  scene.remove(chunk.mesh);
+  chunk.mesh.geometry.dispose();
+  chunk.mesh=null;
+ }
+
+ var positions=[],normals=[],colors=[];
+ var wx0=cx*CHUNK_SIZE, wz0=cz*CHUNK_SIZE;
+
+ for(var lz=0;lz<CHUNK_SIZE;lz++){
+  for(var lx=0;lx<CHUNK_SIZE;lx++){
+   for(var ly=0;ly<CHUNK_HEIGHT;ly++){
+    var blockId=chunk.data[localIndex(lx,ly,lz)];
+    if(blockId===AIR) continue;
+    var wx=wx0+lx, wy=ly, wz=wz0+lz;
+    var color=BLOCK_COLORS[blockId];
+    var r=((color>>16)&0xff)/255;
+    var g=((color>>8)&0xff)/255;
+    var b=(color&0xff)/255;
+
+    for(var f=0;f<6;f++){
+     var face=FACES[f];
+     var nx=wx+face.nx, ny=wy+face.ny, nz=wz+face.nz;
+     var neighbor=getBlock(nx,ny,nz);
+     if(neighbor!==AIR) continue;
+
+     var verts=FACE_VERTS[f];
+     var light=face.light;
+     for(var vi=0;vi<6;vi++){
+      positions.push(wx+verts[vi][0],wy+verts[vi][1],wz+verts[vi][2]);
+      normals.push(face.nx,face.ny,face.nz);
+      colors.push(r*light,g*light,b*light);
+     }
+    }
+   }
+  }
+ }
+
+ if(positions.length===0){
+  chunk.built=true;
+  return;
+ }
+
+ var geom=new THREE.BufferGeometry();
+ geom.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+ geom.setAttribute('normal',new THREE.Float32BufferAttribute(normals,3));
+ geom.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));
+
+ var mat=new THREE.MeshLambertMaterial({vertexColors:true});
+ var mesh=new THREE.Mesh(geom,mat);
+ chunk.mesh=mesh;
+ chunk.built=true;
+ scene.add(mesh);
+ chunkMeshes.push(mesh);
+}
+
+function rebuildChunk(cx,cz){
+ var key=chunkKey(cx,cz);
+ var chunk=chunks.get(key);
+ if(!chunk) return;
+ buildChunkMesh(cx,cz);
+}
+
+// === THREE.JS SETUP ===
+var canvas=document.getElementById('c');
+var renderer=new THREE.WebGLRenderer({canvas:canvas,antialias:false});
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.setClearColor(0x87ceeb);
+
+var scene=new THREE.Scene();
+scene.fog=new THREE.Fog(0x87ceeb,40,110);
+
+var camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,400);
+camera.rotationOrder='YXZ';
+
+var ambientLight=new THREE.AmbientLight(0xffffff,0.65);
+scene.add(ambientLight);
+
+var dirLight=new THREE.DirectionalLight(0xffffff,0.8);
+dirLight.position.set(50,100,30);
+scene.add(dirLight);
+
+// Shared material for all chunks
+var chunkMaterial=new THREE.MeshLambertMaterial({vertexColors:true});
+
+// === WATER PLANE ===
+var waterGeom=new THREE.PlaneGeometry(500,500);
+var waterMat=new THREE.MeshLambertMaterial({color:0x3388cc,transparent:true,opacity:0.55,side:THREE.DoubleSide});
+var waterPlane=new THREE.Mesh(waterGeom,waterMat);
+waterPlane.rotation.x=-Math.PI/2;
+waterPlane.position.y=14.3;
+scene.add(waterPlane);
+
+// === CLOUDS ===
+var cloudMeshes=[];
+var cloudGeom=new THREE.BoxGeometry(1,0.5,1);
+var cloudMat=new THREE.MeshLambertMaterial({color:0xffffff,transparent:true,opacity:0.8});
+for(var ci=0;ci<25;ci++){
+ var cloud=new THREE.Mesh(cloudGeom,cloudMat);
+ cloud.scale.set(4+Math.random()*6,1,3+Math.random()*4);
+ cloud.position.set(
+  (hashCoord(ci*7,ci*13)-0.5)*200,
+  88+hashCoord(ci*11,ci*17)*10,
+  (hashCoord(ci*17,ci*7)-0.5)*200
+ );
+ scene.add(cloud);
+ cloudMeshes.push({mesh:cloud,speed:0.3+hashCoord(ci*3,ci*5)*0.5});
+}
+
+// === OUTLINE BOX ===
+var outlineGeom=new THREE.EdgesGeometry(new THREE.BoxGeometry(1.005,1.005,1.005));
+var outlineMat=new THREE.LineBasicMaterial({color:0x000000});
+var outlineBox=new THREE.LineSegments(outlineGeom,outlineMat);
+outlineBox.visible=false;
+scene.add(outlineBox);
+
+// === PLAYER ===
+var player={
+ x:8,y:60,z:8,
+ vx:0,vy:0,vz:0,
+ yaw:0,pitch:0,
+ onGround:false,
+ halfWidth:0.3,
+ height:1.8,
+ eyeHeight:1.62
+};
+
+// Find spawn height
+(function findSpawn(){
+ for(var y=CHUNK_HEIGHT-1;y>=0;y--){
+  if(getBlock(Math.floor(player.x),y,Math.floor(player.z))!==AIR){
+   player.y=y+2;
+   break;
+  }
+ }
+})();
+
+// === CONTROLS ===
+var keys={};
+var selectedSlot=0;
+var pointerLocked=false;
+
+document.addEventListener('keydown',function(e){
+ keys[e.code]=true;
+ if(e.code>='Digit1'&&e.code<='Digit7'){
+  selectedSlot=parseInt(e.code.charAt(5))-1;
+  updateHotbarUI();
+ }
+});
+document.addEventListener('keyup',function(e){keys[e.code]=false});
+
+// Mouse wheel
+document.addEventListener('wheel',function(e){
+ if(!pointerLocked) return;
+ if(e.deltaY>0) selectedSlot=(selectedSlot+1)%7;
+ else selectedSlot=(selectedSlot+6)%7;
+ updateHotbarUI();
+},{passive:true});
+
+// Pointer lock
+var overlay=document.getElementById('overlay');
+overlay.addEventListener('click',function(){
+ canvas.requestPointerLock();
+});
+
+document.addEventListener('pointerlockchange',function(){
+ pointerLocked=!!document.pointerLockElement;
+ overlay.style.display=pointerLocked?'none':'flex';
+});
+
+// Mouse movement
+document.addEventListener('mousemove',function(e){
+ if(!pointerLocked) return;
+ player.yaw-=e.movementX*0.002;
+ player.pitch-=e.movementY*0.002;
+ player.pitch=Math.max(-Math.PI/2+0.01,Math.min(Math.PI/2-0.01,player.pitch));
+});
+
+// Mouse clicks
+document.addEventListener('mousedown',function(e){
+ if(!pointerLocked) return;
+ handleBlockInteraction(e.button===0?0:2); // 0=left(break), 2=right(place)
+});
+document.addEventListener('contextmenu',function(e){e.preventDefault()});
+
+// === RAYCASTING ===
+var raycaster=new THREE.Raycaster();
+raycaster.far=6;
+
+function getHitInfo(){
+ raycaster.setFromCamera({x:0,y:0},camera);
+ var hits=raycaster.intersectObjects(chunkMeshes,false);
+ if(hits.length===0) return null;
+ var hit=hits[0];
+ // Get face normal from hit
+ var faceNormal=hit.face.normal.clone();
+ // Transform to world space (chunk meshes are at origin, no rotation needed)
+ return{point:hit.point,normal:faceNormal};
+}
+
+function handleBlockInteraction(action){
+ var hit=getHitInfo();
+ if(!hit) return;
+ var p=hit.point;
+ var n=hit.normal;
+
+ var breakX=Math.floor(p.x-n.x*0.5);
+ var breakY=Math.floor(p.y-n.y*0.5);
+ var breakZ=Math.floor(p.z-n.z*0.5);
+
+ var placeX=Math.floor(p.x+n.x*0.5);
+ var placeY=Math.floor(p.y+n.y*0.5);
+ var placeZ=Math.floor(p.z+n.z*0.5);
+
+ if(action===0){ // break
+  if(breakY===0) return; // can't break bedrock
+  var current=getBlock(breakX,breakY,breakZ);
+  if(current===AIR) return;
+  setBlock(breakX,breakY,breakZ,AIR);
+  rebuildChunk(Math.floor(breakX/CHUNK_SIZE),Math.floor(breakZ/CHUNK_SIZE));
+  // Rebuild neighbor if on border
+  var lx=((breakX%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+  var lz=((breakZ%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+  if(lx===0) rebuildChunk(Math.floor(breakX/CHUNK_SIZE)-1,Math.floor(breakZ/CHUNK_SIZE));
+  if(lx===CHUNK_SIZE-1) rebuildChunk(Math.floor(breakX/CHUNK_SIZE)+1,Math.floor(breakZ/CHUNK_SIZE));
+  if(lz===0) rebuildChunk(Math.floor(breakX/CHUNK_SIZE),Math.floor(breakZ/CHUNK_SIZE)-1);
+  if(lz===CHUNK_SIZE-1) rebuildChunk(Math.floor(breakX/CHUNK_SIZE),Math.floor(breakZ/CHUNK_SIZE)+1);
+ } else { // place
+  var existing=getBlock(placeX,placeY,placeZ);
+  if(existing!==AIR) return;
+  // Check doesn't overlap player
+  var px=player.x,py=player.y,pz=player.z;
+  var hw=player.halfWidth,hh=player.height;
+  if(placeX+1>px-hw&&placeX<px+hw&&
+     placeY+1>py&&placeY<py+hh&&
+     placeZ+1>pz-hw&&placeZ<pz+hw){
+   return; // overlaps player
+  }
+  setBlock(placeX,placeY,placeZ,HOTBAR_BLOCKS[selectedSlot]);
+  rebuildChunk(Math.floor(placeX/CHUNK_SIZE),Math.floor(placeZ/CHUNK_SIZE));
+  var lx=((placeX%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+  var lz=((placeZ%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE;
+  if(lx===0) rebuildChunk(Math.floor(placeX/CHUNK_SIZE)-1,Math.floor(placeZ/CHUNK_SIZE));
+  if(lx===CHUNK_SIZE-1) rebuildChunk(Math.floor(placeX/CHUNK_SIZE)+1,Math.floor(placeZ/CHUNK_SIZE));
+  if(lz===0) rebuildChunk(Math.floor(placeX/CHUNK_SIZE),Math.floor(placeZ/CHUNK_SIZE)-1);
+  if(lz===CHUNK_SIZE-1) rebuildChunk(Math.floor(placeX/CHUNK_SIZE),Math.floor(placeZ/CHUNK_SIZE)+1);
+ }
+}
+
+// === COLLISION DETECTION ===
+function isSolid(wx,wy,wz){
+ return getBlock(wx,wy,wz)!==AIR;
+}
+
+function collideAxis(pos,axis,delta){
+ var newPos=pos.slice();
+ newPos[axis]+=delta;
+ var hw=player.halfWidth;
+ var hh=player.height;
+
+ var minX=Math.floor(newPos[0]-hw);
+ var maxX=Math.floor(newPos[0]+hw);
+ var minZ=Math.floor(newPos[2]-hw);
+ var maxZ=Math.floor(newPos[2]+hw);
+ var minY=Math.floor(newPos[1]);
+ var maxY=Math.floor(newPos[1]+hh-0.001);
+
+ for(var bx=minX;bx<=maxX;bx++){
+  for(var bz=minZ;bz<=maxZ;bz++){
+   for(var by=minY;by<=maxY;by++){
+    if(isSolid(bx,by,bz)){
+     // Collision detected, revert this axis
+     return false;
+    }
+   }
+  }
+ }
+ return true;
+}
+
+// === PHYSICS UPDATE ===
+function updatePlayer(dt){
+ dt=Math.min(dt,0.05);
+
+ // Movement relative to yaw
+ var sinYaw=Math.sin(player.yaw);
+ var cosYaw=Math.cos(player.yaw);
+ var moveX=0,moveZ=0;
+ if(keys['KeyW']){moveX-=sinYaw;moveZ-=cosYaw;}
+ if(keys['KeyS']){moveX+=sinYaw;moveZ+=cosYaw;}
+ if(keys['KeyA']){moveX-=cosYaw;moveZ+=sinYaw;}
+ if(keys['KeyD']){moveX+=cosYaw;moveZ-=sinYaw;}
+
+ // Normalize horizontal movement
+ var len=Math.sqrt(moveX*moveX+moveZ*moveZ);
+ if(len>0){moveX/=len;moveZ/=len;}
+
+ var speed=5.5;
+ player.vx=moveX*speed;
+ player.vz=moveZ*speed;
+
+ // Gravity
+ player.vy-=25*dt;
+
+ // Jump
+ if(keys['Space']&&player.onGround){
+  player.vy=8.5;
+  player.onGround=false;
+ }
+
+ // Move X
+ var oldX=player.x;
+ if(collideAxis([player.x,player.y,player.z],0,player.vx*dt)){
+  player.x+=player.vx*dt;
+ } else {
+  player.vx=0;
+ }
+
+ // Move Y
+ var oldY=player.y;
+ var movedY=collideAxis([player.x,player.y,player.z],1,player.vy*dt);
+ if(movedY){
+  player.y+=player.vy*dt;
+  if(player.vy<0) player.onGround=true;
+ } else {
+  if(player.vy<0) player.onGround=true;
+  player.vy=0;
+ }
+
+ // Move Z
+ var oldZ=player.z;
+ if(collideAxis([player.x,player.y,player.z],2,player.vz*dt)){
+  player.z+=player.vz*dt;
+ } else {
+  player.vz=0;
+ }
+
+ // Fall below world
+ if(player.y<-20){
+  respawn();
+ }
+}
+
+function respawn(){
+ player.y=60;
+ player.vx=0;player.vy=0;player.vz=0;
+ for(var y=CHUNK_HEIGHT-1;y>=0;y--){
+  if(getBlock(Math.floor(player.x),y,Math.floor(player.z))!==AIR){
+   player.y=y+2;
+   break;
+  }
+ }
+}
+
+// === CHUNK MANAGEMENT ===
+var chunksToGenerate=[];
+var chunksToBuild=[];
+var chunksToRemove=[];
+var generatedThisFrame=0;
+var builtThisFrame=0;
+
+function manageChunks(){
+ var pcx=Math.floor(player.x/CHUNK_SIZE);
+ var pcz=Math.floor(player.z/CHUNK_SIZE);
+ generatedThisFrame=0;
+ builtThisFrame=0;
+
+ // Collect chunks to generate (within 5 chunks)
+ for(var dz=-5;dz<=5;dz++){
+  for(var dx=-5;dx<=5;dx++){
+   var cx=pcx+dx,cz=pcz+dz;
+   var key=chunkKey(cx,cz);
+   if(!chunks.has(key)){
+    chunksToGenerate.push({cx:cx,cz:cz});
+   }
+  }
+ }
+
+ // Generate up to 4 chunks
+ for(var i=0;i<Math.min(4,chunksToGenerate.length);i++){
+  var cg=chunksToGenerate[i];
+  generateChunkData(cg.cx,cg.cz);
+ }
+ chunksToGenerate=[];
+
+ // Collect chunks to build (within 4 chunks, all 4 neighbors have data)
+ for(var dz=-4;dz<=4;dz++){
+  for(var dx=-4;dx<=4;dx++){
+   var cx=pcx+dx,cz=pcz+dz;
+   var key=chunkKey(cx,cz);
+   var chunk=chunks.get(key);
+   if(!chunk||chunk.built) continue;
+   // Check all 4 neighbors have data
+   if(chunks.has(chunkKey(cx-1,cz))&&chunks.has(chunkKey(cx+1,cz))&&
+      chunks.has(chunkKey(cx,cz-1))&&chunks.has(chunkKey(cx,cz+1))){
+    chunksToBuild.push({cx:cx,cz:cz});
+   }
+  }
+ }
+
+ // Build up to 2 chunks
+ for(var i=0;i<Math.min(2,chunksToBuild.length);i++){
+  var cb=chunksToBuild[i];
+  buildChunkMesh(cb.cx,cb.cz);
+ }
+ chunksToBuild=[];
+
+ // Remove chunks beyond 7 chunks
+ var toRemove=[];
+ chunks.forEach(function(chunk,key){
+  var parts=key.split(',');
+  var cx=parseInt(parts[0]),cz=parseInt(parts[1]);
+  var dx=cx-pcx,dz=cz-pcz;
+  if(Math.abs(dx)>7||Math.abs(dz)>7){
+   toRemove.push({cx:cx,cz:cz,key:key});
+  }
+ });
+ toRemove.forEach(function(r){
+  if(r.mesh&&r.mesh!==null){
+   scene.remove(r.mesh);
+   r.mesh.geometry.dispose();
+   // Remove from chunkMeshes array
+   var idx=chunkMeshes.indexOf(r.mesh);
+   if(idx>=0) chunkMeshes.splice(idx,1);
+  }
+  chunks.delete(r.key);
+ });
+}
+
+// === OUTLINE UPDATE ===
+function updateOutline(){
+ var hit=getHitInfo();
+ if(hit){
+  var p=hit.point;
+  var n=hit.normal;
+  var ox=Math.floor(p.x-n.x*0.5)+0.5;
+  var oy=Math.floor(p.y-n.y*0.5)+0.5;
+  var oz=Math.floor(p.z-n.z*0.5)+0.5;
+  outlineBox.position.set(ox,oy,oz);
+  outlineBox.visible=true;
+ } else {
+  outlineBox.visible=false;
+ }
+}
+
+// === CLOUD UPDATE ===
+function updateClouds(dt){
+ for(var i=0;i<cloudMeshes.length;i++){
+  var c=cloudMeshes[i];
+  c.mesh.position.x+=c.speed*dt;
+  // Wrap around player
+  var dx=c.mesh.position.x-player.x;
+  if(dx>150) c.mesh.position.x-=300;
+  if(dx<-150) c.mesh.position.x+=300;
+  var dz=c.mesh.position.z-player.z;
+  if(dz>150) c.mesh.position.z-=300;
+  if(dz<-150) c.mesh.position.z+=300;
+ }
+}
+
+// === WATER UPDATE ===
+function updateWater(){
+ waterPlane.position.x=player.x;
+ waterPlane.position.z=player.z;
+}
+
+// === HOTBAR UI ===
+function createHotbarUI(){
+ var hotbar=document.getElementById('hotbar');
+ hotbar.innerHTML='';
+ for(var i=0;i<7;i++){
+  var slot=document.createElement('div');
+  slot.className='hotbar-slot'+(i===selectedSlot?' selected':'');
+  var colorDiv=document.createElement('div');
+  colorDiv.className='slot-color';
+  var col='#'+BLOCK_COLORS[HOTBAR_BLOCKS[i]].toString(16).padStart(6,'0');
+  colorDiv.style.background=col;
+  var numDiv=document.createElement('div');
+  numDiv.className='slot-num';
+  numDiv.textContent=i+1;
+  slot.appendChild(colorDiv);
+  slot.appendChild(numDiv);
+  hotbar.appendChild(slot);
+ }
+}
+
+function updateHotbarUI(){
+ var slots=document.querySelectorAll('.hotbar-slot');
+ for(var i=0;i<slots.length;i++){
+  slots[i].className='hotbar-slot'+(i===selectedSlot?' selected':'');
+ }
+}
+
+// === RESIZE ===
+function onResize(){
+ camera.aspect=window.innerWidth/window.innerHeight;
+ camera.updateProjectionMatrix();
+ renderer.setSize(window.innerWidth,window.innerHeight);
+}
+window.addEventListener('resize',onResize);
+
+// === GAME LOOP ===
+var lastTime=performance.now();
+
+function gameLoop(now){
+ requestAnimationFrame(gameLoop);
+ var dt=(now-lastTime)/1000;
+ lastTime=now;
+
+ if(pointerLocked){
+  updatePlayer(dt);
+ }
+
+ // Update camera
+ camera.position.set(player.x,player.y+player.eyeHeight,player.z);
+ camera.rotation.y=player.yaw;
+ camera.rotation.x=player.pitch;
+
+ manageChunks();
+ updateOutline();
+ updateClouds(dt);
+ updateWater();
+
+ renderer.render(scene,camera);
+}
+
+// === INIT ===
+createHotbarUI();
+requestAnimationFrame(gameLoop);
+
+})();
+</script>
+</body>
+</html>
