@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Хомяки — эталон Claude, версия 2 (физика)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cfe9f7;
+               font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: absolute; top: 14px; left: 14px; padding: 12px 16px; max-width: 320px;
+    background: rgba(255,255,255,0.86); border-radius: 16px; color: #3a2a1a;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.14); pointer-events: none;
+  }
+  #ui h1 { margin: 0 0 4px; font-size: 19px; }
+  #ui p { margin: 0 0 8px; font-size: 12px; opacity: 0.72; }
+  #status { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  #status li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a2a1a; flex: none; }
+  .name { font-weight: 700; min-width: 62px; }
+  #meter {
+    position: absolute; right: 14px; top: 14px; padding: 10px 14px; border-radius: 14px;
+    background: rgba(255,255,255,0.86); color: #3a2a1a; font-size: 12.5px; line-height: 1.6;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.14); pointer-events: none; min-width: 190px;
+  }
+  #meter b { font-weight: 700; }
+  #meter span { color: #b05a1e; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h1>🐹 Клетка с хомяками</h1>
+  <p>Тяни — поворот · Колесо мыши — приближение · Клик по хомяку — тычок</p>
+  <ul id="status"></ul>
+</div>
+
+<div id="meter">
+  <b>Проверка физики колеса</b><br>
+  скорость лап: <span id="mV">0.00</span> ед/с<br>
+  скорость обода: <span id="mW">0.00</span> ед/с<br>
+  расхождение: <span id="mD">0.0</span> %
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ============================================================================
+// ХОМЯКИ, ВЕРСИЯ 2. Переписана ФИЗИКА — по разбору хозяина 04.09:
+//
+//   «они ходят через трубу, она полая, и ходят они через вход, а не сквозь
+//    стены; они бегут по колесу как надо, а не внутри его, словно колесо
+//    через них проходит; у них детали бега в колесе, правильные движения»
+//
+// В первой версии всё это было ненастоящим: в колесо хомяк ТЕЛЕПОРТИРОВАЛСЯ,
+// обод крутился с постоянной скоростью независимо от лап, а к трубе он шёл
+// напрямую и проходил сквозь стенку. Здесь три вещи сделаны честно:
+//
+//   1. КОЛЕСО. Хомяк входит сбоку через открытый край, встаёт на нижнюю точку
+//      внутренней поверхности и бежит. Обод вращается со скоростью ω = v / R,
+//      где v — скорость его лап. То есть не «колесо крутится, а он машет», а
+//      «он бежит, и поэтому колесо крутится» — связь односторонняя и точная.
+//      Она же выведена на экран: скорость лап против скорости обода.
+//   2. ТРУБА. Внутрь можно попасть ТОЛЬКО через торцы. Хомяк идёт к ближнему
+//      входу, поднимается на пол трубы, проходит по её оси и выходит с другой
+//      стороны. Боковая стенка для него твёрдая.
+//   3. СТОЛКНОВЕНИЯ. У колеса, миски, поилки и трубы есть тела. Хомяк не
+//      проходит сквозь них: его выталкивает наружу по кратчайшей нормали.
+//
+// Хомяки крупнее вдвое против первой версии — по замечанию, что мелких не
+// видно.
+// ============================================================================
+
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const flat = (c, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color: c, flatShading: true, roughness: 0.85, ...extra });
+function angleDiff(from, to) {
+  let d = (to - from) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+
+// -------------------------------------------------------------- сцена, свет
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xcfe9f7);
+scene.fog = new THREE.Fog(0xcfe9f7, 40, 95);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(13, 10.5, 16);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.6, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 6;
+controls.maxDistance = 45;
+controls.maxPolarAngle = Math.PI * 0.48;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa870, 0.75));
+const sun = new THREE.DirectionalLight(0xfff3d6, 1.6);
+sun.position.set(11, 19, 9);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -16; sun.shadow.camera.right = 16;
+sun.shadow.camera.top = 14; sun.shadow.camera.bottom = -14;
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 60;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+// ------------------------------------------------------------- стол и комната
+const CAGE = { w: 15, d: 11, h: 7 };
+const FLOOR_Y = 0.35;                       // верх подстилки: пол для хомяка
+
+// Габарит зверя: тело длиной ~1.4 и высотой ~1.15 в единицах масштаба.
+// Радиус колеса ниже подобран от этих чисел, а не подогнан глазом.
+const МАСШТАБ = 1.25;
+const ДЛИНА_ЗВЕРЯ = 1.4 * МАСШТАБ;
+const ВЫСОТА_ЗВЕРЯ = 1.15 * МАСШТАБ;
+
+{
+  const пол = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), flat(0xe8ddcd));
+  пол.rotation.x = -Math.PI / 2; пол.position.y = -6.6; пол.receiveShadow = true;
+  scene.add(пол);
+
+  const дерево = flat(0xc08a55);
+  const столешница = new THREE.Mesh(new THREE.BoxGeometry(32, 1, 24), дерево);
+  столешница.position.y = -1.1;
+  столешница.receiveShadow = true; столешница.castShadow = true;
+  scene.add(столешница);
+  for (const [x, z] of [[-14, -10], [14, -10], [-14, 10], [14, 10]]) {
+    const ножка = new THREE.Mesh(new THREE.BoxGeometry(1.2, 5, 1.2), дерево);
+    ножка.position.set(x, -4.1, z); ножка.castShadow = true;
+    scene.add(ножка);
+  }
+}
+
+// -------------------------------------------------------------- поддон, прутья
+{
+  const поддон = flat(0xef6f9e);
+  const дно = new THREE.Mesh(new THREE.BoxGeometry(CAGE.w + 0.5, 0.35, CAGE.d + 0.5), поддон);
+  дно.position.y = -0.45; дно.receiveShadow = true; scene.add(дно);
+
+  for (const [sx, sz, x, z] of [
+    [CAGE.w + 0.5, 0.25, 0, -CAGE.d / 2 - 0.12], [CAGE.w + 0.5, 0.25, 0, CAGE.d / 2 + 0.12],
+    [0.25, CAGE.d + 0.5, -CAGE.w / 2 - 0.12, 0], [0.25, CAGE.d + 0.5, CAGE.w / 2 + 0.12, 0]]) {
+    const борт = new THREE.Mesh(new THREE.BoxGeometry(sx, 1.3, sz), поддон);
+    борт.position.set(x, 0.05, z);
+    борт.castShadow = true; борт.receiveShadow = true;
+    scene.add(борт);
+  }
+
+  const подстилка = new THREE.Mesh(new THREE.BoxGeometry(CAGE.w, 0.7, CAGE.d), flat(0xf2dda2));
+  подстилка.position.y = 0; подстилка.receiveShadow = true; scene.add(подстилка);
+
+  // Стружка отдельными щепками — одним InstancedMesh, иначе 300 объектов
+  // просаживают кадр без всякой пользы.
+  const щепок = 300;
+  const стружка = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(0.34, 0.07, 0.2), flat(0xffffff), щепок);
+  const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), E = new THREE.Euler();
+  const тона = [0xf6e2ab, 0xefd08b, 0xfff1c6, 0xe6c67f, 0xfae5b4];
+  for (let i = 0; i < щепок; i++) {
+    E.set(rand(-0.14, 0.14), rand(0, TAU), rand(-0.14, 0.14));
+    Q.setFromEuler(E);
+    M.compose(new THREE.Vector3(rand(-CAGE.w / 2 + 0.4, CAGE.w / 2 - 0.4), FLOOR_Y + 0.01,
+                                rand(-CAGE.d / 2 + 0.4, CAGE.d / 2 - 0.4)),
+              Q, new THREE.Vector3(1, 1, 1));
+    стружка.setMatrixAt(i, M);
+    стружка.setColorAt(i, new THREE.Color(pick(тона)));
+  }
+  стружка.receiveShadow = true;
+  scene.add(стружка);
+
+  const прут = new THREE.MeshStandardMaterial({ color: 0xdfe6ee, metalness: 0.55, roughness: 0.35 });
+  const высотаПрута = CAGE.h - 0.7;
+  const геомПрута = new THREE.CylinderGeometry(0.05, 0.05, высотаПрута, 6);
+  const точки = [];
+  const nx = Math.round(CAGE.w / 0.62), nz = Math.round(CAGE.d / 0.62);
+  for (let i = 0; i <= nx; i++) {
+    const x = -CAGE.w / 2 + (i / nx) * CAGE.w;
+    точки.push([x, -CAGE.d / 2], [x, CAGE.d / 2]);
+  }
+  for (let i = 1; i < nz; i++) {
+    const z = -CAGE.d / 2 + (i / nz) * CAGE.d;
+    точки.push([-CAGE.w / 2, z], [CAGE.w / 2, z]);
+  }
+  const прутья = new THREE.InstancedMesh(геомПрута, прут, точки.length);
+  точки.forEach(([x, z], i) => {
+    M.makeTranslation(x, 0.7 + высотаПрута / 2, z);
+    прутья.setMatrixAt(i, M);
+  });
+  прутья.castShadow = true;
+  scene.add(прутья);
+
+  const рамка = flat(0xf2f6fa, { metalness: 0.3, roughness: 0.5 });
+  for (const y of [CAGE.h, CAGE.h * 0.55]) {
+    const т = y === CAGE.h ? 0.15 : 0.08;
+    for (const [sx, sz, x, z] of [
+      [CAGE.w + 0.25, т, 0, -CAGE.d / 2], [CAGE.w + 0.25, т, 0, CAGE.d / 2],
+      [т, CAGE.d + 0.25, -CAGE.w / 2, 0], [т, CAGE.d + 0.25, CAGE.w / 2, 0]]) {
+      const р = new THREE.Mesh(new THREE.BoxGeometry(sx, т, sz), рамка);
+      р.position.set(x, y, z); р.castShadow = true; scene.add(р);
+    }
+  }
+}
+
+// ============================== КОЛЕСО ======================================
+// Ось горизонтальная вдоль Z. Открытая сторона — со стороны +Z: через неё
+// хомяк и заходит. Опора и глухая стенка со стороны -Z, поэтому влезть
+// «сквозь диск» нельзя ни зрительно, ни по правилам движения.
+const WHEEL = {
+  x: -4.3, z: -1.6,
+  // Радиус — от габарита зверя: половина его длины плюс запас, иначе обод
+  // проходит сквозь тело (так и было в первом заходе, кадр это показал).
+  R: ДЛИНА_ЗВЕРЯ * 0.5 + ВЫСОТА_ЗВЕРЯ * 0.75 + 0.35,
+  ширина: 1.05 * МАСШТАБ,   // шире боков зверя, он проходит между ободами
+  ось: 0,               // текущий угол поворота
+  скорость: 0,          // рад/с, задаётся ТОЛЬКО бегущим хомяком
+};
+WHEEL.y = FLOOR_Y + WHEEL.R + 0.22;                       // центр колеса
+WHEEL.вход = new THREE.Vector3(WHEEL.x, FLOOR_Y, WHEEL.z + WHEEL.ширина / 2 + 1.5);
+WHEEL.низ = new THREE.Vector3(WHEEL.x, WHEEL.y - WHEEL.R, WHEEL.z);   // нижняя точка обода
+
+const wheelSpin = new THREE.Group();                       // всё, что вращается
+wheelSpin.position.set(WHEEL.x, WHEEL.y, WHEEL.z);
+scene.add(wheelSpin);
+{
+  const мята = flat(0x63dfbf), тёмная = flat(0x2fae8c);
+
+  for (const sz of [-WHEEL.ширина / 2, WHEEL.ширина / 2]) {
+    const обод = new THREE.Mesh(new THREE.TorusGeometry(WHEEL.R, 0.09, 8, 30), мята);
+    обод.position.z = sz;
+    wheelSpin.add(обод);
+  }
+  // Беговая дорожка: перекладины по окружности. Хомяк бежит именно по ним.
+  for (let i = 0; i < 26; i++) {
+    const a = (i / 26) * TAU;
+    const п = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, WHEEL.ширина), тёмная);
+    п.position.set(Math.cos(a) * WHEEL.R, Math.sin(a) * WHEEL.R, 0);
+    п.rotation.z = a;
+    wheelSpin.add(п);
+  }
+  // Глухая стенка со стороны -Z: спицы к втулке.
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * TAU;
+    const с = new THREE.Mesh(new THREE.BoxGeometry(WHEEL.R, 0.06, 0.07), тёмная);
+    с.position.set(Math.cos(a) * WHEEL.R / 2, Math.sin(a) * WHEEL.R / 2, -WHEEL.ширина / 2);
+    с.rotation.z = a;
+    wheelSpin.add(с);
+  }
+  const втулка = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, WHEEL.ширина + 0.2, 10), тёмная);
+  втулка.rotation.x = Math.PI / 2;
+  wheelSpin.add(втулка);
+  wheelSpin.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+  // Стойка и лапа опоры — НЕ вращаются, поэтому вне wheelSpin.
+  const тёмная2 = flat(0x2fae8c);
+  const стойка = new THREE.Mesh(new THREE.BoxGeometry(0.3, WHEEL.y - FLOOR_Y, 0.3), тёмная2);
+  стойка.position.set(WHEEL.x, FLOOR_Y + (WHEEL.y - FLOOR_Y) / 2, WHEEL.z - WHEEL.ширина / 2 - 0.35);
+  const лапа = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.22, 0.7), тёмная2);
+  лапа.position.set(WHEEL.x, FLOOR_Y + 0.11, WHEEL.z - WHEEL.ширина / 2 - 0.35);
+  const ось = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.8, 8), flat(0xdddddd));
+  ось.rotation.x = Math.PI / 2;
+  ось.position.set(WHEEL.x, WHEEL.y, WHEEL.z - WHEEL.ширина / 2 - 0.2);
+  [стойка, лапа, ось].forEach(o => { o.castShadow = true; scene.add(o); });
+}
+
+// ============================== ТРУБА =======================================
+// Полый цилиндр вдоль X. Внутрь — только через торцы; боковая стенка твёрдая.
+const TUBE = {
+  x: 3.6, z: 2.4, длина: 4.6, R: 1.05,
+};
+TUBE.y = FLOOR_Y + TUBE.R * 0.55;                   // ось трубы над подстилкой
+TUBE.полY = TUBE.y - TUBE.R * 0.55;                 // по чему идут внутри
+TUBE.торецA = new THREE.Vector3(TUBE.x - TUBE.длина / 2 - 1.0, FLOOR_Y, TUBE.z);
+TUBE.торецB = new THREE.Vector3(TUBE.x + TUBE.длина / 2 + 1.0, FLOOR_Y, TUBE.z);
+{
+  const труба = new THREE.Mesh(
+    new THREE.CylinderGeometry(TUBE.R, TUBE.R, TUBE.длина, 16, 1, true),
+    flat(0x74d9e8, { transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
+  труба.rotation.z = Math.PI / 2;
+  труба.position.set(TUBE.x, TUBE.y, TUBE.z);
+  труба.castShadow = true; труба.receiveShadow = true;
+  scene.add(труба);
+  for (const sx of [-TUBE.длина / 2, TUBE.длина / 2]) {
+    const кольцо = new THREE.Mesh(new THREE.TorusGeometry(TUBE.R, 0.11, 8, 16), flat(0x2fa8bd));
+    кольцо.rotation.y = Math.PI / 2;
+    кольцо.position.set(TUBE.x + sx, TUBE.y, TUBE.z);
+    кольцо.castShadow = true;
+    scene.add(кольцо);
+  }
+}
+
+// ============================== МИСКА И ПОИЛКА ==============================
+const BOWL = { x: 4.6, z: -2.6, R: 1.15 };
+{
+  const чаша = new THREE.Mesh(new THREE.CylinderGeometry(BOWL.R, BOWL.R * 0.75, 0.55, 14), flat(0xffcf3d));
+  чаша.position.set(BOWL.x, FLOOR_Y + 0.27, BOWL.z);
+  const нутро = new THREE.Mesh(new THREE.CylinderGeometry(BOWL.R * 0.85, BOWL.R * 0.7, 0.32, 14), flat(0xdfa400));
+  нутро.position.set(BOWL.x, FLOOR_Y + 0.39, BOWL.z);
+  [чаша, нутро].forEach(o => { o.castShadow = true; o.receiveShadow = true; scene.add(o); });
+
+  const зёрнаГеом = new THREE.SphereGeometry(0.11, 6, 5);
+  зёрнаГеом.scale(1, 0.6, 1.6);
+  const зёрна = new THREE.InstancedMesh(зёрнаГеом, flat(0x4b3527), 20);
+  const M = new THREE.Matrix4();
+  for (let i = 0; i < 20; i++) {
+    const a = rand(0, TAU), r = rand(0, BOWL.R * 0.6);
+    M.makeRotationY(rand(0, TAU));
+    M.setPosition(BOWL.x + Math.cos(a) * r, FLOOR_Y + 0.56, BOWL.z + Math.sin(a) * r);
+    зёрна.setMatrixAt(i, M);
+  }
+  зёрна.castShadow = true;
+  scene.add(зёрна);
+
+  // Поилка на задней стенке.
+  const колба = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.38, 2.3, 12),
+    flat(0x9adcff, { transparent: true, opacity: 0.55 }));
+  колба.position.set(-1.2, 3.6, -CAGE.d / 2 + 0.35);
+  const вода = new THREE.Mesh(new THREE.CylinderGeometry(0.31, 0.31, 1.6, 12), flat(0x3fa9f5));
+  вода.position.set(-1.2, 3.3, -CAGE.d / 2 + 0.35);
+  const крышка = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.26, 0.36, 12), flat(0xff5f5f));
+  крышка.position.set(-1.2, 2.35, -CAGE.d / 2 + 0.35);
+  const носик = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 1.5, 8), flat(0xdddddd));
+  носик.position.set(-1.2, 1.75, -CAGE.d / 2 + 0.75);
+  носик.rotation.x = Math.PI * 0.33;
+  [колба, вода, крышка, носик].forEach(o => { o.castShadow = true; scene.add(o); });
+}
+
+// ======================= ТЕЛА ПРЕПЯТСТВИЙ ===================================
+// Раньше их не было вовсе, и хомяк ехал сквозь колесо и трубу. Теперь у
+// каждого предмета есть тело, и снаружи его обходят.
+const ТЕЛА = [
+  { вид: 'круг', x: WHEEL.x, z: WHEEL.z, r: WHEEL.R + 0.5 },
+  { вид: 'круг', x: BOWL.x, z: BOWL.z, r: BOWL.R + 0.45 },
+  { вид: 'прямоугольник',
+    minX: TUBE.x - TUBE.длина / 2 - 0.15, maxX: TUBE.x + TUBE.длина / 2 + 0.15,
+    minZ: TUBE.z - TUBE.R - 0.15, maxZ: TUBE.z + TUBE.R + 0.15 },
+];
+const ГРАНИЦЫ = {
+  minX: -CAGE.w / 2 + 1.0, maxX: CAGE.w / 2 - 1.0,
+  minZ: -CAGE.d / 2 + 1.0, maxZ: CAGE.d / 2 - 1.0,
+};
+
+function свободно(x, z) {
+  for (const т of ТЕЛА) {
+    if (т.вид === 'круг') { if (Math.hypot(x - т.x, z - т.z) < т.r) return false; }
+    else if (x > т.minX && x < т.maxX && z > т.minZ && z < т.maxZ) return false;
+  }
+  return true;
+}
+
+// Выталкивание по кратчайшей нормали: для круга — наружу по радиусу, для
+// прямоугольника — через ближайшую грань.
+function вытолкнуть(p) {
+  for (const т of ТЕЛА) {
+    if (т.вид === 'круг') {
+      const dx = p.x - т.x, dz = p.z - т.z, d = Math.hypot(dx, dz);
+      if (d < т.r) {
+        if (d < 1e-4) p.x = т.x + т.r;
+        else { p.x = т.x + dx / d * т.r; p.z = т.z + dz / d * т.r; }
+      }
+    } else if (p.x > т.minX && p.x < т.maxX && p.z > т.minZ && p.z < т.maxZ) {
+      const dl = p.x - т.minX, dr = т.maxX - p.x, dn = p.z - т.minZ, df = т.maxZ - p.z;
+      const m = Math.min(dl, dr, dn, df);
+      if (m === dl) p.x = т.minX; else if (m === dr) p.x = т.maxX;
+      else if (m === dn) p.z = т.minZ; else p.z = т.maxZ;
+    }
+  }
+}
+
+function свободнаяТочка() {
+  for (let i = 0; i < 60; i++) {
+    const x = rand(ГРАНИЦЫ.minX, ГРАНИЦЫ.maxX), z = rand(ГРАНИЦЫ.minZ, ГРАНИЦЫ.maxZ);
+    if (свободно(x, z)) return { x, z };
+  }
+  return { x: 0, z: 0 };
+}
+
+// ============================== ХОМЯК =======================================
+// Модель вдвое крупнее прежней: мелких на общем плане не видно.
+
+function собратьХомяка(шерсть, живот) {
+  const корень = new THREE.Group();
+  const тело = new THREE.Group();
+  корень.add(тело);
+
+  const мехМат = flat(шерсть), животМат = flat(живот);
+  const розовый = flat(0xff9db6), чёрный = flat(0x1e1e1e, { roughness: 0.3 });
+
+  const туловище = new THREE.Mesh(new THREE.SphereGeometry(0.5, 10, 8), мехМат);
+  туловище.scale.set(1, 0.88, 1.25); туловище.position.y = 0.46;
+  const пузо = new THREE.Mesh(new THREE.SphereGeometry(0.37, 10, 8), животМат);
+  пузо.scale.set(1, 0.78, 1.12); пузо.position.set(0, 0.37, 0.13);
+  const хвост = new THREE.Mesh(new THREE.SphereGeometry(0.09, 6, 5), животМат);
+  хвост.position.set(0, 0.46, -0.64);
+
+  const голова = new THREE.Group();
+  голова.position.set(0, 0.64, 0.52);
+  голова.add(new THREE.Mesh(new THREE.SphereGeometry(0.37, 10, 8), мехМат));
+  for (const s of [-1, 1]) {
+    const глаз = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 6), чёрный);
+    глаз.position.set(s * 0.15, 0.09, 0.31);
+    const щека = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), животМат);
+    щека.position.set(s * 0.23, -0.1, 0.22);
+    голова.add(глаз, щека);
+  }
+  const нос = new THREE.Mesh(new THREE.SphereGeometry(0.065, 6, 5), розовый);
+  нос.position.set(0, -0.04, 0.38);
+  голова.add(нос);
+
+  const уши = [];
+  for (const s of [-1, 1]) {
+    const ухо = new THREE.Group();
+    ухо.position.set(s * 0.21, 0.27, -0.05);
+    ухо.userData.базаZ = -s * 0.34;
+    ухо.rotation.z = ухо.userData.базаZ;
+    const внешнее = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), мехМат);
+    внешнее.scale.set(1, 1.1, 0.6); внешнее.position.y = 0.1;
+    const внутреннее = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 6), розовый);
+    внутреннее.scale.set(1, 1.1, 0.5); внутреннее.position.set(0, 0.1, 0.05);
+    ухо.add(внешнее, внутреннее);
+    голова.add(ухо);
+    уши.push(ухо);
+  }
+
+  // Лапы: передние ближе к морде, задние — к хвосту. Базовые позиции
+  // запоминаю, чтобы шаг считался от них, а не от нуля.
+  const лапы = [[-0.26, 0.36], [0.26, 0.36], [-0.26, -0.3], [0.26, -0.3]].map(([x, z]) => {
+    const л = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 6), мехМат);
+    л.position.set(x, 0.11, z);
+    л.userData.базаZ = z; л.userData.базаY = 0.11;
+    return л;
+  });
+
+  тело.add(туловище, пузо, хвост, голова, ...лапы);
+  корень.scale.setScalar(МАСШТАБ);
+  корень.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  return { корень, тело, туловище, голова, уши, лапы };
+}
+
+const ИМЕНА = [
+  { имя: 'Пончик', шерсть: 0xf5a54a, живот: 0xfff1dc },
+  { имя: 'Моти', шерсть: 0xfdf4e3, живот: 0xffffff },
+  { имя: 'Камушек', шерсть: 0x9aa3ad, живот: 0xe9edf1 },
+  { имя: 'Какао', шерсть: 0x8a5a3c, живот: 0xd9b99b },
+  { имя: 'Масло', шерсть: 0xffd166, живот: 0xfff6d6 },
+];
+
+// Длина шага в мировых единицах: от неё считается частота работы лап, а не
+// наоборот. Тогда лапы не «скользят» по земле и по ободу колеса.
+const ДЛИНА_ШАГА = 0.62 * МАСШТАБ;
+
+const мешиХомяков = [];
+const хомяки = [];
+
+class Хомяк {
+  constructor(опис) {
+    this.имя = опис.имя;
+    this.цвет = опис.шерсть;
+    const части = собратьХомяка(опис.шерсть, опис.живот);
+    Object.assign(this, части);
+    this.корень.traverse(o => {
+      if (o.isMesh) { o.userData.хомяк = this; мешиХомяков.push(o); }
+    });
+    const т = свободнаяТочка();
+    this.корень.position.set(т.x, FLOOR_Y, т.z);
+    this.курс = rand(0, TAU);
+    this.скорость = rand(1.9, 2.6);
+    this.фаза = rand(0, TAU);
+    this.состояние = 'стоит';
+    this.таймер = rand(0.4, 2.2);
+    this.цель = new THREE.Vector3();
+    this.куда = null;
+    this.прыжок = 0;
+    this.дёрг = 0; this.дёргТаймер = rand(1, 4); this.дёргУхо = this.уши[0];
+    this.поворот = 0;
+    scene.add(this.корень);
+  }
+
+  get поз() { return this.корень.position; }
+  get вКолесе() { return this.состояние === 'входитВКолесо' || this.состояние === 'бежит'
+                       || this.состояние === 'выходитИзКолеса'; }
+  get вТрубе() { return this.состояние === 'вТрубе'; }
+
+  освободить() {
+    if (WHEEL.хозяин === this) { WHEEL.хозяин = null; }
+    if (TUBE.хозяин === this) TUBE.хозяин = null;
+    if (BOWL.хозяин === this) BOWL.хозяин = null;
+  }
+
+  идтиК(x, z, куда) {
+    this.цель.set(x, FLOOR_Y, z);
+    this.куда = куда;
+    this.состояние = 'идёт';
+    this.таймер = Math.hypot(x - this.поз.x, z - this.поз.z) / this.скорость + 6;
+  }
+
+  выбратьЗанятие() {
+    const r = Math.random();
+    if (r < 0.3 && !WHEEL.хозяин) {
+      WHEEL.хозяин = this;
+      this.идтиК(WHEEL.вход.x, WHEEL.вход.z, 'колесо');
+    } else if (r < 0.55 && !TUBE.хозяин) {
+      TUBE.хозяин = this;
+      const дA = this.поз.distanceTo(TUBE.торецA), дB = this.поз.distanceTo(TUBE.торецB);
+      this.входТрубы = дA < дB ? TUBE.торецA : TUBE.торецB;
+      this.выходТрубы = дA < дB ? TUBE.торецB : TUBE.торецA;
+      this.идтиК(this.входТрубы.x, this.входТрубы.z, 'труба');
+    } else if (r < 0.75 && !BOWL.хозяин) {
+      BOWL.хозяин = this;
+      const a = rand(0, TAU);
+      const x = BOWL.x + Math.cos(a) * (BOWL.R + 0.7);
+      const z = BOWL.z + Math.sin(a) * (BOWL.R + 0.7);
+      this.идтиК(THREE.MathUtils.clamp(x, ГРАНИЦЫ.minX, ГРАНИЦЫ.maxX),
+                 THREE.MathUtils.clamp(z, ГРАНИЦЫ.minZ, ГРАНИЦЫ.maxZ), 'миска');
+    } else {
+      const т = свободнаяТочка();
+      this.идтиК(т.x, т.z, 'гуляет');
+    }
+  }
+
+  // Шаг к цели. Возвращает true, когда дошёл. Пройденный путь копится в
+  // фазу шага — от него зависят и лапы, и (в колесе) поворот обода.
+  шагК(цель, dt, сквозьТела) {
+    const p = this.поз;
+    const dx = цель.x - p.x, dz = цель.z - p.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.22) return true;
+    const нужный = Math.atan2(dx, dz);
+    this.курс += THREE.MathUtils.clamp(angleDiff(this.курс, нужный), -5 * dt, 5 * dt);
+    const выравнивание = Math.max(0.2, Math.cos(angleDiff(this.курс, нужный)));
+    const шаг = Math.min(d, this.скорость * выравнивание * dt);
+    p.x += Math.sin(this.курс) * шаг;
+    p.z += Math.cos(this.курс) * шаг;
+    this.фаза += (шаг / ДЛИНА_ШАГА) * TAU;      // один шаг = полный цикл лап
+    if (!сквозьТела) вытолкнуть(p);
+    return false;
+  }
+
+  тычок() {
+    if (this.прыжок <= 0) this.прыжок = 1;
+    if (this.состояние === 'стоит') this.поворот = rand(-3, 3);
+  }
+
+  обновить(dt, t) {
+    this.таймер -= dt;
+    const p = this.поз;
+    this.бегВКолесе = 0;
+
+    switch (this.состояние) {
+      case 'стоит':
+        this.курс += this.поворот * dt;
+        this.поворот *= Math.max(0, 1 - dt * 0.9);
+        if (this.таймер <= 0) this.выбратьЗанятие();
+        break;
+
+      case 'идёт':
+        if (this.шагК(this.цель, dt, false)) this.прийти();
+        else if (this.таймер <= 0) { this.освободить(); this.состояние = 'стоит'; this.таймер = rand(1, 2); }
+        break;
+
+      // ---- КОЛЕСО: вход сбоку, бег по нижней внутренней точке, выход тем же путём
+      case 'входитВКолесо': {
+        const k = 1 - Math.exp(-dt * 4);
+        p.lerp(WHEEL.низ, k);                     // плавно вплывает внутрь
+        this.курс += angleDiff(this.курс, Math.PI / 2) * k;  // разворот вдоль обода
+        if (this.таймер <= 0) {
+          p.copy(WHEEL.низ);
+          this.курс = Math.PI / 2;
+          this.состояние = 'бежит';
+          this.таймер = rand(5, 10);
+        }
+        break;
+      }
+
+      case 'бежит': {
+        // Он бежит на месте — по внутренней поверхности. Скорость его лап и
+        // есть линейная скорость обода: ω = v / R. Колесо не крутится само,
+        // его крутит ИМЕННО этот бег.
+        const v = this.скорость * 1.35;
+        this.бегВКолесе = v;
+        this.фаза += (v * dt / ДЛИНА_ШАГА) * TAU;
+        p.copy(WHEEL.низ);
+        p.z += Math.sin(t * 3) * 0.03;            // лёгкое покачивание вбок
+        this.курс = Math.PI / 2;
+        if (this.таймер <= 0) { this.состояние = 'выходитИзКолеса'; this.таймер = 0.9; }
+        break;
+      }
+
+      case 'выходитИзКолеса': {
+        const k = 1 - Math.exp(-dt * 4);
+        p.lerp(WHEEL.вход, k);
+        if (this.таймер <= 0) {
+          p.copy(WHEEL.вход);
+          WHEEL.хозяин = null;
+          this.состояние = 'стоит'; this.таймер = rand(0.6, 1.6);
+        }
+        break;
+      }
+
+      // ---- ТРУБА: только по оси, от торца к торцу, стенка твёрдая
+      case 'вТрубе': {
+        // Внутри трубы двигаюсь строго по её оси: z держу равным оси, y
+        // поднимаю на уровень внутреннего пола. Тела препятствий игнорирую
+        // ТОЛЬКО здесь — потому что нахожусь внутри их же оболочки.
+        const цельX = this.выходТрубы.x;
+        const направление = Math.sign(цельX - p.x) || 1;
+        const шаг = this.скорость * dt;
+        p.x += направление * шаг;
+        p.z += (TUBE.z - p.z) * Math.min(1, dt * 8);
+        p.y += (TUBE.полY - p.y) * Math.min(1, dt * 8);
+        this.фаза += (шаг / ДЛИНА_ШАГА) * TAU;
+        this.курс = направление > 0 ? Math.PI / 2 : -Math.PI / 2;
+        if ((направление > 0 && p.x >= цельX) || (направление < 0 && p.x <= цельX)) {
+          p.x = цельX; p.y = FLOOR_Y;
+          TUBE.хозяин = null;
+          this.состояние = 'стоит'; this.таймер = rand(0.5, 1.6);
+        }
+        break;
+      }
+
+      case 'ест':
+        this.курс += angleDiff(this.курс, Math.atan2(BOWL.x - p.x, BOWL.z - p.z)) * Math.min(1, dt * 5);
+        if (this.таймер <= 0) { BOWL.хозяин = null; this.состояние = 'стоит'; this.таймер = rand(0.5, 2); }
+        break;
+    }
+
+    // Пол и границы: в колесе и в трубе высота своя, там не трогаю.
+    if (!this.вКолесе && !this.вТрубе) {
+      p.x = THREE.MathUtils.clamp(p.x, ГРАНИЦЫ.minX, ГРАНИЦЫ.maxX);
+      p.z = THREE.MathUtils.clamp(p.z, ГРАНИЦЫ.minZ, ГРАНИЦЫ.maxZ);
+      p.y += (FLOOR_Y - p.y) * Math.min(1, dt * 8);
+    }
+
+    this.корень.rotation.y = this.курс;
+    this.анимация(dt, t);
+  }
+
+  прийти() {
+    switch (this.куда) {
+      case 'колесо': this.состояние = 'входитВКолесо'; this.таймер = 0.9; break;
+      case 'труба':  this.состояние = 'вТрубе'; break;
+      case 'миска':  this.состояние = 'ест'; this.таймер = rand(3, 6); break;
+      default:       this.состояние = 'стоит'; this.таймер = rand(1, 3);
+                     this.поворот = rand(-0.9, 0.9);
+    }
+    this.куда = null;
+  }
+
+  анимация(dt, t) {
+    const идёт = this.состояние === 'идёт' || this.вТрубе;
+    const бежит = this.состояние === 'бежит';
+
+    // Лапы шагают ОТ ФАЗЫ ПУТИ, а не от часов: поэтому они не скользят.
+    // Диагональные пары работают вместе, как у настоящего зверя.
+    const s = Math.sin(this.фаза), c = -s;
+    const размах = бежит ? 0.26 : (идёт ? 0.16 : 0);
+    [[0, s], [3, s], [1, c], [2, c]].forEach(([i, v]) => {
+      const л = this.лапы[i];
+      л.position.z = л.userData.базаZ + v * размах;
+      л.position.y = л.userData.базаY + Math.max(0, v) * размах * 0.55;
+    });
+
+    // Тело: подскок в такт шагу и наклон вперёд при беге в колесе.
+    const подскок = (идёт ? 0.05 : бежит ? 0.07 : 0) * Math.abs(Math.sin(this.фаза));
+    let прыжок = 0;
+    if (this.прыжок > 0) {
+      this.прыжок -= dt * 2;
+      прыжок = Math.sin(Math.max(0, this.прыжок) * Math.PI) * 0.5;
+    }
+    this.тело.position.y = подскок + прыжок;
+    this.тело.rotation.x = бежит ? -0.22 : 0;          // корпус наклонён к ободу
+    this.тело.rotation.z = (идёт || бежит) ? Math.sin(this.фаза) * 0.05 : 0;
+
+    // Дыхание в покое.
+    const покой = this.состояние === 'стоит' || this.состояние === 'ест';
+    const вдох = покой ? 1 + Math.sin(t * 3 + this.фаза) * 0.03 : 1;
+    this.туловище.scale.set(вдох, 0.88, 1.25 * вдох);
+
+    // Голова: наклон к миске во время еды.
+    this.голова.rotation.x = this.состояние === 'ест' ? -0.3 + Math.sin(t * 9) * 0.18 : 0;
+
+    // Ухо иногда дёргается — мелочь, но именно она оживляет.
+    this.дёргТаймер -= dt;
+    if (this.дёргТаймер <= 0) { this.дёрг = 0.4; this.дёргТаймер = rand(2, 6); this.дёргУхо = pick(this.уши); }
+    if (this.дёрг > 0) {
+      this.дёрг -= dt;
+      this.дёргУхо.rotation.z = this.дёргУхо.userData.базаZ + Math.sin(this.дёрг * 40) * 0.45;
+    }
+  }
+}
+
+ИМЕНА.forEach(о => хомяки.push(new Хомяк(о)));
+
+// Хомяки не стоят друг в друге.
+function расталкивание() {
+  for (let i = 0; i < хомяки.length; i++) {
+    for (let j = i + 1; j < хомяки.length; j++) {
+      const a = хомяки[i], b = хомяки[j];
+      if (a.вКолесе || b.вКолесе || a.вТрубе || b.вТрубе) continue;
+      const dx = b.поз.x - a.поз.x, dz = b.поз.z - a.поз.z;
+      const d = Math.hypot(dx, dz), мин = 1.5;
+      if (d < мин && d > 1e-4) {
+        const т = (мин - d) / 2, nx = dx / d, nz = dz / d;
+        a.поз.x -= nx * т; a.поз.z -= nz * т;
+        b.поз.x += nx * т; b.поз.z += nz * т;
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------- тычок
+const луч = new THREE.Raycaster(), указатель = new THREE.Vector2();
+let нажалX = 0, нажалY = 0;
+renderer.domElement.addEventListener('pointerdown', e => { нажалX = e.clientX; нажалY = e.clientY; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (Math.hypot(e.clientX - нажалX, e.clientY - нажалY) > 6) return;   // это был поворот камеры
+  указатель.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  луч.setFromCamera(указатель, camera);
+  const попал = луч.intersectObjects(мешиХомяков, false)[0];
+  if (попал) попал.object.userData.хомяк.тычок();
+});
+
+// ------------------------------------------------------------------ панель
+const списокЭл = document.getElementById('status');
+const ПОДПИСЬ = {
+  'стоит': 'осматривается',
+  'идёт': 'идёт',
+  'входитВКолесо': 'забирается в колесо',
+  'бежит': 'бежит в колесе',
+  'выходитИзКолеса': 'вылезает из колеса',
+  'вТрубе': 'ползёт по трубе',
+  'ест': 'грызёт зёрна',
+};
+function описание(х) {
+  if (х.состояние === 'идёт') {
+    return { 'колесо': 'идёт к колесу', 'труба': 'идёт к трубе',
+             'миска': 'идёт к миске' }[х.куда] || 'гуляет';
+  }
+  return ПОДПИСЬ[х.состояние] || '';
+}
+let таймерПанели = 0;
+function обновитьПанель() {
+  списокЭл.innerHTML = хомяки.map(х =>
+    '<li><span class="dot" style="background:#' + х.цвет.toString(16).padStart(6, '0') + '"></span>' +
+    '<span class="name">' + х.имя + '</span><span>' + описание(х) + '</span></li>').join('');
+}
+
+const мV = document.getElementById('mV');
+const мW = document.getElementById('mW');
+const мD = document.getElementById('mD');
+
+// -------------------------------------------------------------------- цикл
+const часы = new THREE.Clock();
+function кадр() {
+  requestAnimationFrame(кадр);
+  const dt = Math.min(часы.getDelta(), 0.05);
+  const t = часы.elapsedTime;
+
+  хомяки.forEach(х => х.обновить(dt, t));
+  расталкивание();
+
+  // Колесо крутит ТОЛЬКО бегущий: если внутри никого — оно замедляется трением.
+  const бегун = хомяки.find(х => х.состояние === 'бежит');
+  const нужнаяУгловая = бегун ? бегун.бегВКолесе / WHEEL.R : 0;
+  WHEEL.скорость += (нужнаяУгловая - WHEEL.скорость) * Math.min(1, dt * (бегун ? 6 : 1.2));
+  WHEEL.ось -= WHEEL.скорость * dt;            // обод под лапами уходит назад
+  wheelSpin.rotation.z = WHEEL.ось;
+
+  // Показываю связь честно: линейная скорость обода против скорости лап.
+  const vЛап = бегун ? бегун.бегВКолесе : 0;
+  const vОбода = Math.abs(WHEEL.скорость) * WHEEL.R;
+  мV.textContent = vЛап.toFixed(2);
+  мW.textContent = vОбода.toFixed(2);
+  мD.textContent = vЛап > 0.01 ? (Math.abs(vОбода - vЛап) / vЛап * 100).toFixed(1) : '0.0';
+
+  таймерПанели -= dt;
+  if (таймерПанели <= 0) { обновитьПанель(); таймерПанели = 0.3; }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+кадр();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
