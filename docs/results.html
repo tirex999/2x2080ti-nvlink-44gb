@@ -911,6 +911,50 @@ POST /v1/chat/completions HTTP/1.1&quot; 400   x2
 при нескольких сервер молча берёт последнее.</p>
 <hr />
 <!-- СЕТКА:НАЧАЛО -->
+<h2>13. Flash-Next на FreeToken: префилл тоже на процессоре</h2>
+<p>Постановка простая: активные эксперты считают карты, пассивные — процессор с AVX-512. Движок FreeToken это умеет напрямую: <code>--moe-backend cpu</code> поднимает пул на AVX-512 VNNI и читает банки экспертов прямо из оперативки, никуда их не копируя.</p>
+<p>Выполнялось это ровно наполовину. Строка движка при старте:</p>
+<pre><code>CPU MoE executor ready: threads=64 (pinned to cores 0..113)
+isa=avx512f+avx512vnni(nvfp4-w4a8) fmt=nvfp4 H=2560 I=640
+experts=512 layers=48 top_k=10 act=silu max_tokens=1
+</code></pre>
+<p>Последнее поле — <code>max_tokens=1</code>. Процессорный исполнитель размечен под один токен, то есть только под генерацию. Батч префилла в него не влезает, и префилл уходит другим путём: движок гонит целые слои экспертов на карту через PCIe и считает их ядрами карты.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>путь</th>
+<th style="text-align: right;">префилл, т/с</th>
+<th style="text-align: right;">генерация, т/с</th>
+<th style="text-align: right;">занято ядер из 120</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>штатный: слои экспертов на карту через PCIe</td>
+<td style="text-align: right;">0.62</td>
+<td style="text-align: right;">12.0</td>
+<td style="text-align: right;">~1</td>
+</tr>
+<tr>
+<td><strong>процессорный префилл, чанк 256 токенов</strong></td>
+<td style="text-align: right;"><strong>79</strong></td>
+<td style="text-align: right;"><strong>14.7</strong></td>
+<td style="text-align: right;"><strong>37.8 / 27.3</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>Префилл — в 127 раз быстрее. Условия одни и те же: Qwen3.8-Flash-Next в NVFP4 (65 ГБ в оперативке), <code>--moe-backend cpu --moe-cpu-threads 64</code>, <code>numactl --interleave=all</code>, обе карты свободны. Число штатного пути — не наша арифметика, а строка самого движка <code>input throughput (token/s)</code>. Ядра мерены по cgroup контейнера, а не по отдельному PID.</p>
+<p><strong>Цена штатного префилла почти не зависит от длины промпта.</strong> За один проход через PCIe уезжает вся таблица экспертов — 63 ГБ при NVFP4 — сколько бы токенов ни пришло. Поэтому 53 токена стоят те же 85 секунд, что и 500.</p>
+<h3>Где это в коде</h3>
+<p>Два места, оба в питоне пакета <code>freetoken</code>.</p>
+<p>Первое — <code>engine/engine.py</code>, размер черновиков исполнителя:</p>
+<pre><code>max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+</code></pre>
+<p>При <code>--max-running-requests 1</code> это единица. Черновики в C++ (<code>kernel/csrc/cpu_moe/cpu_moe_ext.cpp</code>) размечены как <code>max_tokens * top_k * I</code>, поэтому подать в исполнитель батч префилла, не расширив черновики, — это запись за границу буфера, а не отказ с понятной ошибкой.</p>
+<p>Второе — <code>layers/moe.py::_prefill_routed</code>, сама развилка. Процессорной ветви там нет вовсе: <code>_expert_gemm</code> знает только ядра карты, а <code>cache.cpu_executor</code> зовётся исключительно из <code>_decode_routed</code>.</p>
+<p>Врезка: расширить черновики до размера чанка и в <code>_prefill_routed</code> звать тот же <code>executor.decode</code> чанками по 256 токенов. Вызов идентичен генерации — эксперты те же, банки те же, в префилле <code>position == expert id</code> совпадает с тем, что ожидает исполнитель, поэтому маршрутные индексы передаются без правки.</p>
+<p>Проверка, что врезка вошла: в строке движка при старте должно стоять <code>max_tokens=256</code>, а не <code>max_tokens=1</code>.</p>
+<hr />
 <h2>Сводная таблица: все модели, все режимы размышления, три задачи</h2>
 <p>Таблица собрана скриптом из тех же файлов замеров, что и галерея сцен, —
 числа сюда не переписываются руками. Каждая клетка это отдельный запуск
