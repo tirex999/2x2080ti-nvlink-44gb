@@ -673,3 +673,37 @@ api_server.py: error: argument --default-chat-template-kwargs:
 Кавычки исчезли по дороге. Лечение — взять **всё присваивание целиком** в
 одинарные кавычки, как в примерах выше. Это тот же класс, что и с обратными
 слэшами в `ExecStart`.
+
+
+## Служба не стартует сама: предстартовая проверка mmap требует overcommit
+
+Симптом: `systemctl start` службы движка падает сразу, нового лога движка не
+появляется вовсе, а в журнале службы лежит:
+
+```
+Checkpoint mmap preflight
+  Largest safetensors: 4.98 GiB
+  Commit headroom:     0.00 GiB
+ERROR: checkpoint mmap needs vm.overcommit_memory=1, but non-interactive
+       launcher cannot prompt for sudo.
+```
+
+Причина **не** в нехватке памяти: свободной может быть сколько угодно — у нас было
+75 ГБ на узле и 32 ГБ доступных в контейнере. Дело в учёте коммита:
+`Committed_AS` 150 ГБ против `CommitLimit` 142 ГБ, запас нулевой, и предстартовая
+проверка честно отказывается отображать файл весов в память.
+
+Руками из меню лаунчер предложит поднять политику и спросит sudo — поэтому
+вручную стенд стартует нормально. Служба в неинтерактивном режиме спросить не
+может и падает. Выглядит это как «иногда не заводится сам».
+
+Лечение — на **узле**, а не в контейнере (`/proc/sys/vm` не изолирован, а в LXC
+`/etc/sysctl.d` смонтирован только для чтения):
+
+```
+printf 'vm.overcommit_memory=1
+' > /etc/sysctl.d/99-vllm-overcommit.conf
+sysctl -p /etc/sysctl.d/99-vllm-overcommit.conf
+```
+
+Откат: удалить файл и `sysctl -w vm.overcommit_memory=0`.

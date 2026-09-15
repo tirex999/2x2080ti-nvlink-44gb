@@ -182,6 +182,11 @@ bash scripts/check-prereqs.sh
 | Драйвер | 610.43.02 |
 | Модели | на NFS, 1 GbE |
 
+> **Где взять такие карты.** 2× RTX 2080 Ti с моддом на 22 ГБ и мостом NVLink —
+> по [объявлению владельца этого стенда на Авито](https://www.avito.ru/sankt-peterburg/tovary_dlya_kompyutera/2hrtx_2080_ti_22gb_nvlink_44gb_dlya_llm_i_ai_8166072307).
+> По вопросам покупки — туда же.
+
+
 ---
 
 ## Qwen3.8-27B: все кванты, что мы перебрали

@@ -233,6 +233,180 @@ host-функции CUDA-графа, PLE, роутинг.</p>
 <li><strong>128 потоков</strong> — не оправдались против 64.</li>
 <li><strong>Сжатие KV в fp8</strong> — не рассматриваем по решению архитектора.</li>
 </ul>
+<h2>Чат через Open WebUI: бюджет вывода и потеря ответов</h2>
+<p>Разобрано 09.09.2026 по симптому «задаю вопрос — ответ не приходит, в истории пусто».
+Три независимые причины, каждая подтверждена замером.</p>
+<p><strong>1. Бюджет вывода 32768 вместо заданного флагом.</strong> Open WebUI не присылает <code>max_tokens</code>.
+FreeToken в этом случае берёт зашитую константу:</p>
+<pre><code class="language-python"># freetoken/server/generation.py
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+max_tokens = DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens
+</code></pre>
+<p>Флаг <code>--max-output-tokens</code> читается <strong>только</strong> в Responses API (<code>responses_api.py:153</code>), а
+OpenAI-ручка — та, которой пользуются Open WebUI и большинство клиентов — его игнорирует.
+То есть флаг стоит, а работает вхолостую. Нам это стоило пустых ответов: на задаче
+«3D-сцена одним файлом» модель тратит около 29000 токенов только на планирование, и при
+бюджете 32768 на сам код оставалось менее 4000 — ответ физически не помещался.</p>
+<p>Врезка в форк (<code>generation.py</code> + <code>openai_api.py</code>) приводит OpenAI-ручку к поведению
+Responses API: <code>resolve_sampling</code> принимает <code>default_max_tokens</code>, а <code>handle_chat_completion</code>
+передаёт в него <code>state.config.max_output_tokens</code>. Без параметра поведение прежнее.</p>
+<p><strong>2. Ответ не сохраняется, если клиент отвалился.</strong> Open WebUI 0.10.2 при
+<code>ENABLE_REALTIME_CHAT_SAVE=False</code> (это дефолт, <code>env.py:360</code>) пишет ответ в базу одним куском
+в самом конце (<code>utils/middleware.py:5226</code>). Ответ, который идёт двадцать минут, переживает
+обрыв браузера только при <code>ENABLE_REALTIME_CHAT_SAVE=true</code> — тогда запись идёт по мере
+генерации. Симптом выключенного режима узнаваем: в <code>chat_message</code> строка <code>user</code> записана
+целиком, а <code>assistant</code> — ровно 2 знака, с временем создания на секунду позже вопроса.</p>
+<p>Замер, который это доказал: движок принял запрос в 06:34:00, дошёл до 38900 токенов
+контекста к 07:00:12, ушёл в <code>Scheduler is idle</code> — и <strong>ни одного <code>200 OK</code></strong> в журнале.
+Ответ дописан в оборванный сокет.</p>
+<p><strong>3. Фоновые вызовы воруют единственный слот.</strong> На каждое сообщение Open WebUI
+дополнительно зовёт модель за заголовком чата, тегами и подсказками-продолжениями. При
+<code>--max-running-requests 1</code> они встают в ту же очередь, что и настоящий ответ. В журнале это
+выглядит обманчиво: <code>200 OK</code> есть, а ответа в чате нет — потому что <code>200 OK</code> принадлежал
+заголовку. Выключать <code>task.tags.enable</code> и <code>task.follow_up.enable</code>; заголовок можно оставить,
+он короткий (префилл около 30 токенов).</p>
+<p>Настройки Open WebUI живут в таблице <code>config</code> базы <code>webui.db</code> — она плоская, <code>key</code>/<code>value</code>:</p>
+<pre><code class="language-sql">update config set value = 'false' where key = 'task.tags.enable';
+update config set value = 'false' where key = 'task.follow_up.enable';
+update config set value = '{&quot;max_tokens&quot;: 262144}' where key = 'models.default_params';
+</code></pre>
+<p><code>models.default_params</code> применяется ко всем моделям (<code>main.py:1044</code>), в том числе к тем, у
+которых нет своей записи в таблице <code>model</code> — а у подключённой напрямую модели её нет.
+Читается из базы на каждый запрос, перезапуск контейнера для него не нужен; переменные
+окружения вроде <code>ENABLE_REALTIME_CHAT_SAVE</code> — нужен.</p>
+<h2>Claude Code на нашей модели</h2>
+<p>Подключение предусмотрено самим FreeToken: в <code>server/anthropic_api.py</code> есть ручка
+<code>/v1/messages</code> с прямой пометкой «the endpoint Claude Code talks to», а команда
+<code>ft launch claude</code> ставит и настраивает агента против запущенного сервера
+(<code>--dry-run</code> печатает план, ничего не меняя; кроме claude поддержаны codex, hermes,
+openclaw, opencode, dsh).</p>
+<p>Проверено 09.09.2026, инструменты работают:</p>
+<pre><code>stop_reason: tool_use
+ВЫЗОВ ИНСТРУМЕНТА: read_file  input={&quot;path&quot;: &quot;/etc/hostname&quot;}   — 5 секунд
+</code></pre>
+<p>Модель сама выбрала инструмент и подставила аргумент, то есть агент сможет читать и
+править файлы, а не только отвечать текстом.</p>
+<p>Для VS Code блок кладётся в <code>~/.claude/settings.json</code>. Неизвестный ключ верхнего уровня
+Claude Code не ломает (проверено запуском <code>claude --settings &lt;файл&gt; -p ...</code>), поэтому
+выключенный вариант удобно держать прямо в боевом файле и включать переименованием ключа
+в <code>env</code> с последующим Developer: Reload Window.</p>
+<pre><code class="language-json">&quot;env&quot;: {
+  &quot;ANTHROPIC_BASE_URL&quot;: &quot;http://&lt;адрес движка&gt;:1919&quot;,
+  &quot;ANTHROPIC_AUTH_TOKEN&quot;: &quot;freetoken&quot;,
+  &quot;ANTHROPIC_API_KEY&quot;: &quot;&quot;,
+  &quot;ANTHROPIC_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_OPUS_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_SONNET_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_HAIKU_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;CLAUDE_CODE_SUBAGENT_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;CLAUDE_CODE_MAX_CONTEXT_TOKENS&quot;: &quot;262144&quot;,
+  &quot;CLAUDE_CODE_MAX_OUTPUT_TOKENS&quot;: &quot;262144&quot;,
+  &quot;CLAUDE_CODE_ATTRIBUTION_HEADER&quot;: &quot;0&quot;
+}
+</code></pre>
+<p>Отдельно меняется строка <code>"model"</code> вверху того же файла. Смешанный режим невозможен:
+<code>ANTHROPIC_BASE_URL</code> один на весь сеанс, поэтому увести на локальную модель только хайку,
+оставив остальное в облаке, нельзя — либо всё локально, либо всё в облако.</p>
+<h3>Сколько это стоит по времени</h3>
+<p>Замер 09.09.2026 на задаче «низкополигональная 3D-сцена одним файлом, Three.js, без внешних
+ресурсов» — та же задача, что мы гоняем на всех движках:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>выдано токенов</td>
+<td>52 121</td>
+</tr>
+<tr>
+<td>время</td>
+<td>2246 с (37 минут)</td>
+</tr>
+<tr>
+<td>скорость</td>
+<td>23.2 т/с (медиана движка 23.28, максимум 25.62)</td>
+</tr>
+<tr>
+<td>пик контекста</td>
+<td>52 352 из 262 144 — 20% окна</td>
+</tr>
+<tr>
+<td>размышление</td>
+<td>96 099 знаков</td>
+</tr>
+<tr>
+<td>готовый код</td>
+<td>58 103 знака</td>
+</tr>
+<tr>
+<td>остановка</td>
+<td>по своей воле (<code>stop</code>), не по лимиту</td>
+</tr>
+</tbody>
+</table></div>
+<p>Размышление занимает две трети выдачи: у модели <code>default_reasoning_effort: xhigh</code>
+(поддерживаются также <code>medium</code> и <code>low</code>). Это и есть причина, по которой ответ идёт
+десятками минут; понизив усилие, время сокращают за счёт качества разбора задачи.</p>
+<h3>Скорость генерации прямо в чате</h3>
+<p>Open WebUI 0.10.2 скорость <strong>не считает</strong> — ни фронтенд, ни бэкенд. Он умеет вычислять её
+только для Ollama-подключений (<code>utils/response.py:170-184</code>, поле <code>response_token/s</code> из
+<code>eval_count</code> и <code>eval_duration</code>); для OpenAI-совместимых серверов этот код не вызывается, а
+поиск по исходникам всей сборки не даёт ни одного совпадения на <code>token/s</code>. Значит цифру
+должен прислать сам сервер.</p>
+<p>Дверь для этого есть, и правок Open WebUI она не требует — <code>utils/middleware.py:4152</code>:</p>
+<pre><code class="language-python">raw_usage.update(data.get('timings', {}))  # llama.cpp
+</code></pre>
+<p>Любой объект <code>timings</code> на верхнем уровне финального чанка вливается прямо в <code>usage</code>.
+Дальше <code>normalize_usage</code> (<code>result = dict(usage)</code>) сохраняет все исходные поля, а
+<code>merge_usage</code> складывает только токены и стоимость — остальное «keeps the latest provider
+value». Показывается это в подсказке у иконки <strong>«i»</strong> под ответом
+(<code>ResponseMessage.svelte:1160</code>); отдельной строки со скоростью в 0.10.2 не существует.</p>
+<p><strong>Нужны оба шага, порознь не работают.</strong></p>
+<p>Шаг 1 — включить у модели способность «Usage». Без неё фронтенд не добавляет в запрос
+<code>stream_options: {include_usage: true}</code> (<code>Chat.svelte:2604-2607</code>), и сервер не присылает
+ничего. Для модели, подключённой напрямую (своей строки в таблице <code>model</code> нет), действует
+глобальный ключ:</p>
+<pre><code class="language-sql">-- в capabilities добавить &quot;usage&quot;: true
+select value from config where key = 'models.default_metadata';
+</code></pre>
+<p>Читается из базы при формировании списка моделей (<code>utils/models.py:295</code>) — перезапуск
+контейнера не нужен, достаточно обновить страницу.</p>
+<p>Шаг 2 — врезка в движок (<code>server/openai_api.py</code>): в <code>stream_chat_completion_chunks</code>
+засекается начало запроса и момент первого события, а в финальный чанк рядом с <code>usage</code>
+кладётся <code>timings</code>. Скорость ответа считается <strong>по времени генерации</strong>, а не по всему
+запросу: иначе долгий префилл на процессоре занижал бы её втрое и цифра расходилась бы с
+той, что движок печатает в журнал (<code>gen throughput (token/s)</code>).</p>
+<p>Что приходит после обоих шагов (живая проба):</p>
+<pre><code class="language-json">&quot;usage&quot;:   {&quot;prompt_tokens&quot;: 65, &quot;completion_tokens&quot;: 39, &quot;total_tokens&quot;: 104},
+&quot;timings&quot;: {&quot;time_to_first_token_s&quot;: 0.83, &quot;generation_time_s&quot;: 1.86,
+            &quot;total_time_s&quot;: 2.69, &quot;response_token/s&quot;: 20.91, &quot;prompt_token/s&quot;: 78.71}
+</code></pre>
+<p>Имена полей взяты в стиле Ollama-пути Open WebUI, чтобы подсказка читалась одинаково для
+любой модели.</p>
+<h4>На vLLM это делается штатно</h4>
+<p>У vLLM свой счётчик уже есть, писать ничего не надо — достаточно флага
+<code>--enable-per-request-metrics</code>. Он кладёт в финальный чанк стрима объект <code>metrics</code>:</p>
+<pre><code class="language-json">&quot;metrics&quot;: {&quot;time_to_first_token_ms&quot;: 83.65, &quot;generation_time_ms&quot;: 1602.0,
+            &quot;queue_time_ms&quot;: 0.008, &quot;mean_itl_ms&quot;: 14.97, &quot;tokens_per_second&quot;: 64.07}
+</code></pre>
+<p>Флаг требует включённой статистики движка: вместе с <code>--disable-log-stats</code> vLLM откажется
+стартовать (<code>cli_args.py</code>, проверка при разборе аргументов).</p>
+<p>Мостик всё равно нужен: Open WebUI читает только верхнеуровневый <code>timings</code> и поле <code>metrics</code>
+не смотрит. Поэтому рядом кладутся те же числа в секундах под именами, которые интерфейс
+уже понимает. Правка протокола не требуется — <code>ChatCompletionStreamResponse</code> наследует
+<code>OpenAIBaseModel</code> с <code>ConfigDict(extra="allow")</code>, поэтому лишнее поле проходит.</p>
+<p>Такой источник цифры лучше самодельного: скорость считает сам движок, и это видно в ответе
+рядом с нашими полями — удобно, когда числа нужно кому-то показать.</p>
+<p><strong>Про лимит вывода при этом:</strong> на vLLM <code>max_tokens</code> во весь контекст ставить НЕЛЬЗЯ. Он
+требует <code>prompt_tokens + max_tokens &lt;= max_model_len</code> и отвергает запрос с текстом
+«you requested N output tokens and your prompt contains ...». Параметр в Open WebUI надо
+просто не задавать — тогда под ответ уходит весь остаток контекста. FreeToken в той же
+ситуации избыточное значение молча урезает, поэтому настройка, вылеченная на одном движке,
+на другом становится поломкой: при смене движка параметры по умолчанию пересматривать.</p>
 <h2>Грабли</h2>
 <p><strong>Обновление пакета сносит врезки.</strong> <code>FT_CPU_PREFILL</code> живёт двумя правками внутри venv
 (<code>engine/engine.py</code> и <code>layers/moe.py</code>). После обновления пакета их нет, а скорость падает молча.
@@ -261,6 +435,14 @@ KV тут ни при чём — он рассчитан на 205 тысяч т�
 <code>journalctl -u ftserve | grep "gen throughput"</code>.</p>
 <p><strong><code>pkill -f "ft serve"</code> убивает собственную оболочку</strong> — строка команды содержит тот же текст.
 Писать <code>pkill -f "[f]t serve"</code>.</p>
+<p><strong>docker-compose 1.29.2 на Docker 28 разрушает контейнер.</strong> <code>docker-compose up -d</code> падает с
+<code>KeyError: 'ContainerConfig'</code>, но ДО падения успевает переименовать и остановить старый
+контейнер — сервис лежит, а новый не создан. Плагина <code>docker compose</code> v2 в контейнере нет.
+Поднимать напрямую <code>docker run</code> с набором из compose-файла; тома именованные, данные
+переживают пересоздание, <code>.webui_secret_key</code> лежит в томе, поэтому разлогина не происходит.</p>
+<p><strong>Правка в форке не действует, пока не перенесена в рабочую копию.</strong> Служба запускается из
+<code>/root/ft-venv/lib/python3.10/site-packages/freetoken</code> — это отдельная копия дерева, а не
+ссылка на форк. Порядок всегда один: правка в форк, <code>cp</code> в site-packages, перезапуск.</p>
 <h2>Обслуживание</h2>
 <p>Подъём (transient-юнит, переживает выход из сессии):</p>
 <pre><code>pct exec 110 -- systemd-run --unit=ftserve --setenv=HOME=/root /bin/bash /root/ft_cpu.sh
