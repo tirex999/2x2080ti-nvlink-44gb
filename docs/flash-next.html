@@ -54,6 +54,77 @@ em{color:var(--mut)}
 лежала в видеопамяти: чекпоинт в FP8 весит <strong>172 ГБ</strong>, в BF16 — 335 ГБ. У нас 44 ГБ видеопамяти
 на двух картах. Поэтому ниже — не адаптация чужого рецепта, а свой, собранный на живом стенде.</p>
 <p>Всё, что здесь написано, измерено. Где числа — это наши замеры, не документация.</p>
+<h2>Новое 26.09: llama.cpp с кэшем экспертов — 28–30 т/с</h2>
+<p>Лучший наш результат на этой модели: <strong>28.4–30.4 т/с вывода</strong> на коротком запросе и <strong>27.7–28.7 т/с</strong>
+на промпте в 5.3 тысячи токенов. Прежний рекорд — 24.4 т/с (FreeToken, 08.09).</p>
+<p>Как это устроено: llama.cpp с <a href="https://github.com/ggml-org/llama.cpp/pull/27861">PR #27861</a> — кэш
+«горячих» экспертов прямо в VRAM. Все эксперты лежат в закреплённой памяти хоста (<code>CUDA_Host</code>), процессор
+считает те, которых нет на карте, а те, что модель брала последние несколько десятков токенов, живут в
+кэше на обеих картах. Модель выбирает экспертов с сильной повторяемостью, поэтому кэш попадает часто.
+Рецепт взят у <a href="https://www.reddit.com/r/LocalLLaMA/comments/1w5vjp6/">автора с 2×3090</a> и переложен на наши карты.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>запрос</th>
+<th>промпт</th>
+<th>вывод, т/с</th>
+<th>время до первого токена</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>короткий (код)</td>
+<td>75 ток</td>
+<td>28.4 → 30.4</td>
+<td>3.0 с</td>
+</tr>
+<tr>
+<td>средний</td>
+<td>5 337 ток</td>
+<td>27.7 → 28.7</td>
+<td>51 с (префилл 104 т/с)</td>
+</tr>
+<tr>
+<td>тот же средний повторно</td>
+<td>5 337 ток</td>
+<td>28.7</td>
+<td><strong>0.27 с</strong> — кэш префикса llama.cpp</td>
+</tr>
+</tbody>
+</table></div>
+<p>Железо: узел с 2×2080Ti 22 ГБ, 2×Xeon Ice Lake, 220 ГБ DDR4-2666; контейнер с лимитом 150 ГБ.
+Квант — <code>lmstudio-community/Qwen3.8-Flash-Next-GGUF</code> Q4_K_M (119 ГБ).</p>
+<p><strong>Сборка.</strong> PR ещё не влит в основную ветку, берём его голову:</p>
+<pre><code class="language-bash">git init llama-pr27861 &amp;&amp; cd llama-pr27861
+git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --depth=1 origin refs/pull/27861/head:pr-27861 &amp;&amp; git checkout pr-27861
+cmake -S . -B build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=ON -DLLAMA_CURL=OFF
+cmake --build build -j 40 --target llama-server
+</code></pre>
+<p><strong>Правка в одну строку, без неё не работает.</strong> В этой версии PR правило <code>-ot "...=CUDA_Host"</code> падает с
+<code>Available buffer types: CPU CUDA0 CUDA1</code> — разбор знает только буферы устройств. В <code>common/arg.cpp</code>,
+функция <code>parse_tensor_buffer_overrides</code>, в цикл по устройствам добавить закреплённый буфер хоста:</p>
+<pre><code class="language-cpp">        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+        if (hbuft) {
+            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
+        }
+</code></pre>
+<p><strong>Запуск:</strong></p>
+<pre><code class="language-bash">LLAMA_ATTN_ROT_DISABLE=1 numactl --interleave=all ./build/bin/llama-server \
+  -m Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf --no-mmap \
+  -ngl 99 -c 131072 --parallel 1 -fa on \
+  -ot &quot;ffn_(gate|up|down)_exps\.weight=CUDA_Host,per_layer_token_embd\.weight=CPU&quot; \
+  -t 24 -tb 48 -b 4096 -ub 512 -ctk f16 -ctv f16 \
+  --moe-expert-cache 200 --jinja --host 0.0.0.0 --port 8081
+</code></pre>
+<ul>
+<li><code>--no-mmap</code> обязателен, если модель лежит на NFS: mmap с сетевой шары давал у нас 0.07 т/с.
+  Загрузка 119.6 ГБ с шары по гигабиту — около 20 минут, процесс держит ~112 ГБ RAM.</li>
+<li><code>--moe-expert-cache 200</code> — слоты кэша на слой; при 200 обе карты заполнены (21.7 и 19.9 ГБ).</li>
+<li><code>-ub 512</code> освобождает видеопамять под кэш, но режет префилл: <strong>104 т/с</strong> — это слабое место,
+  длинный контекст читается минутами. Кэш префикса спасает повторные запросы с тем же началом.</li>
+<li>MTP-голову эта сборка не грузит (проверено 04.09), здесь ускорение только за счёт кэша экспертов.</li>
+</ul>
 <h2>Почему FreeToken, а не vLLM и не llama.cpp</h2>
 <p>Ключ ко всему — <strong>где считаются эксперты</strong>. У модели 125 млрд параметров, из них
 120.8 млрд — роутируемые эксперты, и на каждый токен работают только 10 из 512.</p>
@@ -74,7 +145,7 @@ em{color:var(--mut)}
 <tr>
 <td>llama.cpp</td>
 <td>в RAM, но без перекрытия — две цепочки идут по очереди</td>
-<td>хуже</td>
+<td>хуже <em>(до 26.09; с PR #27861 и кэшем экспертов — </em><em>лучший результат</em><em>, см. раздел выше)</em></td>
 </tr>
 <tr>
 <td><strong>FreeToken</strong></td>
@@ -170,6 +241,11 @@ exec numactl --interleave=all /root/ft-venv/bin/ft serve \
 <td>08.09</td>
 <td><strong>в живом чате, длинный ответ</strong></td>
 <td><strong>24.4</strong></td>
+</tr>
+<tr>
+<td>26.09</td>
+<td><strong>llama.cpp PR #27861 + кэш экспертов в VRAM, Q4_K_M, обе карты</strong></td>
+<td><strong>28.4–30.4</strong></td>
 </tr>
 </tbody>
 </table></div>
