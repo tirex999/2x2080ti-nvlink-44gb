@@ -1,0 +1,1296 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0b17460..b6ff80d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -49,7 +49,9 @@ if(STRATA_ENABLE_CUDA)
+     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
+       continue()
+     endif()
+-    if(_base LESS 80)
++    # sm_75 (Turing, RTX 20): the tf32 scorer has a scalar branch and fused_gr splits its verify window to fit
++    # Turing's 64 KB of shared memory per block (26.09.2026, 2x RTX 2080 Ti 22 GB port).
++    if(_base LESS 75)
+       message(FATAL_ERROR
+         "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
+         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index c64bf4e..0405150 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -88,6 +88,38 @@ struct GpuPlanSink {
+     int pcie_mode = 0;
+ };
+ 
++/// 26.09.2026: THE SECOND CARD AS A THIRD EXECUTOR OF A VERIFY WINDOW'S EXPERTS.
++///
++/// The main card's graph is untouched.  Experts the main card does not hold but this card does are computed here,
++/// beside the CPU pool: the pool launches them right after publishing the main card's plan, computes its own share,
++/// then waits for this card's event.  Its rows land in the SAME mapped `y_miss` rows the CPU writes, so to the main
++/// card they look exactly like CPU rows and its `post` needs no change.  Needs the verify window's mapped buffers
++/// allocated PORTABLE (this card reads `x` and writes `y_miss` through them).
++struct SecondCard {
++    int device = -1;                          ///< CUDA device of this card; the main card is device `main_device`
++    int main_device = 0;
++    const int32_t* host_res = nullptr;        ///< [n_layers * n_expert] -> slot on this card, or -1
++    const uint8_t* cache_base = nullptr;      ///< device address of slot 0
++    const uint64_t* slot_off = nullptr;       ///< byte offset of each slot (sized slots)
++    void* stream = nullptr;                   ///< cudaStream_t on this card
++    void* done = nullptr;                     ///< cudaEvent_t, recorded after the rows are in `y_miss`
++    float* x = nullptr;                       ///< device: MAXT x n_embd activations
++    void* xq = nullptr;                       ///< device: their q8_1 blocks
++    void* scratch = nullptr;                  ///< device: `native_expert_scratch_bytes(cap, n_ff)`
++    float* out = nullptr;                     ///< device: cap x n_embd rows, indexed like `y_miss`
++    int32_t* h_plan = nullptr;                ///< pinned host: counts[4] | start[cap+1] | dst[cap] | tok[cap] | ptr[cap] (u64)
++    int32_t* d_plan = nullptr;                ///< device copy
++    int64_t cap = 0;                          ///< entries (MAXT x k)
++    int64_t plan_i32 = 0;                     ///< int32 words in the plan block
++    bool pending = false;                     ///< launched in this layer, not yet waited for
++    int64_t entries = 0;                      ///< routed entries it computed
++    int64_t experts = 0;                      ///< distinct (layer, expert) pairs it computed
++    int64_t launches = 0;                     ///< layers it took part in
++    int64_t dual_card = 0, dual_main = 0;     ///< experts both cards hold, sent here / left to the main card
++    double ms_launch = 0;                     ///< host time spent issuing its work
++    double ms_wait = 0;                       ///< host time spent waiting for it after the CPU share
++};
++
+ /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
+ struct ExpertDispatch {
+     strata::kernels::cpu::ExpertPool* pool = nullptr;
+@@ -204,12 +236,18 @@ struct ExpertDispatch {
+     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
+     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
+     GpuPlanSink* plan = nullptr;
++    /// 26.09.2026: the second card (null = one card).  See `SecondCard`.
++    SecondCard* card2 = nullptr;
+     int pcie_num = 0;
+     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
+     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
+     std::vector<float> usage;
++    /// 26.09.2026: RAW routed counts per (layer, expert) over the whole run - no decay, empty = off.  `usage` above
++    /// is decayed by the adaptive tier and cannot rank experts past the profile's 8000; this one can, and it is
++    /// what a residency plan for a second card is built from (STRATA_USAGE_DUMP=path in generate).
++    std::vector<uint32_t> routed_total;
+     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
+     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
+     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 384ccc0..dad339c 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -27,8 +27,12 @@
+ 
+ #include <cuda_runtime.h>
+ 
++#include <atomic>
++#include <condition_variable>
+ #include <cstdint>
++#include <mutex>
+ #include <string>
++#include <thread>
+ 
+ namespace strata::core {
+ 
+@@ -77,11 +81,33 @@ public:
+     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
+     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
+     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
++    /// 26.09.2026: whether the pool can hand the GPU a PCIe share at all (`--pcie-frac` > 0).  Off leaves the PCIe
++    /// groups out of the captured graph.  Set before the first `run`.
++    void set_pcie_share(bool on) { pcie_share_ = on; }
+ 
+     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
++    double ms_launch = 0;   ///< 26.09.2026: time the window's cudaGraphLaunch took (on whichever thread issued it)
+     int64_t windows = 0;
+ 
+ private:
++    // 26.09.2026: THE WINDOW'S GRAPH IS LAUNCHED FROM ITS OWN THREAD.  On sm_75 `cudaGraphLaunch` of the ~5000-node
++    // window graph blocks its caller for ~5 ms while the device already runs the first nodes - and the first thing
++    // the device needs is layer 0's plan from the very thread stuck in the launch.  Measured (nsys): the graph
++    // waited 4.7 ms at layer 0 in every round.  With the launch on this thread, the pool's thread serves layer 0 at
++    // once and the submission stays ahead of the execution.  BUT without nsys the launch measured 1.3 ms, not 5,
++    // and the thread came out 0.8 % slower (61.09 vs 60.58 t/s), so it is opt-in: STRATA_ASYNC_LAUNCH=1.
++    void launcher_main();
++    std::thread launch_thr_;
++    std::mutex launch_mu_;
++    std::condition_variable launch_cv_;
++    bool launch_stop_ = false;
++    cudaGraphExec_t launch_exec_ = nullptr;
++    int launch_device_ = 0;
++    std::atomic<int> launch_state_{0};   ///< 0 idle, 1 requested, 2 issued (launch_err_ valid)
++    cudaError_t launch_err_ = cudaSuccess;
++    bool async_launch_ = false;
++    bool pcie_share_ = true;
++
+     bool capture(int T, std::string& err);
+     bool capture_commit(std::string& err);
+     bool record_window(int T, cudaStream_t cs, std::string& err);
+diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
+index 020d78d..c390e54 100644
+--- a/include/strata/kernels/iq_kernels.hpp
++++ b/include/strata/kernels/iq_kernels.hpp
+@@ -54,4 +54,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+ 
++/// 26.09.2026, the second card: rows `ent_dst[0 .. *n_entries)` of `src` (n_embd floats each) copied to the same
++/// rows of `out` - mapped host memory, written in 16-byte stores so the PCIe writes are whole lines rather than
++/// the down kernel's one float per warp.  Ends with a system fence: the host reads `out` once the stream's event
++/// has completed, and the other card reads it after that.
++void gather_rows(const float* src, const int32_t* ent_dst, const int32_t* n_entries, int64_t cap_entries,
++                 int64_t n_embd, float* out, void* stream);
++
+ }  // namespace strata::kernels
+diff --git a/setup.py b/setup.py
+index a17eb68..2290b92 100644
+--- a/setup.py
++++ b/setup.py
+@@ -645,8 +645,8 @@ def main() -> int:
+              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
+     ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
+        f"driver {gpu['driver']}")
+-    if int(gpu["arch"]) < 80:
+-        fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
++    if int(gpu["arch"]) < 75:
++        fail("this GPU is older than the RTX 20 series (compute capability 7.5 is required)")
+     if driver_major(gpu) < MIN_DRIVER:
+         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
+              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 0ab1ce1..555c6f8 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -7,10 +7,14 @@
+ #include "strata/kernels/quantize_act.hpp"
+ #include "strata/kernels/s2_expert_grouped.hpp"
+ 
++#include "strata/kernels/iq_kernels.hpp"
++
+ #include <cuda_runtime.h>
++#include <immintrin.h>
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -248,6 +252,52 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
+     d.experts += k;
+ }
+ 
++namespace {
++
++// 26.09.2026: the second card's share of a verify window's layer.  The caller has written the plan block
++// (`SecondCard::h_plan`); this copies it and the window's activations over, runs the grouped kernels on the card's
++// slots and gathers the rows into the mapped `out` (the same `y_miss` rows the CPU writes).  Asynchronous: the
++// caller computes the CPU share meanwhile and then calls `second_card_wait`, before the main card is told the
++// layer is served.  The plan and `x` are not touched again until then, so the copies cannot race the next layer.
++bool second_card_issue(SecondCard& c, const strata::kernels::cpu::NativeFmt& f, const float* x_f, int64_t n_tok,
++                       int64_t n_embd, float* out, int groups, int entries) {
++    const auto t0 = std::chrono::steady_clock::now();
++    if (cudaSetDevice(c.device) != cudaSuccess) return false;
++    cudaStream_t s = (cudaStream_t) c.stream;
++    const int64_t cap = c.cap, ptr_off = (4 + (cap + 1) + 2 * cap + 1) & ~1ll;
++    bool ok = cudaMemcpyAsync(c.d_plan, c.h_plan, (size_t) c.plan_i32 * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
++              cudaMemcpyAsync(c.x, x_f, (size_t) n_tok * (size_t) n_embd * 4, cudaMemcpyHostToDevice, s) == cudaSuccess;
++    if (ok) {
++        strata::kernels::quantize_q8_1_rows(c.x, n_tok, n_embd, c.xq, s);
++        const int32_t* counts = c.d_plan;
++        const int32_t* start = counts + 4;
++        const int32_t* dst = start + cap + 1;
++        const int32_t* tok = dst + cap;
++        const unsigned long long* ptr = (const unsigned long long*) (c.d_plan + ptr_off);
++        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
++        strata::kernels::native_expert_grouped(L, ptr, start, counts, dst, tok, groups, entries, c.xq, c.scratch, c.out, s);
++        strata::kernels::gather_rows(c.out, dst, counts + 1, entries, n_embd, out, s);
++        ok = cudaEventRecord((cudaEvent_t) c.done, s) == cudaSuccess;
++    }
++    cudaSetDevice(c.main_device);
++    c.pending = ok;
++    ++c.launches;
++    c.ms_launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    return ok;
++}
++
++bool second_card_wait(SecondCard& c) {
++    const auto t0 = std::chrono::steady_clock::now();
++    cudaError_t q;
++    while ((q = cudaEventQuery((cudaEvent_t) c.done)) == cudaErrorNotReady) _mm_pause();
++    c.pending = false;
++    c.ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    if (q != cudaSuccess) std::fprintf(stderr, "strata: second card: %s\n", cudaGetErrorString(q));
++    return q == cudaSuccess;
++}
++
++}  // namespace
++
+ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                                 float* out) {
+     using namespace strata::kernels::cpu;
+@@ -275,13 +325,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     if (!d.usage.empty())
+         for (int64_t i = 0; i < n_tok * k; ++i)
+             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
++    if (!d.routed_total.empty())
++        for (int64_t i = 0; i < n_tok * k; ++i)
++            if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.routed_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
+     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
+     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
+     const int64_t n = n_tok * k;
+-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
++    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 the second card
++    SecondCard* card = (d.card2 != nullptr && native && n <= d.card2->cap) ? d.card2 : nullptr;
++    auto slot2 = [&](int32_t e) -> int32_t {
++        return card != nullptr ? card->host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] : kNotResident;
++    };
+     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
+         int64_t distinct[128], first_of[128];
+         int nd = 0, nmiss = 0;
++        int n_main = 0, n_card = 0, n_dual = 0;   // distinct experts only the main card / only the second / both hold
+         for (int64_t i = 0; i < n; ++i) {
+             first_of[i] = i;
+             for (int64_t j = 0; j < i; ++j)
+@@ -289,9 +347,41 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             if (first_of[i] == i) {
+                 distinct[nd++] = i;
+                 const int32_t e = ids[i];
+-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
++                if (e < 0 || e >= d.n_expert) continue;
++                const bool on_main = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
++                const bool on_card = slot2(e) >= 0;
++                if (on_main && on_card) ++n_dual;
++                else if (on_main) ++n_main;
++                else if (on_card) ++n_card;
++                else ++nmiss;   // missed by both cards: the PCIe share and the CPU split these
+             }
+         }
++        // 26.09.2026: experts BOTH cards hold are split so that the two finish together.  The main card starts its
++        // hits later (after its shared expert) but has no host round trip; `bias` (STRATA_CARD2_BIAS, in experts) is
++        // how much earlier the second card's share effectively starts.  Main: n_main + (n_dual - k); card: n_card + k.
++        static const double bias = std::getenv("STRATA_CARD2_BIAS") ? std::atof(std::getenv("STRATA_CARD2_BIAS")) : 1.0;
++        int k_dual = 0;
++        if (n_dual > 0) {
++            const double kk = (bias + (double) n_main + (double) n_dual - (double) n_card) / 2.0;
++            k_dual = (int) std::lround(kk);
++            k_dual = k_dual < 0 ? 0 : (k_dual > n_dual ? n_dual : k_dual);
++        }
++        int dual_sent = 0;
++        // 26.09.2026: the second card's groups, in its own plan block (see `SecondCard`)
++        int g2 = 0, e2 = 0;
++        int32_t* c2_counts = nullptr;
++        int32_t* c2_start = nullptr;
++        int32_t* c2_dst = nullptr;
++        int32_t* c2_tok = nullptr;
++        unsigned long long* c2_ptr = nullptr;
++        if (card != nullptr) {
++            const int64_t cap = card->cap, ptr_off = (4 + (cap + 1) + 2 * cap + 1) & ~1ll;
++            c2_counts = card->h_plan;
++            c2_start = c2_counts + 4;
++            c2_dst = c2_start + cap + 1;
++            c2_tok = c2_dst + cap;
++            c2_ptr = (unsigned long long*) (card->h_plan + ptr_off);
++        }
+         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
+         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+@@ -305,7 +395,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             unsigned long long ptr = 0;
+             if (e >= 0 && e < d.n_expert) {
+                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+-                if (slot >= 0) {
++                int32_t s2 = slot2(e);
++                if (slot >= 0 && s2 >= 0) {           // held by both: the first k_dual go to the second card
++                    if (dual_sent < k_dual) { ++dual_sent; ++card->dual_card; }
++                    else { s2 = kNotResident; ++card->dual_main; }
++                }
++                if (s2 >= 0) {
++                    kd = 2;
++                    c2_ptr[g2] = (unsigned long long) (card->cache_base + (size_t) card->slot_off[s2]);
++                    c2_start[g2] = e2;
++                    for (int64_t i = i0; i < n; ++i)
++                        if (first_of[i] == i0) {
++                            c2_dst[e2] = (int32_t) i;
++                            c2_tok[e2] = (int32_t) (i / k);
++                            ++e2;
++                        }
++                    ++g2;
++                } else if (slot >= 0) {
+                     kd = 0;
+                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
+                                                                                  : (size_t) slot * (size_t) d.cache_blob));
+@@ -359,6 +465,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         if (P.publish) P.publish(P.ctx);
+         pt("fetch", fetches);
+         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
++        // 26.09.2026: the second card's share, issued now so it runs while the CPU computes its own
++        if (g2 > 0) {
++            c2_start[g2] = e2;
++            c2_counts[0] = g2;
++            c2_counts[1] = e2;
++            c2_counts[2] = 0;
++            c2_counts[3] = 0;
++            card->experts += g2;
++            card->entries += e2;
++            if (!second_card_issue(*card, lay.fmt[(size_t) d.layers], x_f, n_tok, H, out, g2, e2)) {
++                d.failed = true;
++                d.fail = "the second card could not issue its experts";
++                d.fail_layer = d.layers;
++                return;
++            }
++        }
+     } else {
+         for (int64_t i = 0; i < n; ++i) {
+             const int32_t e = ids[i];
+@@ -388,6 +510,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 d.fail_expert = e;
+                 return;
+             }
++            if (kind[i] == 2) continue;    // the second card writes this row itself - it must not be cleared here
+             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
+                 if (kind[i] == 0) ++d.cache_hits;
+                 std::memset(row, 0, (size_t) H * sizeof(float));
+@@ -421,6 +544,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     pt("run", njobs);
+     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
++    if (card != nullptr && card->pending && !second_card_wait(*card)) {
++        d.failed = true;
++        d.fail = "the second card failed";
++        d.fail_layer = d.layers;
++        return;
++    }
+     const auto c4 = std::chrono::steady_clock::now();
+     pt("ran");
+     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+diff --git a/src/core/pinned.cu b/src/core/pinned.cu
+index 56573ce..2a2ce2d 100644
+--- a/src/core/pinned.cu
++++ b/src/core/pinned.cu
+@@ -60,7 +60,21 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
+     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     got = PageBacking::NormalPages;
+-    return p == MAP_FAILED ? nullptr : p;
++    if (p == MAP_FAILED) return nullptr;
++    // 26.09.2026: no hugetlb pool, but transparent huge pages need none - on a kernel in `madvise` mode the
++    // region only has to ask, BEFORE the first touch (cudaHostRegister below faults every page in).  2 MB pages
++    // cut the pool's TLB misses and let the hardware prefetcher run past 4 KB boundaries.  STRATA_ARENA_THP=0
++    // is the A/B arm.
++    {
++        const char* thp = std::getenv("STRATA_ARENA_THP");
++        if (thp == nullptr || std::string(thp) != "0") {
++            if (madvise(p, bytes, MADV_HUGEPAGE) == 0) note = "MAP_HUGETLB unavailable; transparent huge pages requested (madvise)";
++            else note += "; madvise(MADV_HUGEPAGE) refused";
++        } else {
++            note += "; transparent huge pages off (STRATA_ARENA_THP=0)";
++        }
++    }
++    return p;
+ #endif
+ }
+ 
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 35a73a2..8ebd423 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -57,7 +57,8 @@ struct Bump {
+ };
+ 
+ bool mapped(size_t bytes, void** h, void** d) {
+-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
++    // PORTABLE (26.09.2026): the second card reads `x` and writes `y_miss` through these as well
++    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
+     std::memset(*h, 0, bytes);
+     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+ }
+@@ -90,6 +91,14 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
+ }  // namespace
+ 
+ Verifier::~Verifier() {
++    if (launch_thr_.joinable()) {
++        {
++            std::lock_guard<std::mutex> lk(launch_mu_);
++            launch_stop_ = true;
++        }
++        launch_cv_.notify_one();
++        launch_thr_.join();
++    }
+     if (cs_) cudaStreamSynchronize(cs_);
+     for (auto& e : exec_)
+         if (e) cudaGraphExecDestroy(e);
+@@ -242,11 +251,35 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         err = "verify: stream create failed";
+         return false;
+     }
+-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
+-                 (double) count.used / 1048576.0);
++    {
++        async_launch_ = std::getenv("STRATA_ASYNC_LAUNCH") != nullptr && std::string(std::getenv("STRATA_ASYNC_LAUNCH")) != "0";
++        cudaGetDevice(&launch_device_);
++        if (async_launch_) launch_thr_ = std::thread([this] { launcher_main(); });
++    }
++    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers; graph launched from %s\n",
++                 max_t, (double) count.used / 1048576.0, async_launch_ ? "its own thread" : "the pool's thread");
+     return true;
+ }
+ 
++void Verifier::launcher_main() {
++    cudaSetDevice(launch_device_);
++    for (;;) {
++        cudaGraphExec_t ex = nullptr;
++        {
++            std::unique_lock<std::mutex> lk(launch_mu_);
++            launch_cv_.wait(lk, [&] { return launch_stop_ || launch_state_.load(std::memory_order_acquire) == 1; });
++            if (launch_stop_) return;
++            ex = launch_exec_;
++        }
++        const Clock::time_point t0 = Clock::now();
++        cudaError_t e = cudaGraphLaunch(ex, cs_);
++        if (e == cudaSuccess) (void) cudaStreamQuery(cs_);
++        ms_launch += ms_since(t0);
++        launch_err_ = e;
++        launch_state_.store(2, std::memory_order_release);
++    }
++}
++
+ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+ 
+ // ================================ THE WINDOW, AS CAPTURED ================================
+@@ -542,14 +575,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             }
+         };
+         grouped(p_ptr, p_start, p_counts);
+-        wait_flag_ge(m_flagB_, ring, cs);                      // the PCIe share is in staging (DMA) or mapped
+-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
++        // 26.09.2026: with no PCIe share (--pcie-frac 0, e.g. a second card holding the misses) its wait and its four
++        // kernels are left out of the graph - ~15 us per layer of launches over empty groups on a 2080 Ti
++        if (pcie_share_) {
++            wait_flag_ge(m_flagB_, ring, cs);                  // the PCIe share is in staging (DMA) or mapped
++            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
++                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
++                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
++                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
++                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
++            }
++            grouped(p_ptr2, p_start2, p_counts + 2);
+         }
+-        grouped(p_ptr2, p_start2, p_counts + 2);
+         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
+         copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+@@ -736,9 +773,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+     ms_host += ms_since(t0);
+     VDBG("staged; launching\n");
+-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+-    (void) cudaStreamQuery(cs_);
++    // 26.09.2026: the launch goes to `launch_thr_` (see the header); `issued` says whether it has returned, and
++    // until it has, an idle stream means "not submitted yet", not "finished" - the watchdog below waits for it.
++    bool issued = false;
++    auto check_issued = [&]() -> bool {
++        if (issued) return true;
++        if (launch_state_.load(std::memory_order_acquire) != 2) return false;
++        issued = true;
++        return true;
++    };
++    if (async_launch_) {
++        {
++            std::lock_guard<std::mutex> lk(launch_mu_);
++            launch_exec_ = exec_[T];
++            launch_state_.store(1, std::memory_order_release);
++        }
++        launch_cv_.notify_one();
++    } else {
++        const Clock::time_point tl = Clock::now();
++        const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
++        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
++        (void) cudaStreamQuery(cs_);
++        ms_launch += ms_since(tl);
++        issued = true;
++    }
+     VDBG("launched\n");
+     volatile uint32_t* const seq = h_seq_;
+     volatile uint32_t* const flag = h_flag_;
+@@ -755,16 +813,26 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+             _mm_pause();
+             if ((++spins & 1023u) != 0) continue;
+             const auto now = Clock::now();
+-            if (now - last_flush > std::chrono::microseconds(2000)) {
++            if (now - last_flush > std::chrono::microseconds(2000) && check_issued()) {
+                 last_flush = now;
++                if (async_launch_ && launch_err_ != cudaSuccess) {
++                    err = std::string("verify: launch: ") + cudaGetErrorString(launch_err_);
++                    launch_state_.store(0, std::memory_order_release);
++                    return false;
++                }
+                 const cudaError_t q = cudaStreamQuery(cs_);
+                 if (q != cudaErrorNotReady && *seq < want) {
+                     err = "verify: layer " + std::to_string(l) + " never rang (" +
+                           (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
++                    if (async_launch_) launch_state_.store(0, std::memory_order_release);   // issued: nothing in flight
+                     return false;
+                 }
+             }
+-            if (now - a > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
++            if (now - a > std::chrono::seconds(20)) {
++                err = "verify: timed out at layer " + std::to_string(l);
++                if (async_launch_ && check_issued()) launch_state_.store(0, std::memory_order_release);
++                return false;
++            }
+         }
+         const Clock::time_point b = Clock::now();
+         VDBG("layer %lld rang\n", (long long) l);
+@@ -791,6 +859,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+         ms_pool += ms_since(b);
+     }
++    if (async_launch_) {
++        // every layer rang, so the device has run the whole graph's layers - but the launch call itself may not
++        // have returned yet, and a stream sync before it has would not cover the head
++        while (!check_issued()) _mm_pause();
++        launch_state_.store(0, std::memory_order_release);
++        if (launch_err_ != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(launch_err_); return false; }
++    }
+     const cudaError_t se = cudaStreamSynchronize(cs_);
+     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index 2b963ad..05b08c3 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -54,6 +54,29 @@ std::vector<int> physical_cores(bool skip_first) {
+             if (CPU_ISSET(i, &set)) cores.push_back(i);
+     else
+         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
++    // Linux lists LOGICAL CPUs here, SMT siblings included - the same trap the Windows branch avoids above: two
++    // workers per physical core halve the bandwidth the expert kernel is bound by.  Keep the first logical CPU
++    // of each (package, core) pair, read from sysfs; if topology is unreadable, keep the list as it is.
++    // (26.09.2026, 2x Xeon Ice Lake: the container's cpuset mixed siblings of the same cores.)
++    {
++        std::vector<int> firsts;
++        std::vector<std::pair<int, int>> seen;
++        bool ok = true;
++        for (int c : cores) {
++            char path[128];
++            int pkg = -1, core = -1;
++            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
++            if (FILE* f = std::fopen(path, "r")) { if (std::fscanf(f, "%d", &pkg) != 1) pkg = -1; std::fclose(f); }
++            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
++            if (FILE* f = std::fopen(path, "r")) { if (std::fscanf(f, "%d", &core) != 1) core = -1; std::fclose(f); }
++            if (pkg < 0 || core < 0) { ok = false; break; }
++            const std::pair<int, int> key(pkg, core);
++            bool dup = false;
++            for (const auto& s : seen) if (s == key) { dup = true; break; }
++            if (!dup) { seen.push_back(key); firsts.push_back(c); }
++        }
++        if (ok && !firsts.empty()) cores.swap(firsts);
++    }
+ #endif
+     if (skip_first && !cores.empty()) cores.erase(cores.begin());
+     return cores;
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index c439ee4..8788ac7 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -6,6 +6,7 @@
+ 
+ #include <cstdio>
+ #include <cstdlib>
++#include <string>
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -293,6 +294,182 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
+     }
+ }
+ 
++// ================================ 26.09.2026: the T-token read shaped for a 68-SM Turing card ================================
++//
++// Measured on a 2080 Ti (nsys, verify window of 4): gr_norm_multi 9 us on 4 blocks, gr_down_multi 25 us on 41 blocks
++// (262 GB/s of 616), gr_up_multi 18 us - twice per layer, ~105 us of a ~424 us layer.  The same arithmetic with
++// the work spread over the card:
++//   gr_norm2 : one block per (token, stream) - 16 instead of 4 - and one pass (the values stay in registers);
++//   gr_down2 : the 10240 columns in KS = 4 chunks of one TILE, so 41 x 4 = 164 blocks; each writes its partial dot
++//              per (token, row) to `g_gr_part`, in a fixed place - deterministic, no atomics;
++//   gr_up2   : sums the 4 partials (silu for `lo`, the raw dot for `inject_out`) and runs 8 columns per block
++//              (320 blocks) instead of 16.
++// The summation order differs from gr_*_multi (per-chunk warp sums, then the 4 chunks), so the outputs are not
++// bitwise the single-token kernel's; STRATA_GR_V1=1 is the A/B arm back to the kernels above.
++constexpr int KS = D / TILE;                      // 4 column chunks
++constexpr int PROWS = LR + HC;                    // 320 down rows + 4 inject rows per (token, chunk)
++constexpr int UPM2_COLS = 8;
++constexpr int UPM2_BLOCKS = N / UPM2_COLS;        // 320
++__device__ float g_gr_part[kFusedGrMaxT * KS * PROWS];
++
++__global__ void __launch_bounds__(THREADS) gr_norm2_kernel(GrMulti m) {
++    __shared__ float part[WARPS];
++    __shared__ float s_rs;
++    const int tok = blockIdx.x, c = blockIdx.y;
++    const FusedGrArgs& a = m.a[tok];
++    float* xn = m.xn + (size_t) tok * D + (size_t) c * N;
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
++    constexpr int PER = (N / 4 + THREADS - 1) / THREADS;   // float4s per thread (3)
++    float4 rr[PER], gg[PER];
++    float ss = 0.0f;
++#pragma unroll
++    for (int j = 0; j < PER; ++j) {
++        const int q = t + j * THREADS;
++        if (q < N / 4) {
++            const int i = c * N + q * 4;
++            float4 r = *reinterpret_cast<const float4*>(a.R + i);
++            if (a.apply) {
++                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + q * 4);
++                r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y);
++                r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
++            }
++            rr[j] = r;
++            gg[j] = *reinterpret_cast<const float4*>(a.w_norm + i);
++            ss += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
++        }
++    }
++    ss = warp_sum(ss);
++    if (lane == 0) part[warp] = ss;
++    __syncthreads();
++    if (t == 0) {
++        float s = 0.0f;
++        for (int w = 0; w < WARPS; ++w) s += part[w];
++        s_rs = rsqrtf(s / (float) N + a.eps);
++        a.rs[c] = s_rs;
++    }
++    __syncthreads();
++    const float rs = s_rs;
++#pragma unroll
++    for (int j = 0; j < PER; ++j) {
++        const int q = t + j * THREADS;
++        if (q < N / 4) {
++            const float4 r = rr[j], g = gg[j];
++            *reinterpret_cast<float4*>(xn + q * 4) =
++                make_float4(r.x * g.x * rs, r.y * g.y * rs, r.z * g.z * rs, r.w * g.w * rs);
++        }
++    }
++}
++
++__global__ void __launch_bounds__(THREADS) gr_down2_kernel(GrMulti m) {
++    extern __shared__ __align__(16) float tile[];   // [T][TILE]
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const int T = m.T;
++    const int ks = blockIdx.y, base = ks * TILE;
++    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
++    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
++    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
++    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
++    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
++    uint4 wv[TQ];
++    if (active) {
++#pragma unroll
++        for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + base / 8 + lane + 32 * q);
++    }
++    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
++    float4* tile4 = reinterpret_cast<float4*>(tile);
++    for (int i = t; i < T * (TILE / 4); i += THREADS) {
++        const int k = i / (TILE / 4), off = i - k * (TILE / 4);
++        tile4[i] = src4[((size_t) k * D + base) / 4 + off];
++    }
++    __syncthreads();
++    if (!active) return;
++    float acc[kFusedGrMaxT];
++#pragma unroll
++    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
++#pragma unroll
++    for (int q = 0; q < TQ; ++q) {
++        const int j = lane + 32 * q;
++#pragma unroll
++        for (int k = 0; k < kFusedGrMaxT; ++k)
++            if (k < T) acc[k] += dot8(wv[q], tile + k * TILE + j * 8);
++    }
++    float s[kFusedGrMaxT];
++#pragma unroll
++    for (int k = 0; k < kFusedGrMaxT; ++k) s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
++    const int prow = inject_block ? LR + row : row;
++#pragma unroll
++    for (int k = 0; k < kFusedGrMaxT; ++k)
++        if (k < T && lane == k) g_gr_part[((size_t) k * KS + ks) * PROWS + prow] = s[k];
++}
++
++__global__ void __launch_bounds__(THREADS) gr_up2_kernel(GrMulti m) {
++    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
++    __shared__ float g[kFusedGrMaxT][HC][UPM2_COLS];
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const int T = m.T;
++    const int d0 = blockIdx.x * UPM2_COLS;
++    for (int i = t; i < T * LR; i += THREADS) {
++        const int k = i / LR, r = i - k * LR;
++        const float* p = g_gr_part + (size_t) k * KS * PROWS + r;
++        float sum = p[0];
++#pragma unroll
++        for (int c = 1; c < KS; ++c) sum += p[c * PROWS];
++        const float x = sum / (float) HC;
++        lo[k][r] = x / (1.0f + __expf(-x));
++    }
++    if (blockIdx.x == 0 && m.a[0].w_inject != nullptr && t < T * HC) {
++        const int k = t / HC, c = t - k * HC;
++        const float* p = g_gr_part + (size_t) k * KS * PROWS + LR + c;
++        float sum = p[0];
++#pragma unroll
++        for (int cc = 1; cc < KS; ++cc) sum += p[cc * PROWS];
++        m.a[k].inject_out[c] = sum;
++    }
++    __syncthreads();
++    for (int r = warp; r < HC * UPM2_COLS; r += WARPS) {
++        const int c = r / UPM2_COLS, dd = r - c * UPM2_COLS, i = c * N + d0 + dd;
++        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
++        const uint4 wa = __ldg(w4 + lane);
++        const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
++        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
++        bool apply = false;
++        if (lane < T) {
++            const FusedGrArgs& a = m.a[lane];
++            rv = a.R[i];
++            wn = a.w_norm[i];
++            rsc = a.rs[c];
++            apply = a.apply;
++            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
++        }
++        float mine = 0.0f;
++#pragma unroll
++        for (int k = 0; k < kFusedGrMaxT; ++k) {
++            if (k >= T) break;
++            float acc = dot8(wa, lo[k] + lane * 8);
++            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
++            acc = warp_sum(acc);
++            if (lane == k) mine = acc;
++        }
++        if (lane < T) {
++            if (apply) {
++                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
++                m.a[lane].R_out[i] = rv;
++            }
++            const float x = rv * wn * rsc;
++            g[lane][c][dd] = x * sigmoidf_(mine);
++        }
++    }
++    __syncthreads();
++    for (int i = t; i < T * UPM2_COLS; i += THREADS) {
++        const int k = i / UPM2_COLS, col = i - k * UPM2_COLS;
++        float s = 0.0f;
++#pragma unroll
++        for (int c = 0; c < HC; ++c) s += g[k][c][col];
++        m.a[k].mixed[d0 + col] = s / (float) HC;
++    }
++}
++
+ }  // namespace
+ 
+ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
+@@ -300,6 +477,22 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
+         std::exit(1);
+     }
++    // How many tokens' activation tiles fit in this GPU's shared memory: all 8 on sm_80+, 6 on Turing (64 KB
++    // opt-in).  Tokens are independent (each output is bitwise fused_gr_read(a[t])), so a longer window is split;
++    // the second half only re-reads the weights.
++    static int s_max_t = 0;
++    if (s_max_t == 0) {
++        int dev = 0, optin = 0;
++        cudaGetDevice(&dev);
++        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
++        const int fit = optin / (int) (TILE * sizeof(float));
++        s_max_t = fit < 1 ? 1 : (fit > kFusedGrMaxT ? kFusedGrMaxT : fit);
++    }
++    if (n_tok > s_max_t) {
++        fused_gr_read_multi(a, s_max_t, xn_scratch, stream);
++        fused_gr_read_multi(a + s_max_t, n_tok - s_max_t, xn_scratch + (size_t) s_max_t * D, stream);
++        return;
++    }
+     GrMulti m;
+     for (int t = 0; t < n_tok; ++t) {
+         m.a[t] = a[t];
+@@ -314,15 +507,24 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+     m.xn = xn_scratch;
+     m.T = n_tok;
+     cudaStream_t st = (cudaStream_t) stream;
+-    gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
++    static const bool v1 = std::getenv("STRATA_GR_V1") != nullptr && std::string(std::getenv("STRATA_GR_V1")) != "0";
+     static bool attr = false;
+     if (!attr) {
+         cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+-                             (int) (kFusedGrMaxT * TILE * sizeof(float)));
++                             (int) (s_max_t * TILE * sizeof(float)));
++        cudaFuncSetAttribute(gr_down2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int) (s_max_t * TILE * sizeof(float)));
+         attr = true;
+     }
+-    gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++    if (v1) {
++        gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
++        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
++        gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++    } else {
++        gr_norm2_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
++        gr_down2_kernel<<<dim3(DOWN_BLOCKS + 1, KS), THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
++        gr_up2_kernel<<<UPM2_BLOCKS, THREADS, 0, st>>>(m);
++    }
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) {
+         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 3525b91..2a76d82 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -717,4 +717,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     check("native_expert_grouped/down");
+ }
+ 
++namespace {
++__global__ void gather_rows_kernel(const float* __restrict__ src, const int32_t* __restrict__ ent_dst,
++                                   const int32_t* __restrict__ n_entries, int64_t n_embd, float* __restrict__ out) {
++    const int e = blockIdx.x;
++    if (e >= *n_entries) return;
++    const size_t row = (size_t) ent_dst[e] * (size_t) n_embd;
++    const float4* s = (const float4*) (src + row);
++    float4* o = (float4*) (out + row);
++    for (int64_t i = threadIdx.x; i < n_embd / 4; i += blockDim.x) o[i] = s[i];
++    __threadfence_system();
++}
++}  // namespace
++
++void gather_rows(const float* src, const int32_t* ent_dst, const int32_t* n_entries, int64_t cap_entries,
++                 int64_t n_embd, float* out, void* stream) {
++    if (cap_entries <= 0) return;
++    gather_rows_kernel<<<(unsigned) cap_entries, 256, 0, (cudaStream_t) stream>>>(src, ent_dst, n_entries, n_embd, out);
++    check("gather_rows");
++}
++
+ }  // namespace strata::kernels
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index a7801fa..84005ad 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -30,6 +30,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
+@@ -1046,6 +1047,14 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
+     const auto* w = static_cast<const typename F::Block*>(weights);
+     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+     if (!g_multi_exact) {
++        // 26.09.2026: STRATA_MMVQ_ROWS=4 - four rows per block of four warps (a quarter of the blocks of the exact
++        // layout, each weight block still loaded once for all the columns); otherwise llama.cpp's 2-row table
++        static const bool rows4 = std::getenv("STRATA_MMVQ_ROWS") != nullptr && std::atoi(std::getenv("STRATA_MMVQ_ROWS")) == 4;
++        if (rows4) {
++            const unsigned blocks4 = unsigned((std::size_t(n_out) + 3) / 4);
++            native_mmvq_multi_kernel<F, NCOLS, 4, 4><<<blocks4, dim3(WARP, 4), 0, s>>>(w, x, y, n_in, n_out);
++            return;
++        }
+         constexpr int NW = NCOLS <= 4 ? 4 : 2;
+         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+         native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out);
+diff --git a/src/kernels/cuda/native_qsa_score.cu b/src/kernels/cuda/native_qsa_score.cu
+index 9ae4d11..d98aa9d 100644
+--- a/src/kernels/cuda/native_qsa_score.cu
++++ b/src/kernels/cuda/native_qsa_score.cu
+@@ -32,6 +32,7 @@ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+ struct TileA { uint32_t x[4]; };
+ struct TileB { uint32_t x[2]; };
+ struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
++#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+ __device__ __forceinline__ void load_a(TileA& a,const float* p) {
+     const float* src=p+(threadIdx.x%16)*STRIDE+(threadIdx.x/16)*4;
+     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+@@ -48,6 +49,7 @@ __device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
+         : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
+         : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
+ }
++#endif
+ __global__ __launch_bounds__(64,1) void score_kernel(
+         const float* __restrict__ pooled,const float* __restrict__ query,
+         const float* __restrict__ bias,const int32_t* __restrict__ step,
+@@ -59,6 +61,39 @@ __global__ __launch_bounds__(64,1) void score_kernel(
+     if(row0>full)return;
+     const int lane=threadIdx.x,warp=threadIdx.y;
+     __shared__ __align__(16) float shared[WARPS*16*STRIDE];
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++    // Turing (sm_75) has no tf32 mma. Each warp takes 16 of the block's 32 rows and forms the full fp32 dot
++    // product of a row with each head's query (lane covers d = lane + 32*k, then a shuffle reduction); the full
++    // sum goes into the "warp 0" slot and 0 into the "warp 1" slot, so the shared epilogue below is unchanged.
++    // Not bit-identical to the tf32 path (tf32 truncates the inputs); these scores only rank blocks for top-k.
++    float q[HEADS][D/32];
++#pragma unroll
++    for(int j=0;j<HEADS;++j)
++#pragma unroll
++        for(int k=0;k<D/32;++k)q[j][k]=query[j*D+lane+32*k];
++    for(int r=warp*16;r<warp*16+16;++r){
++        const int row=row0+r;
++        float s[HEADS]={0.0f,0.0f,0.0f,0.0f};
++        if(row<=full){
++#pragma unroll
++            for(int k=0;k<D/32;++k){
++                const float p=pooled[size_t(row)*D+lane+32*k];
++#pragma unroll
++                for(int j=0;j<HEADS;++j)s[j]=fmaf(p,q[j][k],s[j]);
++            }
++        }
++#pragma unroll
++        for(int j=0;j<HEADS;++j){
++#pragma unroll
++            for(int o=16;o>0;o>>=1)s[j]+=__shfl_xor_sync(0xffffffffu,s[j],o);
++        }
++        if(lane==0){
++#pragma unroll
++            for(int j=0;j<HEADS;++j){shared[j*COMBINE+r]=s[j];shared[j*COMBINE+ROWS+r]=0.0f;}
++        }
++    }
++    __syncthreads();
++#else
+     float* tile=shared+warp*16*STRIDE;
+     TileC c[2];
+     // mmf's launch heuristic picks2warps for K128. Each warp accumulates
+@@ -99,6 +134,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
+         }
+     }
+     __syncthreads();
++#endif
+     // In the reference: +0 then warp0 partial then warp1 partial, followed
+     // by materialized ReLU, CONT(head0), ADD(head1), ADD(head2), ADD(head3).
+     if(warp==0){
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index e82d7dd..d768cf1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -28,6 +28,8 @@
+ #include "strata/kernels/sampler.hpp"
+ #include "strata/kernels/shared_expert.hpp"
+ #include "strata/kernels/native_moe.hpp"
++#include "strata/kernels/iq_kernels.hpp"
++#include "strata/kernels/native_mmvq.hpp"
+ #include "strata/kernels/native_gdn.hpp"
+ #include "strata/kernels/native_router.hpp"
+ #include "strata/kernels/native_qsa.hpp"
+@@ -220,6 +222,15 @@ struct Options {
+     /// pinned arena while the CPU computes the rest (verify windows).
+     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
++    /// 26.09.2026: the second card (CUDA device index, -1 = one card).  It holds the experts the main card does not,
++    /// ranked by `second_card_usage` (a STRU table from STRATA_USAGE_DUMP) when given, and computes them in the
++    /// verify windows beside the CPU pool.
++    int second_card = -1;
++    std::string second_card_usage;
++    int second_card_reserve_mib = 700;
++    /// 26.09.2026: this many of the main card's most-routed experts are ALSO held by the second card, and each
++    /// layer splits such experts between the two so they finish together (0 = the two sets are disjoint).
++    int64_t second_card_dup = 0;
+     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
+     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
+     int adapt_every = 4;
+@@ -310,6 +321,12 @@ void usage() {
+                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
+                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
+                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
++                 "  --second-card D      a second card (CUDA device D) holds the experts the main card does\n"
++                 "                       not and computes them beside the CPU pool (native packs, --spec).\n"
++                 "  --second-card-usage U  rank its experts by a usage table (STRATA_USAGE_DUMP=U from runs)\n"
++                 "  --second-card-reserve-mib M  VRAM left free on it (default 700)\n"
++                 "  --second-card-dup N  also hold the main card's N most-routed experts there; each layer\n"
++                 "                       splits those between the cards (STRATA_CARD2_BIAS tunes the split)\n"
+                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
+                  "                       tools/make_profile.py) instead of admitting on first use.\n"
+                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
+@@ -550,6 +567,10 @@ int main(int argc, char** argv) {
+         else if (a == "--mtp") o.mtp = next("--mtp");
+         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
++        else if (a == "--second-card") o.second_card = std::atoi(next("--second-card"));
++        else if (a == "--second-card-usage") o.second_card_usage = next("--second-card-usage");
++        else if (a == "--second-card-reserve-mib") o.second_card_reserve_mib = std::atoi(next("--second-card-reserve-mib"));
++        else if (a == "--second-card-dup") o.second_card_dup = std::atoll(next("--second-card-dup"));
+         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+         else if (a == "--stop-eos") o.stop_eos = true;
+@@ -704,6 +725,27 @@ int main(int argc, char** argv) {
+     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
+     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
++    // 26.09.2026: the multi-column dense projections in llama.cpp's layout (2 rows per block) instead of the exact
++    // one-row-per-block layout the author kept "until the upstream layout is timed" - timed here, on a 2080 Ti.
++    if (const char* up = std::getenv("STRATA_MMVQ_UPSTREAM"); up != nullptr && std::string(up) != "0") {
++        strata::kernels::native_mmvq_set_multi_exact(false);
++        std::fprintf(stderr, "strata generate: multi-column projections in the upstream layout (STRATA_MMVQ_UPSTREAM)\n");
++    }
++    // 26.09.2026: the second card's context exists before any pinned memory is allocated or registered, so the
++    // portable allocations and the expert arena are pinned for it too.  The main card stays device 0.
++    if (o.second_card >= 0) {
++        int nd = 0;
++        cudaGetDeviceCount(&nd);
++        if (!native_pack || o.spec < 2 || o.second_card == 0 || o.second_card >= nd) {
++            std::fprintf(stderr, "strata generate: --second-card %d needs a native pack, --spec and a second visible "
++                                 "device (%d visible; the main card is device 0)\n", o.second_card, nd);
++            return 2;
++        }
++        if (cudaSetDevice(o.second_card) != cudaSuccess || cudaFree(nullptr) != cudaSuccess || cudaSetDevice(0) != cudaSuccess) {
++            std::fprintf(stderr, "strata generate: cannot open device %d: %s\n", o.second_card, cudaGetErrorString(cudaGetLastError()));
++            return 1;
++        }
++    }
+     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+     else if (!strata::kernels::cpu::cpu_avx512_ok())
+@@ -1788,6 +1830,145 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
+     }
+ 
++    // ================================ 26.09.2026: THE SECOND CARD ================================
++    //
++    // A slot cache on device `--second-card` of the experts the main card does NOT hold, most-routed first (by the
++    // usage table when one is given, else in layer order), filled once from the arena.  In a verify window each
++    // layer's experts resident here are computed on this card beside the CPU pool and written into the same mapped
++    // `y_miss` rows as the CPU's, so the main card's graph does not change (see `SecondCard`).  The main card's
++    // adaptive tier still swaps its own slots; an expert it takes over is simply found there first.
++    strata::core::ExpertCache xcache2;
++    strata::core::SecondCard card2;
++    std::vector<int32_t> host_res2;
++    if (o.second_card >= 0) {
++        if (host_res.empty() || srcp == nullptr) {
++            std::fprintf(stderr, "strata generate: --second-card needs the profile-filled token graph path\n");
++            return 2;
++        }
++        const auto& lay = strata::kernels::cpu::expert_layout();
++        const size_t n_pairs = (size_t) (g.n_layers * g.n_expert);
++        std::vector<uint64_t> usage2(n_pairs, 0);
++        uint64_t usage_total = 0, usage_main = 0;
++        if (!o.second_card_usage.empty()) {
++            FILE* f = std::fopen(o.second_card_usage.c_str(), "rb");
++            char magic[4] = {};
++            int32_t dims[2] = {};
++            if (f == nullptr || std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "STRU", 4) != 0 ||
++                std::fread(dims, 4, 2, f) != 2 || dims[0] != (int32_t) g.n_layers || dims[1] != (int32_t) g.n_expert ||
++                std::fread(usage2.data(), sizeof(uint64_t), n_pairs, f) != n_pairs) {
++                std::fprintf(stderr, "strata generate: %s is not a usage table for this model\n", o.second_card_usage.c_str());
++                if (f != nullptr) std::fclose(f);
++                return 2;
++            }
++            std::fclose(f);
++        }
++        // expert-major, so without a usage table (all counts equal) every layer is covered alike rather than the
++        // first layers entirely
++        std::vector<int32_t> order;
++        order.reserve(n_pairs);
++        for (size_t i = 0; i < n_pairs; ++i) {
++            usage_total += usage2[i];
++            if (host_res[i] >= 0) usage_main += usage2[i];
++        }
++        for (int64_t e = 0; e < g.n_expert; ++e)
++            for (int64_t l = 0; l < g.n_layers; ++l)
++                if (host_res[(size_t) (l * g.n_expert + e)] < 0) order.push_back((int32_t) (l * g.n_expert + e));
++        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return usage2[(size_t) a] > usage2[(size_t) b]; });
++        // dual residency: the main card's most-routed experts go here FIRST, so the per-layer split can balance
++        int64_t n_dup = 0;
++        if (o.second_card_dup > 0) {
++            std::vector<int32_t> dup;
++            for (size_t i = 0; i < n_pairs; ++i) if (host_res[i] >= 0) dup.push_back((int32_t) i);
++            std::stable_sort(dup.begin(), dup.end(), [&](int32_t a, int32_t b) { return usage2[(size_t) a] > usage2[(size_t) b]; });
++            if ((int64_t) dup.size() > o.second_card_dup) dup.resize((size_t) o.second_card_dup);
++            n_dup = (int64_t) dup.size();
++            order.insert(order.begin(), dup.begin(), dup.end());
++        }
++        if (cudaSetDevice(o.second_card) != cudaSuccess) {
++            std::fprintf(stderr, "strata generate: cannot select device %d\n", o.second_card);
++            return 1;
++        }
++        size_t free_b = 0, total_b = 0;
++        cudaMemGetInfo(&free_b, &total_b);
++        const int64_t cap = (int64_t) strata::kernels::cpu::MAXT * K;
++        const int64_t n_ff = lay.fmt.empty() ? (int64_t) strata::kernels::cpu::FF : lay.fmt[0].n_ff;
++        // this card's own buffers come off the top before the slots are sized
++        const uint64_t buffers = (uint64_t) strata::kernels::cpu::MAXT * g.n_embd * 4 +
++                                 (uint64_t) strata::kernels::cpu::MAXT * (g.n_embd / 32) * 36 +
++                                 (uint64_t) strata::kernels::native_expert_scratch_bytes(cap, n_ff) +
++                                 (uint64_t) cap * g.n_embd * 4 + (64u << 10);
++        const uint64_t reserve = ((uint64_t) o.second_card_reserve_mib << 20) + buffers;
++        const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
++        std::vector<int64_t> sizes;
++        std::vector<int32_t> chosen;
++        uint64_t used = 0, usage_card2 = 0;
++        for (int32_t i : order) {
++            const int64_t l = i / g.n_expert;
++            const uint64_t b = (lay.blob_bytes(l) + 255) / 256 * 256;
++            if (used + b > budget) break;
++            used += b;
++            sizes.push_back((int64_t) lay.blob_bytes(l));
++            chosen.push_back(i);
++            usage_card2 += usage2[(size_t) i];
++        }
++        if (chosen.empty() || !xcache2.open_sized(sizes, g.n_layers, g.n_expert, err)) {
++            std::fprintf(stderr, "strata generate: the second card's cache could not open (%s)\n", chosen.empty() ? "no room" : err.c_str());
++            return 1;
++        }
++        host_res2.assign(n_pairs, strata::core::kNotResident);
++        const Clock::time_point tf = Clock::now();
++        for (int32_t i : chosen) {
++            const int64_t l = i / g.n_expert, e = i % g.n_expert;
++            const int32_t slot = xcache2.admit(l, e);
++            const uint8_t* b = srcp->blob(l, e);
++            if (slot == strata::core::kNotResident || b == nullptr ||
++                !xcache2.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(l))) {
++                std::fprintf(stderr, "strata generate: the second card's fill failed at pair %d: %s\n", i, err.c_str());
++                return 1;
++            }
++            host_res2[(size_t) i] = slot;
++        }
++        {
++            const int32_t i0 = chosen.front();
++            if (!xcache2.verify_slot(host_res2[(size_t) i0], srcp->blob(i0 / g.n_expert, i0 % g.n_expert), err,
++                                     (int64_t) lay.blob_bytes(i0 / g.n_expert))) {
++                std::fprintf(stderr, "strata generate: second card: %s\n", err.c_str());
++                return 1;
++            }
++        }
++        const double fill_s = std::chrono::duration<double>(Clock::now() - tf).count();
++        card2.device = o.second_card;
++        card2.main_device = 0;
++        card2.host_res = host_res2.data();
++        card2.cache_base = xcache2.device_slot(0);
++        card2.slot_off = xcache2.slot_offsets();
++        card2.cap = cap;
++        card2.plan_i32 = ((4 + (cap + 1) + 2 * cap + 1) & ~1ll) + 2 * cap;
++        cudaStream_t s2 = nullptr;
++        cudaEvent_t e2 = nullptr;
++        if (cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking) != cudaSuccess ||
++            cudaEventCreateWithFlags(&e2, cudaEventDisableTiming) != cudaSuccess ||
++            cudaMalloc((void**) &card2.x, (size_t) strata::kernels::cpu::MAXT * g.n_embd * 4) != cudaSuccess ||
++            cudaMalloc(&card2.xq, (size_t) strata::kernels::cpu::MAXT * (g.n_embd / 32) * 36) != cudaSuccess ||
++            cudaMalloc(&card2.scratch, strata::kernels::native_expert_scratch_bytes(cap, n_ff)) != cudaSuccess ||
++            cudaMalloc((void**) &card2.out, (size_t) cap * g.n_embd * 4) != cudaSuccess ||
++            cudaMalloc((void**) &card2.d_plan, (size_t) card2.plan_i32 * 4) != cudaSuccess ||
++            cudaHostAlloc((void**) &card2.h_plan, (size_t) card2.plan_i32 * 4, cudaHostAllocPortable) != cudaSuccess) {
++            std::fprintf(stderr, "strata generate: the second card's buffers could not be allocated\n");
++            return 1;
++        }
++        card2.stream = s2;
++        card2.done = e2;
++        cudaSetDevice(0);
++        drive.d.card2 = &card2;
++        if (n_dup > 0) std::fprintf(stderr, "strata generate: second card: %lld of them are the main card's most-routed (dual residency)\n", (long long) n_dup);
++        std::fprintf(stderr, "strata generate: second card (device %d): %zu experts, %.2f GiB, filled in %.1f s; "
++                             "of the usage table's %llu routed entries the main card holds %.1f%%, this card %.1f%%\n",
++                     o.second_card, chosen.size(), (double) used / 1073741824.0, fill_s, (unsigned long long) usage_total,
++                     usage_total ? 100.0 * (double) usage_main / (double) usage_total : 0.0,
++                     usage_total ? 100.0 * (double) usage_card2 / (double) usage_total : 0.0);
++    }
++
+     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
+     //
+     // **`--gpu-only-full` MEASURES THE 48 LAYER GRAPHS AND THE LM HEAD AND NOTHING ELSE.**  It never enters
+@@ -1883,6 +2064,7 @@ int main(int argc, char** argv) {
+         };
+         drive.d.plan = ver.plan_sink();
+         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
++        ver.set_pcie_share(drive.d.pcie_num > 0);
+         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+         cudaStream_t adapt_stream = nullptr;
+         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+@@ -2575,8 +2757,13 @@ int main(int argc, char** argv) {
+         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
+         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
+         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
++        ver.set_pcie_share(drive.d.pcie_num > 0);
+         const int64_t pcie0 = drive.d.pcie_experts;
+         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
++        // 26.09.2026: raw routing counts for a longer residency plan; ADDED to the file if it already exists, so
++        // several prompts accumulate into one table ("STRU", n_layers, n_expert, then uint64 counts).
++        const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
++        if (usage_dump != nullptr) drive.d.routed_total.assign((size_t) (g.n_layers * g.n_expert), 0u);
+         int64_t swaps_total = 0;
+         double ms_adapt = 0;
+         cudaStream_t adapt_stream = nullptr;
+@@ -2764,6 +2951,8 @@ int main(int argc, char** argv) {
+                         ver.ms_commit / rounds,
+                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
+                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
++        if (rounds > 0)
++            std::printf("%-24s %.3f ms/round issuing the window graph\n", "graph launch", ver.ms_launch / rounds);
+         if (rounds > 0)
+             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
+                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
+@@ -2781,11 +2970,47 @@ int main(int argc, char** argv) {
+             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
+                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
+                         drive.d.pcie_num);
++        if (rounds > 0 && drive.d.card2 != nullptr)
++            std::printf("%-24s %.2f distinct experts / %.2f entries per layer on device %d; issue %.3f  wait %.3f ms/round\n",
++                        "second card", (double) drive.d.card2->experts / (double) (rounds * g.n_layers),
++                        (double) drive.d.card2->entries / (double) (rounds * g.n_layers), drive.d.card2->device,
++                        drive.d.card2->ms_launch / rounds, drive.d.card2->ms_wait / rounds);
++        if (rounds > 0 && drive.d.card2 != nullptr && drive.d.card2->dual_card + drive.d.card2->dual_main > 0)
++            std::printf("%-24s %.2f / %.2f per layer of the experts both cards hold went to the second / the main card\n",
++                        "dual residency", (double) drive.d.card2->dual_card / (double) (rounds * g.n_layers),
++                        (double) drive.d.card2->dual_main / (double) (rounds * g.n_layers));
+         (void) pool_ms0;
+         if (use_mtp && rounds > 0)
+             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
+                         mtp.ms_draft / (double) mtp.rounds, (long long) mtp.rounds, mtp.ms_prefill,
+                         (double) mtp.vram_bytes() / 1048576.0);
++        if (usage_dump != nullptr && !drive.d.routed_total.empty()) {
++            const size_t n = drive.d.routed_total.size();
++            std::vector<uint64_t> acc(n, 0);
++            if (FILE* f = std::fopen(usage_dump, "rb")) {
++                char magic[4] = {};
++                int32_t dims[2] = {};
++                if (std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "STRU", 4) == 0 && std::fread(dims, 4, 2, f) == 2 &&
++                    dims[0] == (int32_t) g.n_layers && dims[1] == (int32_t) g.n_expert &&
++                    std::fread(acc.data(), sizeof(uint64_t), n, f) == n) {
++                } else {
++                    std::fill(acc.begin(), acc.end(), 0);
++                    std::fprintf(stderr, "strata generate: %s is not a usage table for this model; starting it afresh\n", usage_dump);
++                }
++                std::fclose(f);
++            }
++            uint64_t added = 0;
++            for (size_t i = 0; i < n; ++i) { acc[i] += drive.d.routed_total[i]; added += drive.d.routed_total[i]; }
++            const int32_t dims[2] = {(int32_t) g.n_layers, (int32_t) g.n_expert};
++            FILE* f = std::fopen(usage_dump, "wb");
++            if (f == nullptr || std::fwrite("STRU", 1, 4, f) != 4 || std::fwrite(dims, 4, 2, f) != 2 ||
++                std::fwrite(acc.data(), sizeof(uint64_t), n, f) != n) {
++                std::fprintf(stderr, "strata generate: cannot write the usage table %s\n", usage_dump);
++            } else {
++                std::printf("%-24s %llu routed entries added to %s\n", "usage table", (unsigned long long) added, usage_dump);
++            }
++            if (f != nullptr) std::fclose(f);
++        }
+     }
+ 
+     if (dump != nullptr && std::fclose(dump) != 0) {
+diff --git a/tools/mk_profile_from_usage.py b/tools/mk_profile_from_usage.py
+new file mode 100644
+index 0000000..14b6969
+--- /dev/null
++++ b/tools/mk_profile_from_usage.py
+@@ -0,0 +1,16 @@
++# Профиль резидентности карты 1 из таблицы маршрутизации (26.09.2026): лучшие N пар по частоте, формат STRP движка.
++import struct, sys
++src, dst, N = sys.argv[1], sys.argv[2], int(sys.argv[3])
++u = open(src, 'rb').read()
++assert u[:4] == b'STRU'
++L, E = struct.unpack_from('<2i', u, 4)
++cnt = struct.unpack_from('<%dQ' % (L * E), u, 12)
++order = sorted(range(L * E), key=lambda i: (-cnt[i], i))[:N]
++tot = sum(cnt) or 1
++with open(dst, 'wb') as f:
++    f.write(b'STRP')
++    f.write(struct.pack('<5I', 1, L, E, N, N))
++    for i in order:
++        f.write(struct.pack('<2H', i // E, i % E))
++    f.write(struct.pack('<%df' % (L * E), *[c / tot for c in cnt]))
++print('записано', dst, 'пар', N, 'покрытие маршрутов %.2f%%' % (100.0 * sum(cnt[i] for i in order) / tot))
