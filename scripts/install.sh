@@ -2,8 +2,11 @@
 # Установка готовой сборки vLLM для 2x RTX 2080 Ti — одной командой.
 #
 # Скрипт НИЧЕГО не собирает: скачивает уже скомпилированные колёса из релиза
-# и ставит их с зависимостями. Компилятор, CUDA-тулкит и заголовки не нужны —
-# они нужны только тому, кто собирает сам.
+# и ставит их с зависимостями. Но для ЗАПУСКА нужен CUDA-тулкит 13.0 с nvcc:
+# на Turing vLLM берёт FlashInfer для внимания и выбора токенов, а FlashInfer
+# компилирует свои ядра на машине при первом старте. Без nvcc сервер падает
+# после прогрева: "Could not find nvcc and default cuda_home='/usr/local/cuda'
+# doesn't exist". Скрипт проверяет nvcc и говорит, что поставить.
 #
 # Сначала проверяет машину и, если не подходит, говорит ПОЧЕМУ и что делать
 # вместо — а не падает посреди процесса на пятом гигабайте.
@@ -94,6 +97,30 @@ else
   BAD_GPU=1
 fi
 
+NVCC=""
+for c in "${CUDA_HOME:-/nonexistent}/bin/nvcc" "$(command -v nvcc 2>/dev/null)" \
+         $(ls -d /usr/local/cuda*/bin/nvcc 2>/dev/null | sort -V -r); do
+  [ -n "$c" ] && [ -x "$c" ] && { NVCC="$c"; break; }
+done
+if [ -n "$NVCC" ]; then
+  CUDA_HOME_FOUND=$(dirname "$(dirname "$NVCC")")
+  CV=$("$NVCC" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\),.*/\1/p')
+  ok "nvcc ${CV:-?}: $NVCC"
+  [ "${CV%%.*}" = "13" ] || hm "nvcc ${CV:-?}, а torch собран под CUDA 13 — нужен тулкит 13.0"
+else
+  CUDA_HOME_FOUND=/usr/local/cuda-13.0
+  no "nvcc не найден — нет CUDA-тулкита 13.0"
+  hm "Он нужен для ЗАПУСКА: FlashInfer компилирует ядра внимания и выбора токенов"
+  hm "при первом старте. Без него сервер падает после прогрева с ошибкой"
+  hm "  Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist"
+  hm "Поставить только тулкит (драйвер не трогает; репозиторий ubuntu2404 годится и для новее):"
+  hm "  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+  hm "  sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update"
+  hm "  sudo apt install -y cuda-toolkit-13-0"
+  hm "Не пакет cuda и не cuda-13-0: они тянут драйвер и спорят с поставленным из .run"
+  BAD_NVCC=1
+fi
+
 FREE=$(df -Pk "$(dirname "$DIR")" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')
 if [ -n "$FREE" ]; then
   [ "$FREE" -ge 12 ] && ok "свободно ${FREE} ГБ" || hm "свободно ${FREE} ГБ, а нужно около 12"
@@ -118,6 +145,7 @@ if [ -n "${BAD_GLIBC:-}${BAD_PY:-}" ]; then
   exit 1
 fi
 [ -n "${BAD_GPU:-}" ] && hm "карты сейчас не видны — поставить можно, запустить нет"
+[ -n "${BAD_NVCC:-}" ] && hm "nvcc нет — поставить можно, но сервер упадёт на старте, пока нет тулкита"
 echo "${B}Машина подходит.${O}"
 [ "$CHECK_ONLY" = "1" ] && { echo; exit 0; }
 
@@ -227,6 +255,7 @@ StartLimitBurst=6
 [Service]
 Type=simple
 Environment=HOME=/root
+Environment=CUDA_HOME=$CUDA_HOME_FOUND
 WorkingDirectory=$DIR
 ExecStart=$DIR/venv/bin/python -m vllm.entrypoints.openai.api_server \\
   --model ${MD:-ВПИШИТЕ_ПУТЬ_К_МОДЕЛИ} \\
@@ -255,6 +284,7 @@ echo
 echo "${B}Готово.${O} Запуск вручную:"
 echo
 echo "  source $DIR/venv/bin/activate"
+echo "  export CUDA_HOME=$CUDA_HOME_FOUND"
 echo "  python -m vllm.entrypoints.openai.api_server --model <путь> \\"
 echo "      --tensor-parallel-size 2 --dtype half --gpu-memory-utilization 0.94 \\"
 echo "      --max-model-len 102400 --max-num-seqs 1 \\"

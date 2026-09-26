@@ -272,6 +272,45 @@ ERROR: vllm-...-cp312-cp312-linux_x86_64.whl is not a supported wheel on this pl
 «команда не найдена», после — обе карты, 22528 MiB, <code>sm_75</code>.</p>
 <p>Версия обязана совпадать с хостовой до последней цифры. А вот дистрибутив не
 важен: у нас хост Debian 13, контейнер Ubuntu 26.04, драйвер один.</p>
+<h3>Пятая стена, которую чистые машины не поймали: нет <code>nvcc</code></h3>
+<p>Прислал читатель 26.09. Всё поставлено по инструкции, сервер стартует, и минут
+восемь в логе повторяется</p>
+<pre><code>No available shared memory broadcast block found in 60 seconds. This typically
+happens when some processes are hanging or doing some time-consuming work
+</code></pre>
+<p>Само по себе это не ошибка: рабочие процессы заняты прогревом. Потом
+<code>Initial profiling/warmup run took 477.81 s</code> — и падение:</p>
+<pre><code>flashinfer/jit/cpp_ext.py, line 61, in get_cuda_path
+RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist
+</code></pre>
+<p><strong>Почему.</strong> На картах младше Ampere наша сборка ставит FlashInfer первым
+бэкендом внимания (<code>vllm/platforms/cuda.py</code>: при <code>major &lt; 8</code> — <code>FLASHINFER</code>,
+за ним <code>TRITON_ATTN</code>), и выбор токенов тоже идёт через него
+(<code>VLLM_USE_FLASHINFER_SAMPLER</code> по умолчанию включён). Готовых ядер в пакете
+<code>flashinfer-python</code> нет — он компилирует их на машине при первом вызове, через
+<code>nvcc</code>. Компилятор ищет так: <code>CUDA_HOME</code>, потом <code>nvcc</code> в <code>PATH</code>, потом
+<code>/usr/local/cuda</code>; нет ничего — падает. У читателя упало на пробном прогоне
+выбора токенов (<code>_dummy_sampler_run</code>), ядра внимания собирались бы следующими.</p>
+<p><strong>Почему мы этого не видели.</strong> На стенде CUDA-тулкит 13.0 стоит давно, и
+FlashInfer однажды собрал себе ядра в <code>~/.cache/flashinfer/0.6.16.post3/75/</code>:
+выбор токенов и два варианта внимания <code>head_dim 256</code>. Проверка в <code>install.sh</code>
+доходит до импорта vLLM и загрузки его скомпилированных ядер, а ядра FlashInfer
+появляются только при первом прогоне модели. И в инструкции мы написали
+«CUDA-тулкит не нужен» — для установки это правда, для запуска нет.</p>
+<p><strong>Как лечится.</strong> Поставить тулкит 13.0 — только его, без драйвера:</p>
+<pre><code class="language-bash">wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-13-0
+</code></pre>
+<p>Не пакет <code>cuda</code> и не <code>cuda-13-0</code>: они тянут драйвер и спорят с поставленным из
+<code>.run</code>. Перед запуском — <code>export CUDA_HOME=/usr/local/cuda-13.0</code>, в юните службы —
+<code>Environment=CUDA_HOME=/usr/local/cuda-13.0</code>. <code>install.sh</code> теперь сам проверяет
+<code>nvcc</code> и говорит, что поставить. Первый старт после этого ещё раз долгий —
+FlashInfer соберёт ядра; дальше они берутся из кэша.</p>
+<p>Обход без тулкита — выключить FlashInfer для выбора токенов переменной
+<code>VLLM_USE_FLASHINFER_SAMPLER=0</code> и перевести внимание на Triton — мы не мерили:
+скорость и работа с MTP на Turing в таком виде не проверены, поэтому не советуем.</p>
 <hr />
 <h2>Модель думает и не отвечает</h2>
 <p>Симптом: на любой вопрос приходит только размышление, ответа нет вовсе.</p>

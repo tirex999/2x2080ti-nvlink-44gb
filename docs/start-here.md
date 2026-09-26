@@ -134,7 +134,31 @@ nvidia-smi
 
 ## Шаг 3. Движок — одной командой
 
-Компилятор, CUDA-тулкит и заголовки не нужны: всё уже собрано.
+Сам движок собирать не нужно: колёса готовые. Но **до запуска поставьте
+CUDA-тулкит 13.0**. Он нужен не для сборки vLLM, а для FlashInfer: на Turing
+vLLM берёт его для внимания и выбора токенов, и FlashInfer компилирует свои
+ядра на вашей машине при первом старте. Без `nvcc` сервер долго греется,
+а потом падает:
+
+```
+RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist
+```
+
+Ставится только тулкит, драйвер из шага 2 он не трогает:
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-13-0
+```
+
+Именно `cuda-toolkit-13-0`: пакеты `cuda` и `cuda-13-0` тянут за собой драйвер
+и спорят с поставленным из `.run`. Репозиторий `ubuntu2404` годится и для
+более новых Ubuntu — у нас на 26.04 тулкит стоит из него. Проверка:
+`/usr/local/cuda-13.0/bin/nvcc --version` → `release 13.0`.
+
+Теперь сам движок:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/tirex999/2x2080ti-nvlink-44gb/main/scripts/install.sh
@@ -189,6 +213,7 @@ MTP. Но ей нужна ветка форка `weicj/vLLM-2080Ti-Definitive` *
 
 ```bash
 source ~/vllm-2080ti/venv/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0
 
 python -m vllm.entrypoints.openai.api_server \
   --model ~/vllm-2080ti/models/Qwen3.8-27B-abliterated-AWQ-MTP \
@@ -218,6 +243,13 @@ python -m vllm.entrypoints.openai.api_server \
   подключать веб-интерфейс: он шлёт запросы с инструментами, и без этих
   ключей сервер отвечает ошибкой на второе же сообщение.
 - `--enable-force-include-usage` — чтобы интерфейс показывал счётчик токенов.
+- `export CUDA_HOME` — по этой переменной FlashInfer находит компилятор.
+  Без неё ищет `nvcc` в `PATH`, а у службы systemd `PATH` свой, короткий.
+  В юните то же самое пишется строкой `Environment=CUDA_HOME=/usr/local/cuda-13.0`.
+- Самый первый старт долгий: у читателя прогрев шёл 8 минут, и всё это время
+  в логе повторялось `No available shared memory broadcast block found in 60
+  seconds`. Это не зависание — рабочие процессы заняты и не отвечают главному.
+  Потом FlashInfer один раз компилирует ядра и кладёт их в `~/.cache/flashinfer`.
 
 Первый запуск долгий: модель грузится с диска в видеопамять, это минуты.
 Готовность видна по строке `Application startup complete`.
