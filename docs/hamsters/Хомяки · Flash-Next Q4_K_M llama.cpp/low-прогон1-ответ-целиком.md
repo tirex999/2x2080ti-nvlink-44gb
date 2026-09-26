@@ -2,36 +2,35 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Low-Poly Hamster Playground</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
-canvas { display: block; }
-#ui {
-position: absolute; top: 20px; left: 20px;
-color: #fff; background: rgba(0,0,0,0.5);
-padding: 12px 18px; border-radius: 12px;
-font-size: 14px; pointer-events: none;
-backdrop-filter: blur(6px);
-}
-#ui h1 { font-size: 18px; margin-bottom: 4px; }
-#ui p { opacity: 0.7; font-size: 12px; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Low-Poly Hamster Playground</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px;
+            color: #fff; font-size: 14px;
+            background: rgba(0,0,0,0.5); padding: 12px 18px;
+            border-radius: 12px; backdrop-filter: blur(4px);
+        }
+        #ui h1 { font-size: 18px; margin-bottom: 4px; color: #ffb6c1; }
+        #ui p { opacity: 0.8; font-size: 12px; }
+    </style>
 </head>
 <body>
 <div id="ui">
-<h1>🐹 Hamster Playground</h1>
-<p>Drag to rotate • Scroll to zoom</p>
+    <h1>🐹 Hamster Playground</h1>
+    <p>Drag to rotate • Scroll to zoom</p>
 </div>
 
 <script type="importmap">
 {
-  "imports": {
-    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-  }
+    "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
 }
 </script>
 
@@ -41,8 +40,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 // --- Scene Setup ---
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x2d1b69);
-scene.fog = new THREE.Fog(0x2d1b69, 20, 50);
+scene.background = new THREE.Color(0x2d1b4e);
+scene.fog = new THREE.Fog(0x2d1b4e, 20, 40);
 
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
 camera.position.set(8, 7, 10);
@@ -60,14 +59,14 @@ controls.dampingFactor = 0.05;
 controls.target.set(0, 1.5, 0);
 controls.maxPolarAngle = Math.PI / 2.1;
 
-// --- Lighting ---
-const ambient = new THREE.AmbientLight(0xffffff, 0.5);
-scene.add(ambient);
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
 
-const dirLight = new THREE.DirectionalLight(0xfff5e6, 1.2);
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.2);
 dirLight.position.set(5, 10, 5);
 dirLight.castShadow = true;
-dirLight.shadow.mapSize.set(1024, 1024);
+dirLight.shadow.mapSize.set(2048, 2048);
 dirLight.shadow.camera.near = 0.5;
 dirLight.shadow.camera.far = 30;
 dirLight.shadow.camera.left = -10;
@@ -76,407 +75,537 @@ dirLight.shadow.camera.top = 10;
 dirLight.shadow.camera.bottom = -10;
 scene.add(dirLight);
 
-const fillLight = new THREE.DirectionalLight(0x88ccff, 0.3);
-fillLight.position.set(-3, 4, -5);
+const fillLight = new THREE.DirectionalLight(0x8888ff, 0.3);
+fillLight.position.set(-3, 5, -5);
 scene.add(fillLight);
 
-const pointLight = new THREE.PointLight(0xff9966, 0.5, 15);
-pointLight.position.set(0, 5, 0);
+const pointLight = new THREE.PointLight(0xff9999, 0.5, 10);
+pointLight.position.set(0, 4, 0);
 scene.add(pointLight);
 
 // --- Materials ---
-function mat(color, flat = true) {
-  return new THREE.MeshLambertMaterial({ color, flatShading: flat });
+function mat(color, opts = {}) {
+    return new THREE.MeshStandardMaterial({
+        color, flatShading: true, roughness: 0.8, metalness: 0.0, ...opts
+    });
 }
 
-const matFloor = mat(0x8B6914);
-const matCageBar = mat(0xcccccc);
-const matCageTop = mat(0xaaaaaa);
-const matWheel = mat(0xff6b9d);
-const matWheelSpoke = mat(0xffd93d);
-const matBowl = mat(0x4ecdc4);
-const matFood = mat(0x8B4513);
-const matTunnel = mat(0xff8c42);
-const matBedding = mat(0xf5deb3);
-const matWater = mat(0x66ccff);
-
-// --- Floor / Tray ---
-const trayGeo = new THREE.CylinderGeometry(5.5, 5.5, 0.5, 12);
-const tray = new THREE.Mesh(trayGeo, matFloor);
-tray.position.y = 0.25;
+// --- Cage Floor / Tray ---
+const trayGeo = new THREE.BoxGeometry(10, 0.6, 8);
+const trayMat = mat(0xf4a0c0);
+const tray = new THREE.Mesh(trayGeo, trayMat);
+tray.position.y = 0.3;
 tray.receiveShadow = true;
 scene.add(tray);
 
-// Bedding layer
-const beddingGeo = new THREE.CylinderGeometry(5.2, 5.2, 0.3, 12);
-const bedding = new THREE.Mesh(beddingGeo, matBedding);
-bedding.position.y = 0.55;
-bedding.receiveShadow = true;
-scene.add(bedding);
+// Tray rim
+const rimGeo = new THREE.BoxGeometry(10.4, 0.8, 8.4);
+const rimMat = mat(0xe888aa);
+const rim = new THREE.Mesh(rimGeo, rimMat);
+rim.position.y = 0.1;
+rim.receiveShadow = true;
+scene.add(rim);
 
 // --- Cage Bars ---
-const barGeo = new THREE.CylinderGeometry(0.04, 0.04, 4, 6);
-for (let i = 0; i < 24; i++) {
-  const angle = (i / 24) * Math.PI * 2;
-  const bar = new THREE.Mesh(barGeo, matCageBar);
-  bar.position.set(Math.cos(angle) * 5.3, 2.5, Math.sin(angle) * 5.3);
-  bar.castShadow = true;
-  scene.add(bar);
+const barMat = mat(0xcccccc, { metalness: 0.6, roughness: 0.3 });
+const barGeo = new THREE.CylinderGeometry(0.04, 0.04, 6, 6);
+
+for (let x = -4.5; x <= 4.5; x += 1.5) {
+    for (let z of [-3.8, 3.8]) {
+        const bar = new THREE.Mesh(barGeo, barMat);
+        bar.position.set(x, 3.3, z);
+        bar.castShadow = true;
+        scene.add(bar);
+    }
+}
+for (let z = -3.5; z <= 3.5; z += 1.5) {
+    for (let x of [-4.8, 4.8]) {
+        const bar = new THREE.Mesh(barGeo, barMat);
+        bar.position.set(x, 3.3, z);
+        bar.castShadow = true;
+        scene.add(bar);
+    }
 }
 
-// Cage top ring
-const topRingGeo = new THREE.TorusGeometry(5.3, 0.06, 8, 24);
-const topRing = new THREE.Mesh(topRingGeo, matCageTop);
-topRing.position.y = 4.5;
-topRing.rotation.x = Math.PI / 2;
-scene.add(topRing);
+// Top cross bars
+const topBarGeo = new THREE.CylinderGeometry(0.05, 0.05, 10, 6);
+for (let z = -3.5; z <= 3.5; z += 1.75) {
+    const bar = new THREE.Mesh(topBarGeo, barMat);
+    bar.rotation.z = Math.PI / 2;
+    bar.position.set(0, 6.3, z);
+    scene.add(bar);
+}
+const topBarGeo2 = new THREE.CylinderGeometry(0.05, 0.05, 8, 6);
+for (let x = -4.5; x <= 4.5; x += 1.75) {
+    const bar = new THREE.Mesh(topBarGeo2, barMat);
+    bar.rotation.x = Math.PI / 2;
+    bar.position.set(x, 6.3, 0);
+    scene.add(bar);
+}
 
-// Cage lid (mesh top)
-const lidGeo = new THREE.CylinderGeometry(5.4, 5.4, 0.1, 12);
-const lid = new THREE.Mesh(lidGeo, new THREE.MeshLambertMaterial({ color: 0x999999, transparent: true, opacity: 0.3, flatShading: true }));
-lid.position.y = 4.6;
-scene.add(lid);
+// --- Bedding (scattered wood shavings) ---
+const beddingGeo = new THREE.BoxGeometry(0.15, 0.05, 0.08);
+const beddingMat = mat(0xd4a574);
+for (let i = 0; i < 80; i++) {
+    const b = new THREE.Mesh(beddingGeo, beddingMat);
+    b.position.set(
+        (Math.random() - 0.5) * 9,
+        0.65,
+        (Math.random() - 0.5) * 7
+    );
+    b.rotation.y = Math.random() * Math.PI;
+    b.rotation.x = (Math.random() - 0.5) * 0.5;
+    scene.add(b);
+}
 
 // --- Hamster Wheel ---
 const wheelGroup = new THREE.Group();
-const wheelOuterGeo = new THREE.TorusGeometry(1.2, 0.12, 8, 16);
-const wheelOuter = new THREE.Mesh(wheelOuterGeo, matWheel);
-wheelGroup.add(wheelOuter);
+wheelGroup.position.set(3, 1.8, 0);
 
-// Spokes
-for (let i = 0; i < 6; i++) {
-  const angle = (i / 6) * Math.PI * 2;
-  const spokeGeo = new THREE.CylinderGeometry(0.03, 0.03, 2.2, 4);
-  const spoke = new THREE.Mesh(spokeGeo, matWheelSpoke);
-  spoke.rotation.z = angle;
-  spoke.position.set(Math.cos(angle) * 0.55, Math.sin(angle) * 0.55, 0);
-  spoke.rotation.z = angle + Math.PI / 2;
-  wheelGroup.add(spoke);
+const wheelRingGeo = new THREE.TorusGeometry(1.4, 0.12, 8, 16);
+const wheelRingMat = mat(0x66ccff);
+const wheelRing = new THREE.Mesh(wheelRingGeo, wheelRingMat);
+wheelRing.castShadow = true;
+wheelGroup.add(wheelRing);
+
+// Wheel spokes
+const spokeGeo = new THREE.BoxGeometry(0.06, 0.06, 2.6);
+const spokeMat = mat(0x55bbee);
+for (let i = 0; i < 8; i++) {
+    const spoke = new THREE.Mesh(spokeGeo, spokeMat);
+    spoke.rotation.z = (i / 8) * Math.PI;
+    spoke.position.z = 0;
+    wheelGroup.add(spoke);
 }
 
-// Wheel stand
-const standGeo = new THREE.CylinderGeometry(0.08, 0.08, 2.5, 6);
-const stand = new THREE.Mesh(standGeo, matCageBar);
-stand.position.set(0, -1.5, 0);
-wheelGroup.add(stand);
-
 // Wheel axle
-const axleGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.6, 6);
-const axle = new THREE.Mesh(axleGeo, matCageBar);
+const axleGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.8, 8);
+const axleMat = mat(0x888888, { metalness: 0.5 });
+const axle = new THREE.Mesh(axleGeo, axleMat);
 axle.rotation.x = Math.PI / 2;
-axle.position.z = 0;
 wheelGroup.add(axle);
 
-wheelGroup.position.set(-2.5, 2.5, -1);
-wheelGroup.rotation.y = Math.PI / 4;
+// Wheel stand
+const standGeo = new THREE.BoxGeometry(0.3, 2.5, 0.3);
+const standMat = mat(0x888888, { metalness: 0.3 });
+const stand1 = new THREE.Mesh(standGeo, standMat);
+stand1.position.set(0, -0.8, 0.5);
+wheelGroup.add(stand1);
+const stand2 = new THREE.Mesh(standGeo, standMat);
+stand2.position.set(0, -0.8, -0.5);
+wheelGroup.add(stand2);
+
 scene.add(wheelGroup);
+let wheelSpinSpeed = 0;
+let wheelTargetSpin = 0;
 
 // --- Food Bowl ---
 const bowlGroup = new THREE.Group();
-const bowlGeo = new THREE.CylinderGeometry(0.5, 0.35, 0.4, 8);
-const bowl = new THREE.Mesh(bowlGeo, matBowl);
+bowlGroup.position.set(-2.5, 0.6, 1.5);
+
+const bowlOuter = new THREE.CylinderGeometry(0.6, 0.4, 0.4, 8);
+const bowlMat = mat(0xff6666);
+const bowl = new THREE.Mesh(bowlOuter, bowlMat);
 bowl.castShadow = true;
 bowlGroup.add(bowl);
 
-// Food pellets
-for (let i = 0; i < 5; i++) {
-  const pelletGeo = new THREE.IcosahedronGeometry(0.08, 0);
-  const pellet = new THREE.Mesh(pelletGeo, matFood);
-  pellet.position.set((Math.random() - 0.5) * 0.3, 0.25, (Math.random() - 0.5) * 0.3);
-  bowlGroup.add(pellet);
+// Food pellets inside
+const pelletGeo = new THREE.IcosahedronGeometry(0.08, 0);
+const pelletMat = mat(0x8B4513);
+for (let i = 0; i < 12; i++) {
+    const p = new THREE.Mesh(pelletGeo, pelletMat);
+    const angle = Math.random() * Math.PI * 2;
+    const r = Math.random() * 0.3;
+    p.position.set(Math.cos(angle) * r, 0.15, Math.sin(angle) * r);
+    bowlGroup.add(p);
 }
-bowlGroup.position.set(2.5, 0.85, 1.5);
 scene.add(bowlGroup);
 
 // --- Water Bottle ---
 const bottleGroup = new THREE.Group();
-const bottleGeo = new THREE.CylinderGeometry(0.2, 0.2, 1.2, 8);
-const bottle = new THREE.Mesh(bottleGeo, matWater);
-bottle.castShadow = true;
-bottleGroup.add(bottle);
-const bottleCapGeo = new THREE.CylinderGeometry(0.12, 0.15, 0.3, 8);
-const bottleCap = new THREE.Mesh(bottleCapGeo, matCageBar);
-bottleCap.position.y = -0.7;
-bottleGroup.add(bottleCap);
-bottleGroup.position.set(3.5, 2.5, -2);
+bottleGroup.position.set(-4.5, 2.5, -1);
+
+const bottleBody = new THREE.CylinderGeometry(0.25, 0.25, 1.5, 8);
+const bottleMat = mat(0x88ddff, { transparent: true, opacity: 0.6 });
+const bottleBodyMesh = new THREE.Mesh(bottleBody, bottleMat);
+bottleGroup.add(bottleBodyMesh);
+
+const bottleCap = new THREE.CylinderGeometry(0.12, 0.18, 0.3, 8);
+const bottleCapMat = mat(0xff8888);
+const bottleCapMesh = new THREE.Mesh(bottleCap, bottleCapMat);
+bottleCapMesh.position.y = -0.9;
+bottleGroup.add(bottleCapMesh);
+
+// Tube
+const tubeGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.5, 6);
+const tubeMat = mat(0xaaaaaa, { metalness: 0.5 });
+const tube = new THREE.Mesh(tubeGeo, tubeMat);
+tube.position.y = -1.2;
+bottleGroup.add(tube);
+
 scene.add(bottleGroup);
 
-// --- Tunnel ---
-const tunnelGeo = new THREE.CylinderGeometry(0.6, 0.6, 2.5, 8, 1, false, 0, Math.PI);
-const tunnel = new THREE.Mesh(tunnelGeo, matTunnel);
-tunnel.rotation.z = Math.PI / 2;
-tunnel.rotation.y = Math.PI / 3;
-tunnel.position.set(0, 0.7, 2.5);
-tunnel.castShadow = true;
-scene.add(tunnel);
+// --- Hamster Factory ---
+const hamsterColors = [
+    { body: 0xffcc88, belly: 0xffe8cc },
+    { body: 0xeeeeee, belly: 0xffffff },
+    { body: 0xcc8844, belly: 0xffdd99 },
+    { body: 0xff9999, belly: 0xffcccc },
+];
 
-// --- Hamster Builder ---
-function createHamster(color) {
-  const group = new THREE.Group();
-  const bodyMat = mat(color);
-  const bellyMat = mat(0xffeedd);
-  const eyeMat = mat(0x111111);
-  const noseMat = mat(0xff6b8a);
-  const earInnerMat = mat(0xffb3c1);
+function createHamster(colorScheme, name) {
+    const group = new THREE.Group();
+    group.userData = {
+        state: 'idle',
+        timer: Math.random() * 3,
+        direction: new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize(),
+        speed: 0.8 + Math.random() * 0.4,
+        targetPoint: null,
+        name,
+        bobPhase: Math.random() * Math.PI * 2,
+        earWiggle: 0,
+    };
 
-  // Body
-  const bodyGeo = new THREE.IcosahedronGeometry(0.45, 1);
-  const body = new THREE.Mesh(bodyGeo, bodyMat);
-  body.scale.set(1, 0.85, 1.2);
-  body.castShadow = true;
-  group.add(body);
+    // Body
+    const bodyGeo = new THREE.IcosahedronGeometry(0.4, 1);
+    bodyGeo.scale(1.2, 0.9, 1.0);
+    const bodyMat2 = mat(colorScheme.body);
+    const body = new THREE.Mesh(bodyGeo, bodyMat2);
+    body.castShadow = true;
+    group.add(body);
 
-  // Belly
-  const bellyGeo = new THREE.IcosahedronGeometry(0.32, 0);
-  const belly = new THREE.Mesh(bellyGeo, bellyMat);
-  belly.position.set(0, -0.1, 0.15);
-  belly.scale.set(0.8, 0.7, 0.9);
-  group.add(belly);
+    // Belly
+    const bellyGeo = new THREE.IcosahedronGeometry(0.3, 1);
+    bellyGeo.scale(1.0, 0.8, 0.9);
+    const bellyMesh = new THREE.Mesh(bellyGeo, mat(colorScheme.belly));
+    bellyMesh.position.set(0.1, -0.1, 0);
+    group.add(bellyMesh);
 
-  // Head
-  const headGeo = new THREE.IcosahedronGeometry(0.28, 1);
-  const head = new THREE.Mesh(headGeo, bodyMat);
-  head.position.set(0, 0.15, 0.4);
-  head.castShadow = true;
-  group.add(head);
+    // Head
+    const headGeo = new THREE.IcosahedronGeometry(0.28, 1);
+    const head = new THREE.Mesh(headGeo, bodyMat2);
+    head.position.set(0.45, 0.1, 0);
+    head.castShadow = true;
+    group.add(head);
 
-  // Cheeks
-  const cheekGeo = new THREE.IcosahedronGeometry(0.12, 0);
-  const cheekL = new THREE.Mesh(cheekGeo, bellyMat);
-  cheekL.position.set(0.18, 0.05, 0.45);
-  group.add(cheekL);
-  const cheekR = new THREE.Mesh(cheekGeo, bellyMat);
-  cheekR.position.set(-0.18, 0.05, 0.45);
-  group.add(cheekR);
+    // Cheeks
+    const cheekGeo = new THREE.IcosahedronGeometry(0.1, 1);
+    const cheekMat = mat(0xffaaaa);
+    const cheekL = new THREE.Mesh(cheekGeo, cheekMat);
+    cheekL.position.set(0.55, -0.05, 0.15);
+    group.add(cheekL);
+    const cheekR = new THREE.Mesh(cheekGeo, cheekMat);
+    cheekR.position.set(0.55, -0.05, -0.15);
+    group.add(cheekR);
 
-  // Ears
-  const earGeo = new THREE.SphereGeometry(0.1, 5, 4);
-  const earL = new THREE.Mesh(earGeo, bodyMat);
-  earL.position.set(0.18, 0.35, 0.2);
-  group.add(earL);
-  const earR = new THREE.Mesh(earGeo, bodyMat);
-  earR.position.set(-0.18, 0.35, 0.2);
-  group.add(earR);
+    // Ears
+    const earGeo = new THREE.SphereGeometry(0.1, 5, 4);
+    const earMat = mat(0xffaaaa);
+    const earL = new THREE.Mesh(earGeo, earMat);
+    earL.position.set(0.35, 0.3, 0.18);
+    earL.scale.set(1, 1.3, 0.6);
+    group.add(earL);
+    const earR = new THREE.Mesh(earGeo, earMat);
+    earR.position.set(0.35, 0.3, -0.18);
+    earR.scale.set(1, 1.3, 0.6);
+    group.add(earR);
 
-  // Inner ears
-  const innerEarGeo = new THREE.SphereGeometry(0.06, 4, 3);
-  const innerEarL = new THREE.Mesh(innerEarGeo, earInnerMat);
-  innerEarL.position.set(0.18, 0.36, 0.22);
-  group.add(innerEarL);
-  const innerEarR = new THREE.Mesh(innerEarGeo, earInnerMat);
-  innerEarR.position.set(-0.18, 0.36, 0.22);
-  group.add(innerEarR);
+    // Eyes
+    const eyeGeo = new THREE.SphereGeometry(0.05, 6, 6);
+    const eyeMat = mat(0x111111);
+    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeL.position.set(0.62, 0.12, 0.1);
+    group.add(eyeL);
+    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeR.position.set(0.62, 0.12, -0.1);
+    group.add(eyeR);
 
-  // Eyes
-  const eyeGeo = new THREE.SphereGeometry(0.05, 5, 4);
-  const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
-  eyeL.position.set(0.1, 0.18, 0.55);
-  group.add(eyeL);
-  const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
-  eyeR.position.set(-0.1, 0.18, 0.55);
-  group.add(eyeR);
+    // Nose
+    const noseGeo = new THREE.SphereGeometry(0.04, 5, 5);
+    const nose = new THREE.Mesh(noseGeo, mat(0xff6688));
+    nose.position.set(0.72, 0.05, 0);
+    group.add(nose);
 
-  // Eye shine
-  const shineGeo = new THREE.SphereGeometry(0.02, 4, 3);
-  const shineMat = mat(0xffffff);
-  const shineL = new THREE.Mesh(shineGeo, shineMat);
-  shineL.position.set(0.12, 0.2, 0.57);
-  group.add(shineL);
-  const shineR = new THREE.Mesh(shineGeo, shineMat);
-  shineR.position.set(-0.08, 0.2, 0.57);
-  group.add(shineR);
+    // Legs (4 tiny stubs)
+    const legGeo = new THREE.CylinderGeometry(0.06, 0.05, 0.2, 5);
+    const legMat = mat(colorScheme.body);
+    const legPositions = [
+        [0.2, -0.35, 0.15], [0.2, -0.35, -0.15],
+        [-0.2, -0.35, 0.15], [-0.2, -0.35, -0.15],
+    ];
+    legPositions.forEach((pos, i) => {
+        const leg = new THREE.Mesh(legGeo, legMat);
+        leg.position.set(...pos);
+        leg.userData.legIndex = i;
+        group.add(leg);
+    });
 
-  // Nose
-  const noseGeo = new THREE.IcosahedronGeometry(0.04, 0);
-  const nose = new THREE.Mesh(noseGeo, noseMat);
-  nose.position.set(0, 0.08, 0.62);
-  group.add(nose);
+    // Tail (tiny nub)
+    const tailGeo = new THREE.SphereGeometry(0.07, 4, 4);
+    const tail = new THREE.Mesh(tailGeo, bodyMat2);
+    tail.position.set(-0.48, 0, 0);
+    group.add(tail);
 
-  // Tail (tiny nub)
-  const tailGeo = new THREE.SphereGeometry(0.06, 4, 3);
-  const tail = new THREE.Mesh(tailGeo, bodyMat);
-  tail.position.set(0, 0.05, -0.5);
-  group.add(tail);
-
-  // Legs
-  const legGeo = new THREE.CylinderGeometry(0.05, 0.04, 0.2, 5);
-  const legPositions = [
-    [0.15, -0.35, 0.15], [-0.15, -0.35, 0.15],
-    [0.15, -0.35, -0.15], [-0.15, -0.35, -0.15]
-  ];
-  const legs = [];
-  legPositions.forEach(pos => {
-    const leg = new THREE.Mesh(legGeo, bodyMat);
-    leg.position.set(...pos);
-    leg.castShadow = true;
-    group.add(leg);
-    legs.push(leg);
-  });
-
-  return { group, legs, body, head };
+    return group;
 }
 
 // --- Create Hamsters ---
-const hamsterColors = [0xf4a460, 0xe8d5b7, 0x8B7355, 0xffdab9];
 const hamsters = [];
+const hamsterNames = ['Nibbles', 'Peanut', 'Cinnamon', 'Snowball'];
 
 for (let i = 0; i < 4; i++) {
-  const { group, legs, body, head } = createHamster(hamsterColors[i]);
-  group.position.set(
-    (Math.random() - 0.5) * 4,
-    0.85,
-    (Math.random() - 0.5) * 4
-  );
-  group.rotation.y = Math.random() * Math.PI * 2;
-  scene.add(group);
-
-  hamsters.push({
-    mesh: group,
-    legs,
-    body,
-    head,
-    state: 'idle',
-    stateTimer: 0,
-    speed: 0.015 + Math.random() * 0.01,
-    turnSpeed: 0.03 + Math.random() * 0.02,
-    targetAngle: Math.random() * Math.PI * 2,
-    walkTime: 0,
-    maxWalkTime: 2 + Math.random() * 3,
-    idleTime: 1 + Math.random() * 2,
-    bobPhase: Math.random() * Math.PI * 2,
-    wheelSpin: 0
-  });
+    const h = createHamster(hamsterColors[i], hamsterNames[i]);
+    const angle = (i / 4) * Math.PI * 2;
+    h.position.set(Math.cos(angle) * 2, 1.0, Math.sin(angle) * 2);
+    h.rotation.y = Math.random() * Math.PI * 2;
+    scene.add(h);
+    hamsters.push(h);
 }
 
-// --- Wheel rotation state ---
-let wheelRotation = 0;
-let wheelActive = false;
-let wheelSpeed = 0;
+// --- Small Toy Ball ---
+const toyBallGeo = new THREE.IcosahedronGeometry(0.25, 1);
+const toyBallMat = mat(0x66ff66);
+const toyBall = new THREE.Mesh(toyBallGeo, toyBallMat);
+toyBall.position.set(0, 0.85, -1.5);
+toyBall.castShadow = true;
+scene.add(toyBall);
+let toyBallVel = new THREE.Vector2(0, 0);
 
-// --- Animation ---
-const clock = new THREE.Clock();
+// --- Hideout (small house) ---
+const houseGroup = new THREE.Group();
+houseGroup.position.set(1.5, 0.6, -2);
 
-function updateHamsters(dt, time) {
-  hamsters.forEach((h, idx) => {
-    h.stateTimer += dt;
+const houseBody = new THREE.BoxGeometry(1.2, 0.9, 1.0);
+const houseMat = mat(0xffaa44);
+const houseBodyMesh = new THREE.Mesh(houseBody, houseMat);
+houseBodyMesh.castShadow = true;
+houseGroup.add(houseBodyMesh);
 
-    if (h.state === 'idle' && h.stateTimer > h.idleTime) {
-      h.state = 'walking';
-      h.stateTimer = 0;
-      h.targetAngle = Math.random() * Math.PI * 2;
-      h.maxWalkTime = 1.5 + Math.random() * 3;
-    } else if (h.state === 'walking' && h.stateTimer > h.maxWalkTime) {
-      h.state = 'idle';
-      h.stateTimer = 0;
-      h.idleTime = 1 + Math.random() * 3;
+const roofGeo = new THREE.ConeGeometry(0.9, 0.6, 4);
+const roofMat = mat(0xff6666);
+const roof = new THREE.Mesh(roofGeo, roofMat);
+roof.position.y = 0.7;
+roof.rotation.y = Math.PI / 4;
+roof.castShadow = true;
+houseGroup.add(roof);
+
+// Door hole
+const doorGeo = new THREE.BoxGeometry(0.3, 0.4, 0.05);
+const doorMat = mat(0x332211);
+const door = new THREE.Mesh(doorGeo, doorMat);
+door.position.set(0, -0.1, 0.5);
+houseGroup.add(door);
+
+scene.add(houseGroup);
+
+// --- Behavior Update ---
+const CAGE_BOUNDS = { x: 4.0, z: 3.0 };
+const WHEEL_POS = new THREE.Vector3(3, 1.0, 0);
+const BOWL_POS = new THREE.Vector3(-2.5, 0.6, 1.5);
+
+function updateHamster(hamster, dt, time) {
+    const ud = hamster.userData;
+    ud.timer -= dt;
+
+    // State transitions
+    if (ud.timer <= 0) {
+        const roll = Math.random();
+        if (ud.state === 'idle') {
+            if (roll < 0.4) {
+                ud.state = 'walking';
+                ud.direction.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+                ud.timer = 1 + Math.random() * 2;
+            } else if (roll < 0.7) {
+                ud.state = 'approach_wheel';
+                ud.targetPoint = new THREE.Vector3(3, 1.0, (Math.random() - 0.5) * 0.5);
+                ud.timer = 4 + Math.random() * 3;
+            } else if (roll < 0.9) {
+                ud.state = 'approach_bowl';
+                ud.targetPoint = new THREE.Vector3(-2.5 + (Math.random()-0.5)*0.5, 0.6, 1.5 + (Math.random()-0.5)*0.5);
+                ud.timer = 3 + Math.random() * 2;
+            } else {
+                ud.state = 'walking';
+                ud.direction.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+                ud.timer = 1 + Math.random() * 2;
+            }
+        } else if (ud.state === 'walking') {
+            ud.state = 'idle';
+            ud.timer = 0.5 + Math.random() * 2;
+        } else if (ud.state === 'approach_wheel') {
+            ud.state = 'running_wheel';
+            ud.timer = 3 + Math.random() * 3;
+        } else if (ud.state === 'running_wheel') {
+            ud.state = 'idle';
+            ud.timer = 1 + Math.random() * 2;
+            ud.targetPoint = null;
+        } else if (ud.state === 'approach_bowl') {
+            ud.state = 'eating';
+            ud.timer = 2 + Math.random() * 2;
+        } else if (ud.state === 'eating') {
+            ud.state = 'idle';
+            ud.timer = 1 + Math.random() * 2;
+            ud.targetPoint = null;
+        }
     }
 
-    if (h.state === 'walking') {
-      // Turn toward target
-      let angleDiff = h.targetAngle - h.mesh.rotation.y;
-      while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-      while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-      h.mesh.rotation.y += angleDiff * h.turnSpeed;
+    // Movement
+    let speed = 0;
+    if (ud.state === 'walking') {
+        speed = ud.speed;
+        // Bounce off walls
+        if (Math.abs(hamster.position.x) > CAGE_BOUNDS.x) {
+            ud.direction.x *= -1;
+            hamster.position.x = Math.sign(hamster.position.x) * CAGE_BOUNDS.x;
+        }
+        if (Math.abs(hamster.position.z) > CAGE_BOUNDS.z) {
+            ud.direction.z *= -1;
+            hamster.position.z = Math.sign(hamster.position.z) * CAGE_BOUNDS.z;
+        }
+        hamster.position.x += ud.direction.x * speed * dt;
+        hamster.position.z += ud.direction.z * speed * dt;
+    } else if (ud.state === 'approach_wheel' || ud.state === 'approach_bowl') {
+        if (ud.targetPoint) {
+            const dir = ud.targetPoint.clone().sub(hamster.position);
+            dir.y = 0;
+            const dist = dir.length();
+            if (dist > 0.5) {
+                dir.normalize();
+                speed = ud.speed * 1.2;
+                hamster.position.x += dir.x * speed * dt;
+                hamster.position.z += dir.z * speed * dt;
+            }
+        }
+    } else if (ud.state === 'running_wheel') {
+        // Stay near wheel, bounce slightly
+        const toCenter = WHEEL_POS.clone().sub(hamster.position);
+        toCenter.y = 0;
+        if (toCenter.length() > 1.0) {
+            hamster.position.lerp(WHEEL_POS, dt * 3);
+        }
+        wheelTargetSpin = 8;
+    }
 
-      // Move forward
-      const dx = Math.sin(h.mesh.rotation.y) * h.speed;
-      const dz = Math.cos(h.mesh.rotation.y) * h.speed;
-      h.mesh.position.x += dx;
-      h.mesh.position.z += dz;
+    // Rotate to face movement direction
+    if (ud.state === 'walking' || ud.state === 'approach_wheel' || ud.state === 'approach_bowl') {
+        const targetRot = Math.atan2(ud.direction.x, ud.direction.z);
+        let diff = targetRot - hamster.rotation.y;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        hamster.rotation.y += diff * dt * 5;
+    }
 
-      // Keep in cage
-      const dist = Math.sqrt(h.mesh.position.x ** 2 + h.mesh.position.z ** 2);
-      if (dist > 4.2) {
-        const toCenter = Math.atan2(-h.mesh.position.x, -h.mesh.position.z);
-        h.targetAngle = toCenter + (Math.random() - 0.5) * 1;
-      }
-
-      // Leg animation
-      h.legs.forEach((leg, i) => {
-        leg.rotation.x = Math.sin(time * 8 + h.bobPhase + i * Math.PI) * 0.4;
-      });
-
-      // Body bob
-      h.mesh.position.y = 0.85 + Math.sin(time * 6 + h.bobPhase) * 0.03;
-
-      // Check if near wheel
-      const wheelDist = Math.sqrt((h.mesh.position.x - wheelGroup.position.x) ** 2 + (h.mesh.position.z - wheelGroup.position.z) ** 2);
-      if (wheelDist < 1.5) {
-        wheelActive = true;
-      }
+    // Bob animation when walking
+    if (ud.state === 'walking' || ud.state === 'approach_wheel' || ud.state === 'approach_bowl') {
+        hamster.position.y = 1.0 + Math.sin(time * 8 + ud.bobPhase) * 0.05;
     } else {
-      // Idle: gentle breathing
-      h.mesh.position.y = 0.85 + Math.sin(time * 2 + h.bobPhase) * 0.02;
-      h.legs.forEach(leg => { leg.rotation.x *= 0.9; });
+        hamster.position.y += (1.0 - hamster.position.y) * dt * 5;
     }
 
-    // Check if any hamster is on wheel
-    const wheelDist = Math.sqrt((h.mesh.position.x - wheelGroup.position.x) ** 2 + (h.mesh.position.z - wheelGroup.position.z) ** 2);
-    if (wheelDist < 1.5 && h.state === 'walking') {
-      wheelActive = true;
+    // Idle wiggle (ears)
+    if (ud.state === 'idle') {
+        ud.earWiggle = Math.sin(time * 3 + ud.bobPhase) * 0.1;
+    } else {
+        ud.earWiggle *= 0.9;
     }
-  });
+
+    // Clamp position
+    hamster.position.x = Math.max(-CAGE_BOUNDS.x, Math.min(CAGE_BOUNDS.x, hamster.position.x));
+    hamster.position.z = Math.max(-CAGE_BOUNDS.z, Math.min(CAGE_BOUNDS.z, hamster.position.z));
 }
+
+// --- Toy Ball Interaction ---
+function updateToyBall(dt) {
+    toyBall.position.x += toyBallVel.x * dt;
+    toyBall.position.z += toyBallVel.y * dt;
+    toyBallVel.multiplyScalar(0.95);
+
+    // Bounce off bounds
+    if (Math.abs(toyBall.position.x) > CAGE_BOUNDS.x) {
+        toyBallVel.x *= -0.7;
+        toyBall.position.x = Math.sign(toyBall.position.x) * CAGE_BOUNDS.x;
+    }
+    if (Math.abs(toyBall.position.z) > CAGE_BOUNDS.z) {
+        toyBallVel.y *= -0.7;
+        toyBall.position.z = Math.sign(toyBall.position.z) * CAGE_BOUNDS.z;
+    }
+
+    // Hamster collision with ball
+    hamsters.forEach(h => {
+        const dist = new THREE.Vector2(h.position.x - toyBall.position.x, h.position.z - toyBall.position.z).length();
+        if (dist < 0.6) {
+            const push = new THREE.Vector2(
+                toyBall.position.x - h.position.x,
+                toyBall.position.z - h.position.z
+            ).normalize().multiplyScalar(2.5);
+            toyBallVel.x += push.x;
+            toyBallVel.y += push.y;
+        }
+    });
+
+    // Ball rolling rotation
+    const speed2 = Math.sqrt(toyBallVel.x * toyBallVel.x + toyBallVel.y * toyBallVel.y);
+    if (speed2 > 0.01) {
+        toyBall.rotation.z -= toyBallVel.x * dt * 3;
+        toyBall.rotation.x += toyBallVel.y * dt * 3;
+    }
+}
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+let time = 0;
 
 function animate() {
-  requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.05);
-  const time = clock.getElapsedTime();
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    time += dt;
 
-  updateHamsters(dt, time);
+    // Update hamsters
+    hamsters.forEach(h => updateHamster(h, dt, time));
 
-  // Wheel spin
-  if (wheelActive) {
-    wheelSpeed = Math.min(wheelSpeed + dt * 2, 4);
-    wheelActive = false; // Reset each frame; will be set again if hamster is near
-  } else {
-    wheelSpeed *= 0.98;
-  }
-  wheelRotation += wheelSpeed * dt;
-  wheelGroup.rotation.z = wheelRotation;
+    // Wheel spin
+    wheelSpinSpeed += (wheelTargetSpin - wheelSpinSpeed) * dt * 3;
+    wheelRing.rotation.z += wheelSpinSpeed * dt;
+    wheelTargetSpin *= 0.98; // decay
 
-  // Gentle scene rotation for the whole cage
-  // (subtle idle animation on bedding)
-  bedding.position.y = 0.55 + Math.sin(time * 0.5) * 0.01;
+    // Toy ball
+    updateToyBall(dt);
 
-  controls.update();
-  renderer.render(scene, camera);
+    // Gentle scene sway
+    pointLight.intensity = 0.5 + Math.sin(time * 0.5) * 0.1;
+
+    controls.update();
+    renderer.render(scene, camera);
 }
 
 animate();
 
 // --- Resize ---
 window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
 });
 </script>
 </body>
 </html>
 ```
 
-This creates a complete, self-contained **Low-Poly Hamster Playground** that runs immediately in any modern browser. Here's what's included:
+This creates a complete, self-contained hamster playground with:
 
 **Scene Elements:**
-- 🪵 Circular wooden tray with a bedding layer
-- 🔲 Wire cage bars arranged in a circle with a translucent lid
-- 🎡 A colorful spinning hamster wheel (spins when hamsters get near it!)
-- 🥣 A food bowl with pellets
-- 💧 A water bottle mounted to the cage
-- 🕳️ A half-cylinder tunnel
+- 🟪 **Cage** — wireframe bars on all sides with a crossbar top
+- 🟫 **Tray/Floor** — pink base with scattered wood shaving bedding
+- 🐹 **4 Hamsters** — each with unique colors (golden, white, brown, pink), built from low-poly icosahedrons with cheeks, ears, eyes, nose, legs, and tail nub
+- 🎡 **Wheel** — spinning wheel on a stand that activates when hamsters approach
+- 🥣 **Food Bowl** — with tiny pellet meshes inside
+- 💧 **Water Bottle** — translucent cylinder mounted on cage wall
+- 🏠 **Hideout House** — small box with a pyramid roof and door
+- ⚽ **Toy Ball** — a green ball that hamsters push around
 
-**Hamsters (×4):**
-- Built from low-poly icosahedrons and spheres
-- Each has a unique color (sandy, cream, brown, peach)
-- Cute details: inner ears, cheeks, nose, eye shine, tiny tail nub
+**Behavior System:**
+- State machine: `idle` → `walking` → `approach_wheel` → `running_wheel` → `idle` (and similar for bowl)
+- Hamsters wander, bounce off walls, approach the wheel to make it spin, and seek the food bowl
+- Walking bob animation, ear wiggle when idle
+- Ball gets pushed by hamster collisions with physics-like velocity decay
 
-**Behavior:**
-- State machine: `idle` → `walking` → `idle` (randomized timers)
-- Walk with leg animation and body bob
-- Turn toward random headings, turn back when near cage wall
-- Wheel spins when a hamster walks close to it
-
-**Interaction:**
-- OrbitControls for drag-rotate and scroll-zoom
-- Damped camera movement for smooth feel
+**Controls:** Drag to orbit camera, scroll to zoom.
