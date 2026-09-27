@@ -1,0 +1,284 @@
+Let me build a complete Minecraft-style voxel game in a single HTML file. This is a complex task that requires careful implementation of:
+
+1. Three.js scene setup with proper lighting
+2. Procedural terrain generation with value noise
+3. Chunk-based world management
+4. Efficient meshing (one mesh per chunk)
+5. First-person controls with pointer lock
+6. Block breaking/placing with raycasting
+7. Hotbar UI
+8. Sky, clouds, water
+
+Let me think through the architecture:
+
+**Noise System:**
+- Integer hash function using prime multipliers and xor-shifts
+- 2D value noise with bilinear interpolation and smoothstep
+- Fractal noise (4 octaves)
+- 3D noise for caves
+
+**Chunk System:**
+- 16x16x80 chunks stored in a Map
+- Generation within 5 chunks of player (max 4/frame)
+- Meshing within 4 chunks if neighbors exist (max 2/frame)
+- Removal beyond 7 chunks
+
+**Terrain Generation:**
+- Height: m = fractal(x*0.004, z*0.004), h = fractal(x*0.02, z*0.02), H = floor(5 + m*m*58 + h*10)
+- Fill: bedrock at y=0, stone below H-3, dirt/sand/stone layers, surface based on height
+- Caves: 3D noise > 0.67
+- Trees: hash < 0.02 on grass
+
+**Meshing:**
+- For each non-air block, check 6 neighbors
+- If neighbor is air, add face (2 triangles = 6 vertices)
+- Use world coordinates, keep mesh at origin
+- Vertex colors with fake lighting (top=1.0, sides=0.8, bottom=0.55)
+
+**Player:**
+- AABB collision, axis-separated
+- Gravity, jump, WASD movement
+
+**Raycasting:**
+- Ray from camera center, max distance 6
+- Against chunk meshes
+- Break: floor(p - n*0.5), Place: floor(p + n*0.5)
+
+Let me write this carefully, making sure all the details are correct.
+
+For the hash function, I'll use something like:
+```
+hash(x, y) = fract(sin(dot(x, y, primes)) * large_number)
+```
+Actually, let me use integer-based hashing with xor-shifts as specified.
+
+```javascript
+function hash2D(x, y) {
+    let h = x * 374761393 + y * 668265263;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h = h ^ (h >> 16);
+    return (h & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For smoothstep: `t * t * (3 - 2 * t)`
+
+For bilinear interpolation of value noise:
+- Get integer coordinates
+- Get fractional parts
+- Apply smoothstep to fractional parts
+- Bilinear interpolate the 4 corner hash values
+
+For fractal noise (4 octaves):
+- Sum noise at different frequencies/amplitudes
+
+For 3D noise (caves):
+- Similar but with 8 corners
+
+Let me now write the complete file. I need to be very careful about:
+- Negative coordinates (using floor division)
+- Chunk border rebuilds
+- Pointer lock state checks
+- Context menu suppression
+- Proper raycasting offset
+
+Let me code this up:
+
+```javascript
+// Chunk key helper
+function chunkKey(cx, cz) { return cx + "," + cz; }
+
+// World to chunk
+function worldToChunk(w) { return Math.floor(w / 16); }
+function worldToLocal(w) { return w - Math.floor(w / 16) * 16; }
+```
+
+For the meshing, I need to define the 6 faces of a cube with their vertices, normals, and lighting:
+
+```
+Face definitions:
++Y (top): 4 vertices, normal (0,1,0), light 1.0
+-Y (bottom): 4 vertices, normal (0,-1,0), light 0.55
++X, -X, +Z, -Z (sides): light 0.8
+```
+
+Each face = 2 triangles = 6 vertices (or 4 vertices + index, but for simplicity with BufferGeometry I'll use 6 vertices per face).
+
+Actually, let me use indexed geometry to save memory. Each face has 4 vertices and 6 indices (2 triangles).
+
+Wait, for simplicity and to avoid index buffer complexity, let me just use non-indexed geometry with 6 vertices per face. It's simpler and the spec doesn't require indexed.
+
+Let me think about the face vertex positions for a unit cube at position (bx, by, bz):
+
+Top face (+Y, y+1):
+(0,1,0), (1,1,0), (1,1,1), (0,1,1) → triangles: 0,1,2 and 0,2,3
+
+Bottom face (-Y, y):
+(0,0,0), (1,0,0), (1,0,1), (0,0,1) → triangles: 0,2,1 and 0,3,2 (reversed for correct winding)
+
+Actually, let me be more careful. In Three.js, front faces are counter-clockwise when viewed from outside.
+
+Top face (looking down from +Y):
+Vertices in CCW when viewed from above:
+(0,1,1), (1,1,1), (1,1,0), (0,1,0)
+Triangles: (0,1,2), (0,2,3)
+
+Bottom face (looking up from -Y):
+(0,0,0), (1,0,0), (1,0,1), (0,0,1)
+Triangles: (0,1,2), (0,2,3)
+
++X face (looking from +X toward -X):
+(1,0,0), (1,1,0), (1,1,1), (1,0,1)
+Triangles: (0,1,2), (0,2,3)
+
+-X face (looking from -X toward +X):
+(0,0,1), (0,1,1), (0,1,0), (0,0,0)
+Triangles: (0,1,2), (0,2,3)
+
++Z face (looking from +Z toward -Z):
+(1,0,1), (1,1,1), (0,1,1), (0,0,1)
+Triangles: (0,1,2), (0,2,3)
+
+-Z face (looking from -Z toward +Z):
+(0,0,0), (0,1,0), (1,1,0), (1,0,0)
+Triangles: (0,1,2), (0,2,3)
+
+Let me define these as arrays:
+
+```javascript
+const FACES = [
+    { // +X
+        dir: [1, 0, 0],
+        verts: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]],
+        light: 0.8
+    },
+    { // -X
+        dir: [-1, 0, 0],
+        verts: [[0,0,1],[0,1,1],[0,1,0],[0,0,0]],
+        light: 0.8
+    },
+    { // +Y
+        dir: [0, 1, 0],
+        verts: [[0,1,1],[1,1,1],[1,1,0],[0,1,0]],
+        light: 1.0
+    },
+    { // -Y
+        dir: [0, -1, 0],
+        verts: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]],
+        light: 0.55
+    },
+    { // +Z
+        dir: [0, 0, 1],
+        verts: [[1,0,1],[1,1,1],[0,1,1],[0,0,1]],
+        light: 0.8
+    },
+    { // -Z
+        dir: [0, 0, -1],
+        verts: [[0,0,0],[0,1,0],[1,1,0],[1,0,0]],
+        light: 0.8
+    }
+];
+```
+
+For each face, I add 6 vertices (two triangles from the 4 corners):
+Triangle 1: v0, v1, v2
+Triangle 2: v0, v2, v3
+
+Now let me think about the block colors:
+```javascript
+const BLOCK_COLORS = {
+    1: [0x4c/255, 0xaf/255, 0x50/255], // grass
+    2: [0x79/255, 0x55/255, 0x48/255], // dirt
+    3: [0x9e/255, 0x9e/255, 0x9e/255], // stone
+    4: [0xe7/255, 0xd9/255, 0xa8/255], // sand
+    5: [0x8d/255, 0x6e/255, 0x63/255], // wood
+    6: [0x2e/255, 0x7d/255, 0x32/255], // leaves
+    7: [1, 1, 1] // snow
+};
+```
+
+Now let me think about the collision system:
+- Player AABB: half-width 0.3, height 1.8
+- Position is at feet (bottom center)
+- Eye at position.y + 1.62
+- AABB: x ± 0.3, y to y+1.8, z ± 0.3
+
+For axis-separated collision:
+1. Move on X, check if any block overlaps, revert if so
+2. Move on Y, check, revert if so (set on-ground if moving down)
+3. Move on Z, check, revert if so
+
+To check overlap with a block at (bx, by, bz):
+- Block occupies [bx, bx+1] x [by, by+1] x [bz, bz+1]
+- Player occupies [px-0.3, px+0.3] x [py, py+1.8] x [pz-0.3, pz+0.3]
+- Overlap if all three axes overlap
+
+For the raycast, I'll use Three.js Raycaster against the chunk meshes.
+
+Let me also think about the water plane - it's at y=14.3, semi-transparent blue, follows the player.
+
+Clouds: ~25 flat white boxes at y~90, drifting slowly.
+
+Now let me write the complete code. This will be long but I need to get everything right.
+
+One thing I need to be careful about: the spec says "Use world coordinates for vertices and keep the mesh at the origin." This means the mesh object's position is (0,0,0) and the vertices are in world space. This simplifies raycasting.
+
+For the chunk data structure:
+```javascript
+const chunks = new Map(); // key: "cx,cz", value: { data: Uint8Array(16*80*16), mesh: THREE.Mesh }
+```
+
+Data indexing: data[localX * 80 * 16 + y * 16 + localZ] or some other layout. Let me use:
+data[(y * 16 + localZ) * 16 + localX] - this gives good cache locality for the meshing loop.
+
+Actually, let me use data[localX + localZ * 16 + y * 256] where 256 = 16*16.
+
+Let me finalize the code now. I'll write it all out carefully.
+
+One more consideration: the spec says "max 4 per frame" for generation and "max 2 per frame" for meshing. I need to implement this with counters in the animation loop.
+
+For the tree generation, I need to be careful:
+- Only place trees where the trunk fits inside the chunk (so leaves don't cross chunk boundaries, or I need to handle that)
+- Actually, the spec says "when a per-column hash < 0.02 and the trunk fits inside the chunk" - so I just check if the trunk position is within the chunk bounds. The leaves might extend outside, but since we're generating per-chunk, we'd miss them. Let me re-read...
+
+"Trees: on grass, when a per-column hash < 0.02 and the trunk fits inside the chunk: 4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)."
+
+I think "the trunk fits inside the chunk" means the trunk position (the column) is within the chunk. The leaves extending outside the chunk would be handled when that neighbor chunk is generated (it would check the hash for those columns too). Actually no - the leaves are placed relative to the tree position, so if a tree is at the edge of a chunk, its leaves would extend into the neighbor chunk. But since we generate chunk data independently, we'd miss those leaves.
+
+One approach: when generating a chunk, also check columns in neighboring chunks that might have trees extending into this chunk. But that's complex. 
+
+A simpler approach: when generating a chunk, for each column in the chunk, if it has a tree, place the trunk and leaves. For leaves that extend outside the chunk, we just don't place them (they'll be missing at chunk borders). This is a common simplification in simple voxel games.
+
+Actually, a better approach: when generating chunk data, iterate over a slightly larger area (say ±3 blocks beyond the chunk) and for any column that has a tree, place the blocks that fall within this chunk. This way trees at chunk borders get their leaves placed correctly.
+
+Let me implement it this way: when generating a chunk at (cx, cz), iterate over columns from (cx*16 - 3) to (cx*16 + 18) and (cz*16 - 3) to (cz*16 + 18), check for trees, and place blocks that fall within the chunk bounds.
+
+Actually, that's a bit complex. Let me just do the simple version where trees near edges might have missing leaves. It's a minor visual issue.
+
+Wait, re-reading the spec: "the trunk fits inside the chunk" - I think this means we only place trees where the entire tree (including leaves) fits within the chunk. So the trunk must be at least 2 blocks from any edge (since leaves are 5x5, that's ±2). Let me implement it that way - only place trees where localX >= 2 and localX <= 13, localZ >= 2 and localZ <= 13.
+
+OK let me write the full code now.
+
+Actually, I realize I should also handle the case where trees are generated in one chunk but their leaves extend into another. The simplest correct approach is:
+
+When generating chunk (cx, cz), for each column (wx, wz) in the range [cx*16-3, cx*16+18] x [cz*16-3, cz*16+18]:
+- Check if that column has a tree (using the hash)
+- If yes, compute the tree blocks
+- For each tree block, if it falls within this chunk's bounds, set it
+
+This ensures trees at chunk borders are handled correctly. Let me implement this.
+
+Let me now write the complete file. I'll be thorough and make sure everything works.
+
+Here's my plan for the code structure:
+1. HTML/CSS (overlay, hotbar, crosshair, canvas)
+2. Three.js setup (scene, camera, lights, fog)
+3. Noise functions
+4. Terrain generation
+5. Chunk management (generate, mesh, remove)
+6. Player physics and controls
+7. Raycasting and block editing
+8. Animation loop
+9. Event handlers
+
+Let me write it all now.
