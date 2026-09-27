@@ -1,0 +1,943 @@
+The user wants a single self-contained HTML file using Three.js r128, implementing a hamster cage with honest physics. This is a big task. I need to write a comprehensive HTML file. Let me plan carefully but keep the code manageable.
+
+Key requirements:
+
+- Wheel: axis horizontal, hamster runs on the inside bottom of the rim, ω = v/R, friction deceleration when empty, debug panel showing paw speed, rim linear speed |ω|·R, and mismatch %.
+- Wheel radius derived from hamster dimensions (ДЛИНА_ЗВЕРЯ, ВЫСОТА_ЗВЕРЯ constants).
+- Pipe: hollow cylinder lying on bedding, enter only from ends, movement along axis, hamster stands on inside bottom.
+- Colliders: wheel (circle), bowl, pipe (rectangle/AABB). Walking hamsters get pushed out. Hamsters softly push each other apart.
+- Paws: phase from distance traveled, diagonal pairs.
+- Transitions: smoothly enter/exit wheel, one user per wheel.
+- FSM: idle → walk to target → activity → idle. Activities: wheel, pipe, bowl, walk.
+- Side panel showing each hamster's activity.
+- Click hamster → jump.
+- Idle breathing, ear twitch, head bobbing and chewing at bowl.
+- Scene: room, table, cage tray, bedding InstancedMesh, bars, wheel, pipe, bowl with seeds, water bottle.
+- Hamster parts: body, belly, head group, eyes with pupils, cheeks, nose, ears with inner, 4 legs, tail.
+- Shadows PCFSoftShadowMap 2048, directional + ambient.
+- rAF with delta clamp, resize handler.
+- Expose window.HAMSTERS, window.WHEEL, window.PIPE etc.
+
+Design decisions:
+
+Wheel physics: wheel angle θ, angular velocity ω. Running hamster: paw speed v (target speed). Wheel gets ω = v/R... actually "correct" physics: hamster runs, rim moves under paws backward. If no slip, rim linear speed = paw speed. So when hamster runs inside, set ω = v/R (or better, wheel accelerates toward that). Simplest honest approach: while hamster runs at speed v, wheel ω = v/R. Check |ω|·R vs v → 0% mismatch. When empty, ω decays: ω *= exp(-friction*dt) or ω -= sign*μ*dt to zero.
+
+Hamster in wheel: position at wheel center, but feet at bottom inside of rim. Hamster position: wheel center is at height axleY = R + clearance above ground. Hamster feet at y = axleY - R. Hamster stands at angular position at bottom of wheel. As wheel rotates, does hamster stay at bottom? Yes — running keeps them at bottom. Body orientation: facing tangentially at bottom point. If wheel rotates so rim moves backward relative to hamster's facing direction... hamster faces +x at bottom of wheel; rim at bottom moves in -x direction (backward). Wheel axis along z. Bottom point velocity = ω × r. Axis z, bottom point r = (0,-R,0). Velocity = ω ẑ × (0,-R,0) = ω*(R, 0, 0)... ẑ×ŷ = -x̂ so ẑ×(0,-R,0) = -R(ẑ×ŷ) = -R(-x̂)= R x̂. So ω>0 gives bottom point moving +x. We want rim moving -x (backward) when hamster faces +x. So ω should be negative. Or hamster faces -x. Let me just compute: hamster faces direction d at bottom; rim velocity at bottom should be -d * v. Set ω accordingly.
+
+Simpler: fix wheel orientation. Wheel axis along world Z. Hamster inside faces +X at bottom. Then rim bottom velocity should be -X*v → ω_z = -v/R (from above, ω_z>0 gives +X velocity at bottom, so ω_z = -v/R). Wheel mesh rotation.z = θ, dθ/dt = ω_z.
+
+Hamster in wheel: position = wheel center + (0, -R + hamsterHeight/2, 0)... feet at bottom inside: feet y = axleY - R (minus small sink for rim thickness). Hamster x,z = wheel center x,z. Facing +X. Legs run with phase from distance traveled = ∫v dt; rim moves backward.
+
+Entering wheel: hamster walks to wheel front (opening on +X side? Wheel usually has one side open). Let's make wheel open on +X side (outside of cage side?). Hmm, wheel is placed against cage wall with open side facing into cage. Wheel at cage's -X side, open side facing +X (into cage). Hamster enters from +X side, walks through opening, moves in -X direction to reach center-bottom of wheel, then turns to face... wait, at bottom of wheel, hamster runs and rim bottom moves backward relative to hamster. If hamster faces -X (into wheel), rim moves +X. OK.
+
+Transition: state "entering_wheel": lerp position from wheel mouth to running position (center bottom), facing -X. Then "running". Exit: lerp back to mouth, then to outside point, then state walking.
+
+Wheel collider for walking hamsters: circle in XZ? Wheel is a vertical disk. Walking hamster shouldn't pass through the wheel's side... wheel is thin along Z (axis along Z). Hmm, wheel axis along Z means wheel disk is in XY plane. Walking hamster on floor: collider is a box/rectangle in XZ: wheel occupies x in [cx - R, cx + R], z in [cz - halfWidth, cz + halfWidth]. But hamster needs to enter from mouth at +X side. So collider: rectangle but with an entry zone allowed when target is wheel. Simpler: treat wheel as a box collider, but when hamster is in "entering wheel" state, skip wheel collision. Also wheel is against back wall so hamsters approach from +X only.
+
+Actually, to keep it simple: wheel collider = AABB in XZ (x range, z range). Walking hamsters get pushed out. Hamsters targeting wheel use a path: walk to mouth point (cx + R + 0.3, cz), then transition to entering state which moves along -X into wheel. Inside wheel, skip external collisions.
+
+Pipe: cylinder along X axis, on floor, at some position. Radius rPipe, length L. Enter from ends (x = px ± L/2). Hamster inside: position along axis, y = pipe center y - rPipe + footOffset (stands on inside bottom), deviation from axis ~0 (check #4: "hamster in pipe is on axis (deviation from axis close to zero)"). Hmm — stands on inside bottom but deviation from axis close to zero? Contradictory unless we measure deviation in XZ (horizontal) — deviation from axis in lateral direction is zero. Check probably measures z deviation from axis. Let me keep hamster's z exactly at pipe axis z, y at inside bottom. Then "отклонение от оси" in lateral direction is zero. Good.
+
+Pipe behavior: pick an end, walk to entry point just outside end, state "entering_pipe": move along axis from entry to opposite exit, then exit point, then resume walking. While inside, hamster faces along axis direction. Skip pipe collision when inside/entering.
+
+Pipe collider for outside walkers: rectangle in XZ: x in [px-L/2, px+L/2] extended by radius, z in [pz-r, pz+r]. But hamster needs to enter from ends: approach point is at x = px - L/2 - (r+0.2) or so, aligned with pz. When targeting pipe, allow approach along axis. To avoid push-out fighting approach, skip pipe collision when hamster's target is pipe and it's near the axis line. Simpler: skip pipe collision when hamster state is entering_pipe/in_pipe; for walking-to-pipe, hamster approaches along axis line, and the rectangle collider extends only the body footprint... when hamster reaches end, its center is at x = px - L/2 - r? Actually the pipe's mouth is at x = px - L/2, radius r. Hamster center should be at x = px - L/2 - bodyRadius... then push-out from rectangle pushes it in -X, which is fine, it just stops at edge; then when close enough to mouth (within threshold and aligned in z), switch to entering state which overrides kinematic motion along axis. Good.
+
+Bowl: circle collider radius rBowl. Hamster at bowl stands adjacent to it (target point at bowl edge + offset), eats.
+
+Hamster-hamster: soft push apart, min distance = sum of radii.
+
+Paw phase: phase += (dist / stepLen) * 2π. Legs: FL & BR in phase, FR & BL in phase+π. Rotation = sin(phase)*amp when moving; when idle, amp→0 (freeze). Requirement: "при остановке фаза шага перестаёт меняться" — since phase is from distance, this is automatic.
+
+Clamp dt to 0.05.
+
+Debug panel: pick running hamster (or first one), show paw speed v, |ω|·R, mismatch %.
+
+Expose: window.HAMSTERS array, window.WHEEL = {R, omega, angle,...}, window.PIPE = {...}.
+
+Room: floor, walls, table under cage. Cage: tray (box), bedding InstancedMesh (small boxes scattered), bars (thin cylinders/boxes around), top frame. Lights: directional with shadow 2048, ambient/hemisphere.
+
+Hamster build: group. Body ellipsoid (scaled sphere), belly, head group (eyes, pupils, cheeks, nose, ears with inner), 4 legs (pivot groups at hip, small capsule/box), tail. Colors per hamster.
+
+Click: raycaster against hamster groups → jump (vy velocity, gravity, ground y).
+
+Breathing: body scale oscillation. Ear twitch: random timer, rotate ear.
+
+Chewing: at bowl, head bob + jaw? Just head rotation oscillation.
+
+FSM states: 'idle', 'walking', 'to_wheel', 'in_wheel_enter', 'running_wheel', 'wheel_exit', 'to_pipe', 'in_pipe', 'to_bowl', 'eating', maybe 'jumping'. Keep simple:
+
+- idle: timer, then pick activity: wheel (if free), pipe, bowl, walk.
+- walking: move to target; on arrival → activity state or idle.
+- running_wheel: run for random duration, then exit.
+- in_pipe: kinematic along axis.
+- eating: timer, chew anim.
+
+Movement: velocity toward target with accel? Keep simple: constant speed with easing; store speed for panel.
+
+Wheel physics update:
+```
+if runner: targetOmega = -runner.pawSpeed / R; omega approaches targetOmega quickly (or set directly). Set directly: omega = -v/R. But when hamster accelerates (v ramps up), omega ramps too. Good — mismatch ~0.
+else: friction decay: omega = approach(omega, 0, friction*dt).
+angle += omega*dt.
+```
+Runner paw speed: hamster has current run speed v that ramps to runSpeed. Distance traveled += v*dt for phase.
+
+Panel check: pawSpeed = runner.v; rimSpeed = |omega|*R; mismatch = |rim - paw|/max(paw,eps)*100.
+
+Wheel radius from hamster dims:
+```
+const ДЛИНА_ЗВЕРЯ = 0.9, ВЫСОТА_ЗВЕРЯ = 0.55;
+R = ВЫСОТА_ЗВЕРЯ * 1.6 + ДЛИНА_ЗВЕРЯ*0.15 ...
+```
+Requirement: animal fits inside with margin, distance between rims (width) wider than sides. R = ВЫСОТА_ЗВЕРЯ*1.8; width = ДЛИНА_ЗВЕРЯ*1.2? Width between side disks should be wider than body width (body width ~0.45). Set wheel width = 0.9.
+
+Check #3: hamster in wheel stands at bottom point of rim, dims < radius. Expose WHEEL.R and hamster dims; hamster feet y ≈ axleY - R.
+
+Wheel build: torus for rim (radius R, tube 0.06), spokes (boxes) rotating with angle, two side disks (open cylinder? side rings — use ring geometry or thin cylinders at z=±width/2), axle along Z, stand.
+
+Wheel mesh: group at (wx, axleY, wz); rotating subgroup rotation.z = angle contains rim torus, spokes, side disks.
+
+Hamster inside wheel: position (wx, axleY - R + footAdjust, wz). footAdjust = rim tube radius (stands on inside of rim): feet y = axleY - R + tubeR? Torus radius R is center of tube; inside is R - tubeR. Feet y = axleY - (R - tubeR). Use effective R_inner = R - tubeR for physics? For ω·R check, use R (nominal). Keep R as running radius, feet at axleY - R + 0.03.
+
+Facing: hamster faces -X (into wheel, wheel at -X side of cage). Bottom rim velocity should be +X (backward). ω_z: bottom velocity = ω ẑ × (0,-R,0) = ω*R x̂. Need +X → ω = +v/R. So omega = v/R with hamster facing -X. Wheel rotation.z = angle increasing.
+
+Hmm wait, let me verify: hamster runs "forward" (-X), pushes rim backward (+X). Yes, ω = +v/R.
+
+Pipe: along X axis, center (px, rPipe, pz), length L. rPipe = 0.45. Hamster inside: y = rPipe - innerBottomOffset... feet y = rPipe - (rPipe - tubeR) ... feet stand on inside bottom: feet y ≈ 2*tubeR? Just feet y = 0.06 (near floor). Hamster center y = feet + halfHeight. Deviation from axis: z - pz = 0. Good.
+
+Cage layout: cage interior x∈[-3,3], z∈[-2,2]. Table at y ~0. Tray from y=-0.3 to 0.2? Let floor of cage be y=0 (top of bedding). Bars from y=0 to 2.2. Wheel at x=-2.2, z=0, axis along Z, open side +X. Pipe at (0.8, , 0.9) along X. Bowl at (1.8, , -1.0). Water bottle on wall x=2.9.
+
+Bedding: InstancedMesh of ~600 small boxes randomly placed, y≈0.02.
+
+Camera: OrbitControls, positioned to see cage on table.
+
+Side panel HTML: list of hamsters with names/colors/status; wheel physics panel.
+
+Raycast click: raycaster.intersectObjects(hamsterMeshes, true), find owner via userData.
+
+Jump: if not in wheel/pipe, vy = 2.2, gravity, y clamps to 0.
+
+Let me write the code. Keep it organized. Names: Топтя, Рыжик, Нуба, Серый, Пятнышко. Colors: gold, red, cream, gray, spotted (white with brown patches — just use color).
+
+Hamster build function makeHamster(color, name):
+
+- group root (position = ground position of feet, y = feet).
+- bodyGroup: body sphere scaled (length 0.9? body radius 0.28 scaled to (1.15, 0.95, 0.85)*? Let me define: bodyRadius 0.26, scale (1.6, 1.15, 1.0) → length ~0.83, height 0.6, width 0.52. Hmm, ДЛИНА_ЗВЕРЯ=0.9, ВЫСОТА_ЗВЕРЯ=0.55, ШИРИНА_ЗВЕРЯ=0.45.
+
+Body center at y = 0.30. Head group at front (x = +0.38? hamster faces -X in wheel but generally faces movement direction; build facing +X, rotate group's rotation.y = heading). Build facing +X: head at x=+0.35, y=0.42. Eyes at x=0.52, y=0.47, z=±0.12. Pupils smaller darker. Cheeks spheres at x=0.45, y=0.38, z=±0.16. Nose at x=0.6, y=0.44. Ears: at x=0.28, y=0.62, z=±0.14, small hemisphere + inner. Legs: 4 pivot groups at (±0.22, 0.16, ±0.18), each with a small sphere/box extending down 0.16. Tail at x=-0.45.
+
+Leg pivot at hip; leg mesh offset y=-0.08 so it hangs down; rotate pivot around z axis for swing (since facing +X, swing in x-y plane → rotation.z). Diagonal pairs: FL(z+) & BR(z-) in phase, FR & BL in phase+π.
+
+Heading: rotation.y = atan2(dirX, dirZ)? For facing +X model, rotation.y = atan2(dir.x, dir.z) - π/2? Model faces +X. rotation.y = Math.atan2(dir.z, dir.x) rotates +X axis to (cos, 0, -sin)... rotation around Y by angle a maps +X to (cos a, 0, -sin a). We want (dx, dz): cos a = dx, -sin a = dz → a = atan2(-dz, dx). Use that.
+
+Breathing: bodyGroup scale = 1 + 0.03*sin(t*2 + phase). Ear twitch: random.
+
+Chewing: headGroup rotation.x oscillates when eating.
+
+Now FSM code per hamster object h:
+
+```
+h.state, h.timer, h.target (Vector3), h.speed current, h.phase, h.path...
+```
+
+Activity selection:
+```
+pickActivity(h):
+  r = random
+  if wheel free and r<0.3 → go to wheel mouth
+  else if r<0.55 → pipe (random direction)
+  else if r<0.8 → bowl
+  else walk (random point)
+```
+Wheel occupied flag wheel.occupant; pipe occupied? Pipe can allow both? Simpler: pipe also one at a time (occupant). Bowl: allow multiple? Bowl collider small; allow 2. Let's allow multiple at bowl with different target points around bowl.
+
+Movement update (walking):
+```
+dir = target - pos (xz); d = len
+if d < 0.05 → arrive
+speed ramps to walkSpeed
+pos += dir/d * speed * dt
+phase += speed*dt/stepLen*2π
+collisions: push out from wheel box, pipe box, bowl circle, tray walls, other hamsters
+```
+
+Wheel states:
+- 'to_wheel': target = mouth point (wx + R + 0.35, wz). On arrival (and |z - wz| small) → state 'wheel_enter', t=0. Set wheel.occupant = h.
+- 'wheel_enter': kinematic: lerp from mouth to center-bottom over time; facing -X; y = axleY - R (feet). On complete → 'running_wheel', timer = rand 4-9s.
+- 'running_wheel': v ramps to runSpeed; phase advances; wheel.omega = v/R; timer -= dt; on end → 'wheel_exit'.
+- 'wheel_exit': lerp back to mouth; then state 'walking' with random target; wheel.occupant = null.
+
+While in wheel states, hamster position is set kinematically; skip collisions.
+
+Pipe states:
+- 'to_pipe': target = entry point outside end: entryX = px - sign*(L/2 + rPipe + 0.3), z = pz. On arrival → 'pipe_enter'. pipe.occupant = h (if free, else pick other activity).
+- 'pipe_enter'/'in_pipe': kinematic along axis: parameter s from -(L/2 + bodyLen) to +(L/2 + bodyLen)... hamster center x from px - (L/2 + 0.5) to px + (L/2 + 0.5). y = pipe inner bottom feet, z = pz. Facing along +X (or direction of travel). Speed constant. On complete → 'walking', pipe.occupant=null.
+
+While inside pipe, hamster is geometrically inside pipe collider — skip pipe collision when in pipe state. Check #5 says "walking hamster never ends up inside body of wheel, bowl, or pipe" — walking, so fine.
+
+Bowl:
+- 'to_bowl': target = bowl edge + offset in direction of approach. On arrival → 'eating', timer 3-6s, chew anim. Then idle/walk.
+
+Eating: head bob; body stationary; phase frozen (no distance).
+
+Idle: stand, breathe, ear twitch; timer 1-3s → pick activity.
+
+Jump: on click, if state is walking/idle/to_*: h.vy = 2.5; h.jumping = true. During jump, y physics; legs tuck.
+
+Collisions:
+
+```
+function collideWorld(p, radius):
+  // tray walls: clamp x to [-3+r, 3-r], z to [-2+r, 2-r]
+  // bowl: circle at (bx,bz) radius rBowl+r → push out
+  // wheel box: x∈[wx-R-0.1, wx+R+0.1]? but mouth... wheel is at x=-2.2, R~1.0 → x∈[-3.2,-1.2]. Mouth at x=-1.2 side. Hamster approaching mouth stays outside x > -1.2. Box pushout: if inside box, push out along min penetration axis. If approaching mouth along z=wz from +X, hamster hits box face at x=-1.2+... gets pushed back in +X. Then 'to_wheel' arrival threshold: distance to mouth point (x=-1.2-0.35? no, mouth point is outside: x = wx+R+0.4). Hamster walks to that point, never enters box. Good.
+  // pipe box: x∈[px-L/2-r*0.7, px+L/2+r*0.7], z∈[pz-r-? ...]. Approach point outside box. Pushout min axis.
+```
+
+Wait, pipe box: pipe is a cylinder; approximate with rectangle x∈[px-L/2, px+L/2] expanded by r+hamsterRadius in z, and x expanded by hamsterRadius. Pushout min axis. Approach point at x = px - (L/2 + r + 0.35), z=pz: distance to box x face = 0.35 > 0? Box x min = px - L/2 - hamsterR. If hamsterR=0.3, box min = px - L/2 - 0.3; approach point x = px - L/2 - r - 0.35 = px - L/2 - 0.8. Outside. Good.
+
+Hamster-hamster: for pairs, if dist < minD (0.55), push each by half overlap. Skip if either is in wheel/pipe.
+
+Wheel box: wheel is thin along Z (width 0.9). Walking hamster shouldn't cross wheel plane... box z∈[wz - width/2 - hr, wz + width/2 + hr], x∈[wx-R-hr*0.5, wx+R+hr*0.5]. Hmm, but wheel is near left wall; hamster walking around z=0 area might get pushed. Fine.
+
+But wheel mouth: hamster enters from +X. 'to_wheel' target is outside box. OK.
+
+Also wheel bottom: wheel bottom near floor; fine.
+
+Debug panel: show for runner if any, else wheel state: pawSpeed (runner ? runner.v : 0), rimSpeed=|ω|·R, mismatch. Also show selected/last runner. Show for each hamster too.
+
+Also expose window.__check = {HAMSTERS, WHEEL, PIPE, BOWL}.
+
+Lights: DirectionalLight position (6,10,4), castShadow, shadow.mapSize 2048, camera bounds. HemisphereLight. Room: big box inside (room walls) — use planes with MeshLambert/Standard. Use MeshStandardMaterial for nicer look; performance fine.
+
+Bedding InstancedMesh: BoxGeometry(0.09,0.02,0.03), 700 instances, random rotation, color variation via setColorAt? r128 supports setColorAt. Use MeshStandardMaterial with vertexColors? setColorAt works with instanceColor. Keep simple: single color, random rotation.
+
+Bars: vertical thin cylinders every 0.25 around perimeter, castShadow. Frame boxes top.
+
+Water bottle: cylinder + cap + tube on wall.
+
+Bowl: cylinder (open) + seeds (small spheres instanced or few).
+
+Wheel build:
+```
+wheelGroup at (wx, axleY, wz)
+rotor group: torus(R, 0.05), 8 spokes (box length 2R thin), 2 side rings: CylinderGeometry(R, R, 0.04, 32) rotated so axis along Z, at z=±width/2 — but side disks should be nearly solid with hole? Just use thin cylinders as disks (solid) — hamster enters from +X side... if side disks are solid and axis along Z, hamster enters from +X which is between the two disks (open side). Disks at z=±width/2 block z direction, open at x ends? No — cylinder disk with axis Z blocks movement through the disk face (in Z direction). Mouth is on rim circumference (radial opening). Hamster enters radially from +X between the two side disks. Yes, works: side disks are at z=±w/2, rim torus in XY plane, opening = anywhere on circumference not blocked; hamster enters from +X side, moving in -X between disks. Good.
+```
+Spokes would hit hamster... cartoon acceptable; spokes thin, maybe rungs (crossbars) along Z at rim (like real wheel — crossbars hamster runs on). Add crossbars: small cylinders along Z at radius R-0.05, 10 of them, spaced around. Nice.
+
+Stand: 2 boxes from base to axle.
+
+axleY = R + 0.15 (clearance under wheel).
+
+R computed from ВЫСОТА_ЗВЕРЯ: R = ВЫСОТА_ЗВЕРЯ * 1.9 + 0.1? Let me set: ДЛИНА=0.9, ВЫСОТА=0.55, ШИРИНА=0.45. R = ВЫСОТА*1.8 = 0.99 ≈ 1.0. width = ШИРИНА*2 = 0.9. Check: hamster fits: 2*sqrt(R²)... at bottom, hamster occupies height 0.55 < R? Needs to fit under top: 0.55 < 2R obviously. "габарит меньше радиуса колеса" — check #3 says dims less than radius? "его габарит меньше радиуса колеса (обод не пересекает тело)". Height 0.55 < R=1.0 ✓. Length 0.9 < R? 0.9 < 1.0 ✓ (barely). OK, set R = 1.05: R = ВЫСОТА*1.9. Length 0.9 < 1.05 ✓.
+
+Running hamster at bottom: body center at feet+0.30, top at ~0.6 above feet, feet at rim → top at axleY - R + 0.6 = axleY - 0.45, inside rim ✓.
+
+Pipe: rPipe = 0.42, tube 0.05, inner radius 0.37. Hamster width 0.45 > inner diameter 0.74? 0.45 < 0.74 ✓. Height 0.55 > inner 0.74? 0.55 < 0.74 ✓. OK. Pipe radius from hamster: rPipe = ВЫСОТА*0.75 ≈ 0.41.
+
+Pipe y: center at rPipe so bottom touches floor. Feet inside at y = 2*tubeR ≈ 0.1? Inner bottom at rPipe - (rPipe-0.05)... inner surface bottom y = 0.05 (tube thickness). Feet y = 0.06.
+
+Hamster inside pipe: z = pz exactly, x moves. Facing along movement.
+
+Camera: (5,4,6), target (0,1,0).
+
+Room: floor plane at y=-1.6 (table height), table box, cage on top. Table top y=0? Let cage floor (bedding) be y=0, tray below, table top y=-0.5, table legs to room floor y=-2. Room floor plane y=-2, walls behind.
+
+Shadows: bedding receives, hamsters cast, bars cast.
+
+OK, code size ~700 lines. Let me write it.
+
+Key globals:
+
+```js
+const ДЛИНА_ЗВЕРЯ=0.9, ВЫСОТА_ЗВЕРЯ=0.55, ШИРИНА_ЗВЕРЯ=0.45;
+const WHEEL = {R: ВЫСОТА_ЗВЕРЯ*1.9, width: ШИРИНА_ЗВЕРЯ*2, x:-2.1, z:0, omega:0, angle:0, occupant:null, friction:1.2};
+WHEEL.axleY = WHEEL.R + 0.12;
+const PIPE = {r:0.42, len:1.8, x:0.9, z:0.95, occupant:null};
+const BOWL = {x:1.9, z:-1.0, r:0.3};
+```
+
+Wheel update:
+```js
+function updateWheel(dt){
+  const o = WHEEL.occupant;
+  if(o && o.state==='running_wheel'){
+    WHEEL.omega = o.runSpeed / WHEEL.R; // no slip
+  } else {
+    // friction
+    const d = WHEEL.friction*dt;
+    if(Math.abs(WHEEL.omega)<=d) WHEEL.omega=0; else WHEEL.omega -= Math.sign(WHEEL.omega)*d;
+  }
+  WHEEL.angle += WHEEL.omega*dt;
+  rotor.rotation.z = WHEEL.angle;
+}
+```
+Hmm, but during 'running_wheel', hamster's v ramps up: o.runSpeed ramps from 0 to target. omega = runSpeed/R always → mismatch 0. But when hamster decelerates at end... transition to exit; omega set to 0 → wheel stops abruptly? Better: during exit, keep last omega and let friction decay. Only set omega during 'running_wheel'; otherwise friction. When runner stops (runSpeed ramps to 0 before exit), omega follows to 0 smoothly. Let me ramp runSpeed down before exit: when timer<0.6, decelerate. Then wheel_exit.
+
+Also runner's distance: o.wheelDist += runSpeed*dt; phase from that.
+
+Runner position each frame:
+```
+h.pos.set(WHEEL.x, WHEEL.axleY - WHEEL.R + 0.04, WHEEL.z); // feet
+h.group.position.set(...); h.group.rotation.y = heading for -X = atan2(0, -1)=π.
+```
+Feet y = axleY - R + tubeR(0.05). Set 0.05.
+
+Wheel enter: from mouth point M = (WHEEL.x + WHEEL.R + 0.45, WHEEL.z) feet y=0.02 (bedding). Lerp t 0→1 over 1.2s: x = lerp(M.x, WHEEL.x, ease), y = lerp(0.02, wheelFeetY, ease)? Move horizontally into wheel at floor level — wheel bottom is at axleY - R = 0.12 above floor, so inside wheel floor is 0.12+0.05. Slight rise, fine, lerp y.
+
+Exit similar reversed.
+
+Pipe kinematics:
+```
+state 'pipe_move': h.pipeS += dir*speed*dt; s from -(len/2+0.6) to +(len/2+0.6) relative to pipe.x.
+x = PIPE.x + s; y=0.06; z=PIPE.z.
+phase += speed*dt/step*2π.
+```
+Enter condition: from arrival at entry point, set pipeS = start, state pipe_move. Smooth: entry point x = PIPE.x - (len/2 + r + 0.35) ≈ s0 = -(len/2 + 0.77). Start pipe_move from s0 — same position, continuous ✓. Facing = direction of travel (+X or -X).
+
+Bowl target: point at distance BOWL.r + 0.45 from bowl center, chosen side (from hamster's current direction).
+
+Now hamster update function with switch. Let me write it.
+
+Also "Один предмет — один пользователь": wheel.occupant, pipe.occupant checks when picking activity.
+
+Panel update every ~0.15s: status text per hamster; wheel panel: paw speed (runner ? runner.runSpeed : lastRunnerSpeed?), rim speed, mismatch. If no runner, show last runner's values? Show current: if runner, pawSpeed=runSpeed, else 0; mismatch only meaningful when running. Show "—" when no runner. Keep last runner reference for display.
+
+Status text mapping:
+- idle: 'стоит, дышит'
+- walking: 'гуляет'
+- to_wheel: 'идёт к колесу'
+- wheel_enter: 'забегает в колесо'
+- running_wheel: 'бежит в колесе'
+- wheel_exit: 'выходит из колеса'
+- to_pipe: 'идёт к трубе'
+- pipe_move: 'ползёт по трубе'
+- to_bowl: 'идёт к миске'
+- eating: 'грызёт зёрна'
+
+Jump: allow in idle/walking states. h.jumpV; h.yVel; y += vy*dt; vy -= g*dt; clamp to groundY (state-dependent base y). During jump in walking state, base y = 0.02.
+
+Raycaster: on pointerdown, compute, intersect children of hamsterGroup; walk up parents to find userData.hamsterRef.
+
+Ear twitch: h.twitchTimer; when active, rotate one ear for 0.3s.
+
+Chewing: headGroup.rotation.x = 0.15*sin(t*10) when eating; also slight cheek scale.
+
+Breathing: bodyMesh.scale.set(sx*(1+0.02*sin), ...).
+
+Legs: pivot rotation.z = sin(phase + off)*0.6*moveAmp; moveAmp ramps to 1 when moving, 0 when not; when amp ~0, legs at rest angle. Phase only advances with distance ✓.
+
+In wheel: legs run with phase from wheel distance, amp 1.
+
+Tail: slight sway.
+
+Body orientation smoothing: h.heading lerps to target heading angle (shortest angle).
+
+Let me write the HTML. Also CSS for status panel on left, physics panel top right.
+
+Bedding color: setColorAt for variation — r128: does instanceColor exist? setColorAt was added around r117, fine.
+
+Let me write the code carefully.
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>...</head>
+<body>
+<div id="ui">...</div>
+<div id="phys">...</div>
+<script src cdnjs r128></script>
+<script src jsdelivr OrbitControls></script>
+<script> ... </script>
+```
+
+Scene setup:
+
+```js
+let scene, camera, renderer, controls, clock;
+renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+```
+
+Room: floor 20x20 at y=-2.1, color; back wall at z=-8, side wall; ceiling optional. Table: top box 8x0.15x6 at y=-0.42; legs 4 boxes to floor.
+
+Cage: tray: box 6.6 x 0.5 x 4.6 centered y=-0.2 (top at 0.05), inner floor plane at y=0 (bedding surface). Walls: bars around perimeter x∈[-3.3,3.3], z∈[-2.3,2.3], y from 0 to 2.3. Bars: cylinders r=0.025 spaced 0.28. Frame: boxes at top edges and bottom.
+
+Cage interior bounds for hamsters: x∈[-3.0,3.0], z∈[-2.0,2.0] (with radius margin).
+
+Wheel at x=-2.1: wheel occupies x∈[-3.15,-1.05]; tray inner wall at -3.3, fine.
+
+Lights: dir (5,9,3), intensity 1.0, castShadow, shadow.camera range ±6, bias -0.0005. Hemisphere (0xfff4e0, 0x445566, 0.55). Maybe soft point too.
+
+Hamster factory:
+
+```js
+function makeHamster(cfg){
+ const g = new THREE.Group();
+ const mat = new THREE.MeshStandardMaterial({color:cfg.color, roughness:0.9});
+ const dark = ...
+ body = sphere(0.27, 20,16) scale(1.6,1.1,1.0) pos y=0.32
+ belly = sphere(0.22) scale(1.3,0.9,0.85) pos (0.05,0.26,0) cream color
+ headG = Group at (0.36,0.5,0)
+   head sphere 0.19
+   eyes white sphere 0.045 at (0.13,0.04,±0.10) local; pupils 0.022 black slightly forward
+   cheeks sphere 0.07 at (0.10,-0.05,±0.11)
+   nose 0.03 at (0.19,-0.01,0) pink
+   ears: pivot group at (-0.02,0.16,±0.12); outer sphere 0.07 flat, inner 0.045 darker
+ legs: 4 pivots at (±0.2, 0.18, ±0.16); leg mesh capsule-ish: sphere 0.06 scale(1,1.6,1) offset y=-0.07
+ tail: sphere 0.05 at (-0.47,0.3,0)
+}
+```
+
+Feet at y≈0.18-0.07-0.06*1.6... leg pivot y=0.18, leg extends to 0.18 - (0.07+0.096) ≈ 0.01. Good.
+
+Hamster object:
+
+```js
+{
+ name, group, headG, ears:[L,R], legs:[{pivot, off}...], bodyMesh,
+ pos: new THREE.Vector3(x, 0.02, z), heading, targetHeading,
+ state:'idle', timer, target, speed:0, phase:0, moveAmp:0,
+ runSpeed:0, wheelDist:0, walkDist:0,
+ yOff:0, vy:0, jumping:false,
+ breathPhase, twitchT:rand, twitchActive:0,
+ pipeDir, pipeS, enterT, from, to, chew...
+}
+```
+
+Main loop:
+
+```js
+function animate(){
+ requestAnimationFrame(animate);
+ let dt = Math.min(clock.getDelta(), 0.05);
+ updateWheel(dt);
+ for h of HAMSTERS: updateHamster(h, dt);
+ separateHamsters();
+ updateUI();
+ renderer.render(scene,camera);
+}
+```
+
+updateHamster: switch on state:
+
+Common helpers:
+```js
+function walkTo(h, tx, tz, next){ h.target.set(tx,0,tz); h.state='walking'; h.next=next; h.status...}
+```
+Walking update:
+```js
+const dx=h.target.x-h.pos.x, dz=h.target.z-h.pos.z, d=Math.hypot(dx,dz);
+h.speed = approach(h.speed, d>0.05? WALK:0, 3*dt);
+if(d>0.02){ const step=h.speed*dt; h.pos.x+=dx/d*step; h.pos.z+=dz/d*step; h.walkDist+=step; h.phase += step/STEP_LEN*2π; h.targetHeading=Math.atan2(-dz,dx)... }
+if(d<0.06){ h.state = h.next... }
+```
+Heading: model faces +X; rotation.y = a maps +X to (cos a,0,-sin a). Want (dx,dz)/d: a = Math.atan2(-dz, dx).
+
+Collisions after walking move: collide(h) applies pushout to h.pos (only if state is walking/idle/to_*).
+
+collide(h):
+```js
+const r=0.3;
+// walls
+h.pos.x = clamp(h.pos.x, -3+r, 3-r); z similar ±2
+// bowl circle
+d = dist to (BOWL.x,BOWL.z); min = BOWL.r + r; if d<min push out
+// wheel box
+if not (h.state related to wheel): box wx±(R+0.08), wz±(width/2+0.1): if inside, push out min axis
+// pipe box
+if not pipe states: box px±(len/2+0.15), pz±(r+0.12): push out min axis
+```
+
+Wheel box x half = R + 0.06; z half = width/2 + 0.08.
+
+Pair separation:
+```js
+for i<j: skip if either in wheel/pipe (states in_wheel/in_pipe); dx,dz; min=0.55; if d<min push each by (min-d)/2 along normal (respecting walls roughly).
+```
+
+State machine transitions:
+
+```js
+function pickActivity(h){
+  const r=Math.random();
+  if(r<0.30 && !WHEEL.occupant){ h.state='to_wheel'; setTarget(mouth); }
+  else if(r<0.55 && !PIPE.occupant){ pipeDir = random ±1; target entry; state 'to_pipe'; }
+  else if(r<0.80){ bowl approach point; state 'to_bowl'; }
+  else { random point; state 'walking'; next='idle'; }
+}
+```
+
+Use 'walking' with h.next callback for all "to_" movement, and check arrival in onArrive. Simpler: keep separate states but reuse walk movement code:
+
+```js
+if(['walking','to_wheel','to_pipe','to_bowl'].includes(h.state)){ moveToward; if arrived: arriveHandler(h); }
+```
+arriveHandler:
+```js
+switch(h.arrive){
+ case 'wheel': WHEEL.occupant=h; h.state='wheel_enter'; h.enterT=0; break;
+ case 'pipe': PIPE.occupant=h; h.state='pipe_move'; h.pipeS = -h.pipeDir*(PIPE.len/2 + 0.75); h.speed=1.0; break;
+ case 'bowl': h.state='eating'; h.timer=3+Math.random()*4; h.speed=0; break;
+ default: h.state='idle'; h.timer=1+Math.random()*2.5;
+}
+```
+
+wheel_enter:
+```js
+h.enterT += dt/1.1; t=easeInOut(min(1,enterT));
+feetY_wheel = WHEEL.axleY - WHEEL.R + 0.05;
+h.pos.x = lerp(mouthX, WHEEL.x, t); h.pos.z = WHEEL.z;
+h.yOff = lerp(0, feetY_wheel - 0.02, t);
+h.targetHeading = π (facing -X);
+h.speed = 0.6; h.phase += 0.6*dt/STEP*2π (walking steps during enter)
+if enterT>=1 → state 'running_wheel', timer=4+rand*5, runSpeed=0
+```
+Wait, mouth point: mouthX = WHEEL.x + WHEEL.R + 0.45. But hamster center inside wheel at WHEEL.x — passes through rim? Rim is a circle in XY plane; hamster moving in -X at bottom passes through rim's bottom point... that's the point — at bottom, hamster goes under the rim's bottom arc? Wheel bottom is at axleY - R = 0.12 above floor. Hamster enters from +X side: path at floor level passes through the wheel's bottom region where rim is at y=0.12 — hamster height 0.55 would intersect rim! Real wheels: hamster steps over the bottom edge? No — real hamster wheels have open bottom? No, rim is a full circle. Hamster enters by going under the wheel? Wheel bottom clearance 0.12 < hamster. Hmm. Real wheels: hamster climbs in — wheel bottom is close to ground, hamster squeezes under? Actually yes, hamsters duck under the rim to enter. For cartoon: raise wheel bottom clearance to ~0.25 and hamster crouches during enter (scale y 0.7, head tuck). Simpler: axleY = R + 0.35; during enter, hamster crouches: bodyGroup scale.y 0.6 → height ~0.35 < 0.35 clearance... tight. Let me set clearance 0.3, crouch to 0.55 scale → height 0.3. OK, acceptable. Or just accept slight visual clip. Let me implement crouch: h.crouch lerps 0..1 during enter/exit; bodyGroup.scale.y = 1-0.45*crouch.
+
+Actually simpler: during enter, hamster passes under rim: rim bottom at y=0.3; crouched hamster top at ~0.32. Close enough visually.
+
+running_wheel:
+```js
+h.timer -= dt;
+target = h.timer<0.7 ? 0 : RUN_SPEED(=2.2);
+h.runSpeed = approach(h.runSpeed, target, 4*dt);
+h.wheelDist += h.runSpeed*dt; h.phase += h.runSpeed*dt/STEP*2π;
+h.pos.set(WHEEL.x, feetY, WHEEL.z); heading π;
+if(h.timer<=0){ h.state='wheel_exit'; h.enterT=0; }
+```
+feetY stored as h.wheelFeetY = WHEEL.axleY - WHEEL.R + 0.05.
+
+wheel_exit: reverse lerp to mouth; at 1: WHEEL.occupant=null; state 'walking' target random, arrive 'idle'.
+
+pipe_move:
+```js
+h.pipeS += h.pipeDir * 0.9 * dt;
+h.pos.x = PIPE.x + h.pipeS; h.pos.z = PIPE.z; h.yOff = 0.06-0.02=0.04?
+```
+Base y: h.pos.y = 0.02 + h.yOff + jumpY. Let me keep h.pos.y as feet y directly. Ground y = 0.02. In pipe feet y = 0.06.
+
+phase advances with speed. heading = pipeDir>0 ? 0 : π.
+When |pipeS| > PIPE.len/2 + 0.75 → exit: PIPE.occupant=null; state 'walking' target further outside; arrive 'idle'.
+
+eating: chewT += dt; head bob; timer-=dt → idle.
+
+Jump physics:
+```js
+if(h.jumping){ h.vy -= 9.8*dt; h.pos.y += h.vy*dt; const gy = h.groundY(); if(h.pos.y<=gy){h.pos.y=gy; h.jumping=false;} }
+else h.pos.y = approach to groundY (for wheel y handled kinematically anyway)
+```
+groundY: 0.02 normally; in wheel states: wheelFeetY; in pipe: 0.06.
+
+Apply jump only in states idle/walking/to_*.
+
+Visual update per frame:
+```js
+h.group.position.copy(h.pos);
+h.group.rotation.y = angleLerp(h.group.rotation.y, h.heading, 8*dt);
+legs: amp = h.moveAmp (approach to (speed>0.05||running)?1:0)
+ rot = Math.sin(h.phase + off)*0.7*amp; if jumping rot = tuck pose.
+breathing: bodyMesh.scale base * (1+0.025*sin(t*2.2+bp)) when idle-ish.
+ears twitch.
+chewing head.
+```
+
+moveAmp: h.speed>0.05 or running_wheel → 1.
+
+Note: in running_wheel, h.speed for panel = runSpeed. Set h.speed = runSpeed in that state for amp.
+
+UI: build divs per hamster with color dot; update text.
+
+Physics panel:
+```
+хомяк в колесе: name / —
+скорость лап v: x.xx м/с
+ω: x.xx рад/с
+|ω|·R: x.xx м/с
+расхождение: x.x %
+```
+Mismatch when v<0.1: show '—'.
+
+Expose:
+```js
+window.HAMSTERS = HAMSTERS;
+window.WHEEL = WHEEL; window.PIPE=PIPE; window.BOWL=BOWL;
+```
+
+Resize handler.
+
+Raycast click:
+```js
+renderer.domElement.addEventListener('pointerdown', e=>{...});
+```
+Distinguish click vs drag: record down position, on pointerup if moved <5px → click.
+
+Raycast against array of hamster groups (recursive true). Find root: traverse up until userData.h.
+
+Also water bottle: cylinder on inside of right wall, tube going down.
+
+Seeds in bowl: InstancedMesh of 40 small spheres.
+
+Bedding: InstancedMesh 600 boxes; random pos x∈[-3,3], z∈[-2,2], y=0.01, random rotation.y, slight tilt. castShadow false, receiveShadow true.
+
+Bars: build with loop; each cylinder castShadow. ~ (2*6.6/0.28 + 2*4.6/0.28) ≈ 80 bars. Fine.
+
+Also top frame: 4 boxes.
+
+Let me write the final code. Careful with r128 API: TorusGeometry, CylinderGeometry fine. MeshStandardMaterial. HemisphereLight(sky, ground, intensity).
+
+One more: "Обод под лапами уходит НАЗАД относительно направления, куда смотрит зверь." Hamster faces -X, rim bottom velocity +X ✓ (ω=+v/R gives bottom velocity +X as computed).
+
+Verify: velocity at point p on rotating body = ω ẑ × p. p = (0,-R,0). ẑ×(0,-R,0) = (ẑ×ŷ)(-R) = (-x̂)(-R) = R x̂. So ω>0 → +X ✓.
+
+Rotor rotation.z = angle, dangle = ω dt ✓.
+
+Panel mismatch: pawSpeed = occupant.runSpeed; rim = |ω|*R; since ω=runSpeed/R exactly → 0%.
+
+Also empty wheel decay: friction 1.5 rad/s².
+
+STEP_LEN = 0.22.
+
+Legs diagonal: FL (x+0.2,z+0.16) off 0; BR (x-0.2,z-0.16) off 0; FR (x+0.2,z-0.16) off π; BL off π.
+
+Body length: body sphere r 0.27 scale x1.6 → half 0.432; head adds. Total ~0.95 ≈ ДЛИНА 0.9 OK.
+
+Hamster scale: keep as is; "хорошо различимы" — 0.9 length in 6-wide cage is fine.
+
+Names/colors:
+- Рыжик 0xd98e3d
+- Топтя 0xb07a4a
+- Нуба 0xe8d9b0
+- Пепел 0x9aa0a8
+- Снежана 0xf2ede4
+
+Now let me write it all. Also add a small "проверка" note.
+
+UI panel: fixed left, dark translucent.
+
+Let me write the code fully.
+
+```js
+// helpers
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const approach=(v,t,d)=>{ if(v<t) return Math.min(t,v+d); return Math.max(t,v-d); };
+function angleLerp(a,b,t){ let d=b-a; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return a+d*Math.min(1,t); }
+```
+
+Hamster creation and scene. Let me write it.
+
+For collide, wheel box: skip when h.state in wheelStates = ['wheel_enter','running_wheel','wheel_exit']. Pipe box skip when 'pipe_move'. to_wheel approach target mouthX = WHEEL.x + WHEEL.R + 0.5; box x max = WHEEL.x + WHEEL.R + 0.06 → mouth is 0.44 outside ✓.
+
+to_pipe target: entryX = PIPE.x + dir*(PIPE.len/2 + PIPE.r + 0.4); box x half = PIPE.len/2 + 0.2 → entry is r+0.2 outside ✓.
+
+Bowl approach: point at BOWL center + dir*(BOWL.r+0.5), dir from hamster to bowl at pick time, normalized (xz).
+
+Random walk target: random within bounds, avoid wheel/pipe boxes? Collisions handle pushout; fine.
+
+UI update every frame is fine (5 rows).
+
+Also handle "пока в колесе кто-то бежит, второй туда не лезет" — occupant set on enter ✓.
+
+Click jump: h.state must be idle/walking/to_*; h.jumping=true; h.vy=2.6.
+
+Jump in walking state continues walking — fine.
+
+Ear twitch: h.twitchT -= dt; if <=0 { h.twitchT = 2+rand*4; h.twitchActive=0.35; h.twitchEar = rand<.5?0:1 } if twitchActive>0: ear.rotation.x = sin(t*30)*0.4*...; ear.rotation.z?
+
+Chewing: when eating: headG.rotation.x = 0.12 + 0.1*Math.sin(t*12); else headG.rotation.x = 0.05*sin(t*1.5) idle bob.
+
+Head nod while walking: slight.
+
+OK, let me write the final answer. Include a small "check" overlay too. Code will be long but fine.
+
+One more detail: bedding InstancedMesh with setColorAt needs material with vertexColors? In r128, setColorAt creates instanceColor attribute and shader uses it automatically if material has color — works without vertexColors flag (USE_INSTANCING_COLOR). Yes, works.
+
+Shadow: directional shadow camera: left -6 right 6 top 6 bottom -6, near 1 far 25.
+
+Table: top box(7.4, 0.18, 5.4) at y=-0.35; tray sits at y -0.55..0.05? Tray: box(6.8,0.5,4.8) center y=-0.2 → top at 0.05, bottom -0.45 above table top -0.26. Table top surface at -0.26. OK, table top center y=-0.35, half 0.09 → surface -0.26 ✓. Legs from -0.26 to -2.0: length 1.74, center -1.13.
+
+Room floor y=-2.0.
+
+Cage inner floor: plane 6.4x4.4 at y=0.005, wood color, receiveShadow.
+
+Bars y from 0 to 2.2; frame at 2.25.
+
+Camera initial (6.5, 4.2, 7), target (0, 0.9, 0).
+
+Fog? Optional.
+
+Let me write it.
+
+For pipe build: open cylinder: CylinderGeometry(r, r, len, 24, 1, true) rotated z 90° to lie along X; material DoubleSide. Plus tube thickness: outer cylinder r+0.05 open too, or just torus rims at ends. Add torus rims at ends. Inner bottom: hamster stands at y=0.06 — inner surface curve; visually fine.
+
+Bowl: CylinderGeometry(0.3,0.22,0.16) + inner darker cylinder; seeds instanced spheres r 0.02 at top.
+
+Water bottle: group at wall x=2.95: cylinder r0.12 h0.5 horizontal? Vertical hanging: cylinder axis Y at (2.95, 1.2, -0.6), metal cap below, small tube going down to y 0.3.
+
+Wheel stand: 2 boxes at z=±(width/2+0.06) from floor to axle, plus axle cylinder along Z.
+
+Rotor: torus(R, 0.05, 12, 48) in XY plane (default torus is in XY ✓). Side disks: CylinderGeometry(R-0.02, R-0.02, 0.03, 40) rotation.x = π/2, at z=±width/2. Crossbars: cylinders along Z length width, r 0.02, at angle k: (cos*(R-0.04), sin*(R-0.04)), rotation.x=π/2. 12 bars.
+
+All rotor children in a `rotor` group added to wheelGroup.
+
+Hamster in wheel between disks (width 0.9 vs hamster width 0.52 ✓).
+
+OK, writing final HTML now. Also add a small "проверка" note. Code will be long but fine.
+
+Also make sure no console errors: OrbitControls script path correct.
+
+UI update: build rows once, store references.
+
+Let me write updateHamster fully:
+
+```js
+const WHEEL_STATES=['to_wheel','wheel_enter','running_wheel','wheel_exit'];
+function groundY(h){
+  if(h.state==='wheel_enter'||h.state==='running_wheel'||h.state==='wheel_exit') return WHEEL.axleY-WHEEL.R+0.05;
+  if(h.state==='pipe_move') return 0.06;
+  return 0.02;
+}
+```
+
+During wheel_enter, pos is set by lerp including y; then jumping off.
+
+Movement code:
+
+```js
+function updateHamster(h,dt,t){
+ switch(h.state){
+  case 'idle':
+    h.speed=0; h.timer-=dt; if(h.timer<=0) pickActivity(h);
+    break;
+  case 'walking': case 'to_wheel': case 'to_pipe': case 'to_bowl': {
+    const dx=h.target.x-h.pos.x, dz=h.target.z-h.pos.z, d=Math.hypot(dx,dz);
+    const want = d>0.04 ? 1.1 : 0;
+    h.speed = approach(h.speed, want, 4*dt);
+    if(d>1e-4 && h.speed>0.001){
+      const step=h.speed*dt;
+      h.pos.x+=dx/d*step; h.pos.z+=dz/d*step;
+      h.phase += step/STEP_LEN*TAU;
+      h.targetHeading=Math.atan2(-dz,dx);
+    }
+    if(d<0.07) onArrive(h);
+    break;
+  }
+  case 'wheel_enter': {
+    h.enterT+=dt/1.2; const e=easeInOut(clamp(h.enterT,0,1));
+    h.pos.x=lerp(h.mouthX,WHEEL.x,e); h.pos.z=WHEEL.z;
+    h.pos.y=lerp(0.02, WHEEL.axleY-WHEEL.R+0.05, e);
+    h.crouch=Math.sin(e*Math.PI); // crouch mid-way
+    h.speed=0.7; h.phase+=0.7*dt/STEP_LEN*TAU;
+    h.targetHeading=Math.PI;
+    if(h.enterT>=1){h.state='running_wheel'; h.timer=4+Math.random()*5; h.crouch=0;}
+    break;
+  }
+  case 'running_wheel': {
+    h.timer-=dt;
+    const tgt = h.timer<0.8?0:2.3;
+    h.runSpeed=approach(h.runSpeed,tgt,5*dt);
+    h.speed=h.runSpeed;
+    h.phase += h.runSpeed*dt/STEP_LEN*TAU;
+    h.pos.set(WHEEL.x, WHEEL.axleY-WHEEL.R+0.05, WHEEL.z);
+    h.targetHeading=Math.PI;
+    if(h.timer<=0 && h.runSpeed<0.05){ h.state='wheel_exit'; h.enterT=0; }
+    break;
+  }
+  case 'wheel_exit': {
+    h.enterT+=dt/1.2; const e=easeInOut(clamp(h.enterT,0,1));
+    h.pos.x=lerp(WHEEL.x,h.mouthX,e); h.pos.z=WHEEL.z;
+    h.pos.y=lerp(WHEEL.axleY-WHEEL.R+0.05,0.02,e);
+    h.crouch=Math.sin(e*Math.PI);
+    h.speed=0.7; h.phase+=0.7*dt/STEP_LEN*TAU;
+    h.targetHeading=Math.PI;
+    if(h.enterT>=1){ WHEEL.occupant=null; h.crouch=0; h.runSpeed=0; startWalk(h, randPoint()); }
+    break;
+  }
+  case 'pipe_move': {
+    const sp=0.9; h.speed=sp;
+    h.pipeS += h.pipeDir*sp*dt;
+    h.pos.x=PIPE.x+h.pipeS; h.pos.z=PIPE.z; h.pos.y=0.06;
+    h.phase += sp*dt/STEP_LEN*TAU;
+    h.targetHeading = h.pipeDir>0?0:Math.PI;
+    if(Math.abs(h.pipeS)>PIPE.len/2+0.8){ PIPE.occupant=null; startWalk(h, randPoint()); }
+    break;
+  }
+  case 'eating':
+    h.speed=0; h.timer-=dt; if(h.timer<=0) startWalk(h, randPoint());
+    break;
+ }
+ // jump
+ if(h.jumping){ h.vy-=12*dt; h.pos.y+=h.vy*dt; const gy=groundY(h); if(h.pos.y<=gy){h.pos.y=gy;h.jumping=false;h.vy=0;} }
+ else if(!['wheel_enter','running_wheel','wheel_exit','pipe_move'].includes(h.state)) h.pos.y=groundY(h);
+ // collisions for free states
+ if(['idle','walking','to_wheel','to_pipe','to_bowl'].includes(h.state)) collideWorld(h);
+ // heading smoothing
+ h.group.rotation.y = angleLerp(h.group.rotation.y, h.targetHeading, 10*dt);
+ h.group.position.copy(h.pos);
+ animateBody(h,dt,t);
+}
+```
+
+Wait: pipe entry — when arriving at entry point, pipeS starts at ±(len/2+0.8)? Entry point x = PIPE.x + dir*(len/2 + r + 0.4) = dir*(0.9+0.4)=dir*1.3; len/2+0.8 = 1.7. Mismatch: pipe_move starts at s=dir*1.3 but my exit threshold is 1.7 on same side? Set start: h.pipeS = h.pipeDir * (PIPE.len/2 + PIPE.r + 0.4) * -1? Let me define: pipeDir = direction of travel (+1 means travel in +X). Entry is on -X side: entry x = PIPE.x - (len/2 + r + 0.4). So when picking pipe with dir=+1, target = PIPE.x - 1.7. On arrival, pipeS = -1.7 (matches arrival x ✓ continuous). Travel until pipeS > +1.7. For dir=-1: target = PIPE.x + 1.7, pipeS starts +1.7, travel until < -1.7. So start h.pipeS = -h.pipeDir*1.7, exit when h.pipeDir*h.pipeS > 1.7. ✓ continuous, no teleport.
+
+mouthX = WHEEL.x + WHEEL.R + 0.5. On wheel_enter start, pos is at mouthX (arrived) ✓ continuous.
+
+pickActivity:
+
+```js
+function pickActivity(h){
+  const r=Math.random();
+  if(r<0.32 && !WHEEL.occupant){ h.state='to_wheel'; h.target.set(WHEEL.x+WHEEL.R+0.5,0,WHEEL.z); }
+  else if(r<0.60 && !PIPE.occupant){ h.pipeDir=Math.random()<0.5?1:-1; h.state='to_pipe'; h.target.set(PIPE.x - h.pipeDir*(PIPE.len/2+PIPE.r+0.4),0,PIPE.z); }
+  else if(r<0.85){ const dx=h.pos.x-BOWL.x, dz=h.pos.z-BOWL.z, d=Math.hypot(dx,dz)||1; h.state='to_bowl'; h.target.set(BOWL.x+dx/d*(BOWL.r+0.5),0,BOWL.z+dz/d*(BOWL.r+0.5)); }
+  else startWalk(h, randPoint());
+}
+function startWalk(h,p){ h.state='walking'; h.target.copy(p); h.arriveIdle=true; }
+function onArrive(h){
+  if(h.state==='to_wheel'){ WHEEL.occupant=h; h.mouthX=h.target.x; h.state='wheel_enter'; h.enterT=0; }
+  else if(h.state==='to_pipe'){ PIPE.occupant=h; h.state='pipe_move'; h.pipeS=-h.pipeDir*(PIPE.len/2+PIPE.r+0.4); }
+  else if(h.state==='to_bowl'){ h.state='eating'; h.timer=3+Math.random()*4; }
+  else { h.state='idle'; h.timer=1+Math.random()*2.5; }
+}
+```
+
+randPoint: random within x∈[-2.6,2.6], z∈[-1.7,1.7].
+
+collideWorld(h):
+```js
+const r=0.3;
+h.pos.x=clamp(h.pos.x,-3+r,3-r); h.pos.z=clamp(h.pos.z,-2+r,2-r);
+// bowl
+{const dx=h.pos.x-BOWL.x,dz=h.pos.z-BOWL.z,d=Math.hypot(dx,dz),m=BOWL.r+r;
+ if(d<m&&d>1e-6){const p=(m-d); h.pos.x+=dx/d*p; h.pos.z+=dz/d*p;}}
+// wheel box
+{const hx=WHEEL.R+0.06,hz=WHEEL.width/2+0.1;
+ const dx=h.pos.x-WHEEL.x,dz=h.pos.z-WHEEL.z;
+ if(Math.abs(dx)<hx+r&&Math.abs(dz)<hz+r){
+   const pxs=hx+r-Math.abs(dx), pzs=hz+r-Math.abs(dz);
+   if(pxs<pzs) h.pos.x=WHEEL.x+Math.sign(dx||1)*hx... 
+```
+Wait, pushout: set to face: h.pos.x = WHEEL.x + Math.sign(dx)*(hx+r). Yes, push to boundary.
+
+Pipe box similar with hx=PIPE.len/2+0.12, hz=PIPE.r+0.1.
+
+Hmm, but to_wheel approach: target mouthX = WHEEL.x + R + 0.5; box boundary at WHEEL.x + R + 0.06 + r(0.3) = +0.36 → mouth target at +0.5 is outside ✓.
+
+to_pipe: boundary at PIPE.x ± (len/2+0.12+0.3)=±1.32; target at ±(0.9+0.42+0.4)=±1.72 ✓.
+
+Pair separation:
+```js
+for(let i=0;i<5;i++)for(let j=i+1;j<5;j++){
+ const a=HAMSTERS[i],b=HAMSTERS[j];
+ if(FIXED(a)||FIXED(b))continue; // in wheel/pipe
+ let dx=b.pos.x-a.pos.x,dz=b.pos.z-a.pos.z,d=Math.hypot(dx,dz),m=0.55;
+ if(d<m&&d>1e-6){const p=(m-d)/2; dx/=d;dz/=d; a.pos.x-=dx*p;a.pos.z-=dz*p;b.pos.x+=dx*p;b.pos.z+=dz*p;}
+}
+```
+FIXED = state in ['wheel_enter','running_wheel','wheel_exit','pipe_move'].
+
+animateBody:
+```js
+const moving = h.speed>0.06;
+h.moveAmp = approach(h.moveAmp, moving?1:0, 5*dt);
+for(const L of h.legs){
+  if(h.jumping){ L.pivot.rotation.z = -0.6; }
+  else L.pivot.rotation.z = Math.sin(h.phase+L.off)*0.65*h.moveAmp;
+}
+// breathing
+const br = 1 + 0.03*Math.sin(t*2.4+h.breathPhase)*(h.state==='idle'?1:0.4);
+h.bodyMesh.scale.set(h.bScale.x*br, h.bScale.y*(2-br)*0.5+h.bScale.y*0.5, h.bScale.z*br);
+```
+Simplify: scale.x = bx*(1+a), scale.z = bz*(1+a), scale.y = by*(1-a*0.5).
+
+Crouch: h.group.scale.y = 1 - 0.4*h.crouch.
+
+Chewing:
+```js
+if(h.state==='eating'){ h.headG.rotation.x=0.15+0.12*Math.sin(t*14); }
+else h.headG.rotation.x=0.06*Math.sin(t*1.6+h.breathPhase);
+```
+Ears:
+```js
+h.twitchT-=dt; if(h.twitchT<=0){h.twitchT=2+Math.random()*4; h.twitchActive=0.4;}
+if(h.twitchActive>0){h.twitchActive-=dt; h.ears[0].rotation.z=Math.sin(t*25)*0.5;} else h.ears[0].rotation.z=0;
+```
+
+Tail sway: rotation.y = sin(t*3)*0.2.
+
+UI: status text map; physics panel:
+
+```js
+const o=WHEEL.occupant;
+const paw = o&&o.state==='running_wheel'? o.runSpeed : (o? o.speed:0);
+```
+Show runner name; rim=Math.abs(WHEEL.omega)*WHEEL.R; mismatch = paw>0.15? |rim-paw|/paw*100 : null.
+
+Expose window.__CHECK = {HAMSTERS, WHEEL, PIPE, BOWL, dims:{ДЛИНА...}}.
+
+Also expose functions? Fine.
+
+Click handler:
+```js
+let downX,downY;
+dom.addEventListener('pointerdown',e=>{downX=e.clientX;downY=e.clientY;});
+dom.addEventListener('pointerup',e=>{
+ if(Math.hypot(e.clientX-downX,e.clientY-downY)>6)return;
+ mouse NDC; raycaster.setFromCamera; const hits=raycaster.intersectObjects(hamsterGroups,true);
+ if(hits.length){ let o=hits[0].object; while(o&&!o.userData.hamsterRef)o=o.parent; if(o&&canJump) jump }
+});
+```
+userData.hamsterRef set on root group; traverse up.
+
+canJump: state in ['idle','walking','to_wheel','to_pipe','to_bowl'] && !jumping.
+
+OK. Also add a slight bob for hamsters in wheel? Running gait: y bounce = |sin(phase)|*0.02. Add to pos.y in running state.
+
+Now let me write the final file. Also add a small "проверка" note. Code will be long but fine.
+
+One more detail: bedding InstancedMesh with setColorAt needs material with vertexColors? In r128, setColorAt creates instanceColor attribute and shader uses it automatically if material has color — works without vertexColors flag (USE_INSTANCING_COLOR). Yes, works.
+
+Shadow: directional shadow camera: left -6 right 6 top 6 bottom -6, near 1 far 25.
+
+Table: top box(7.4, 0.18, 5.4) at y=-0.35; tray sits at y -0.55..0.05? Tray: box(6.8,0.5,4.8) center y=-0.2 → top at 0.05, bottom -0.45 above table top -0.26. Table top surface at -0.26. OK, table top center y=-0.35, half 0.09 → surface -0.26 ✓. Legs from -0.26 to -2.0: length 1.74, center -1.13.
+
+Room floor y=-2.0.
+
+Cage inner floor: plane 6.4x4.4 at y=0.005, wood color, receiveShadow.
+
+Bars y from 0 to 2.2; frame at 2.25.
+
+Camera initial (6.5, 4.2, 7), target (0, 0.9, 0).
+
+Fog? Optional.
+
+Let me write it.
+
+For pipe build: open cylinder: CylinderGeometry(r, r, len, 24, 1, true) rotated z 90° to lie along X; material DoubleSide. Plus tube thickness: outer cylinder r+0.05 open too, or just torus rims at ends. Add torus rims at ends. Inner bottom: hamster stands at y=0.06 — inner surface curve; visually fine.
+
+Bowl: CylinderGeometry(0.3,0.22,0.16) + inner darker cylinder; seeds instanced spheres r 0.02 at top.
+
+Water bottle: group at wall x=2.95: cylinder r0.12 h0.5 horizontal? Vertical hanging: cylinder axis Y at (2.95, 1.2, -0.6), metal cap below, small tube going down to y 0.3.
+
+Wheel stand: 2 boxes at z=±(width/2+0.06) from floor to axle, plus axle cylinder along Z.
+
+Rotor: torus(R, 0.05, 12, 48) in XY plane (default torus is in XY ✓). Side disks: CylinderGeometry(R-0.02, R-0.02, 0.03, 40) rotation.x = π/2, at z=±width/2. Crossbars: cylinders along Z length width, r 0.02, at angle k: (cos*(R-0.04), sin*(R-0.04)), rotation.x=π/2. 12 bars.
+
+All rotor children in a `rotor` group added to wheelGroup.
+
+Hamster in wheel between disks (width 0.9 vs hamster width 0.52 ✓).
+
+OK, writing final HTML now. Also add a small "проверка" note. Code will be long but fine.
+
+Also make sure no console errors: OrbitControls script path correct.
+
+UI update: build rows once, store references.
+
+Also add a small "check" overlay. Code will be long but fine.
+
+Also add: pipe occupant visual — hamster inside pipe visible through open cylinder? Open cylinder with DoubleSide shows inside; hamster inside visible from open ends and through side (single-sided DoubleSide surface is not solid). Add transparent plastic: outer cylinder MeshStandardMaterial transparent opacity 0.25 so we can see inside. Nice: acrylic tube. Outer solid transparent cylinder r+0.05 opacity 0.3, inner surface opaque-ish? Keep: inner cylinder (r, DoubleSide, tan, opaque) + outer transparent. Hamster inside visible from open ends and through transparent outer. But inner opaque cylinder blocks view from outside through side — that's fine, visible from ends.
+
+Actually for visibility, make inner also lighter color DoubleSide. OK.
+
+Let me write it.
