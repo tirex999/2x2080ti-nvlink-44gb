@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 0b17460..b6ff80d 100644
+index 0b17460..e4b00b7 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -49,7 +49,9 @@ if(STRATA_ENABLE_CUDA)
@@ -127,7 +127,7 @@ index 384ccc0..dad339c 100644
      bool capture_commit(std::string& err);
      bool record_window(int T, cudaStream_t cs, std::string& err);
 diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
-index 020d78d..c390e54 100644
+index 020d78d..4252ca6 100644
 --- a/include/strata/kernels/iq_kernels.hpp
 +++ b/include/strata/kernels/iq_kernels.hpp
 @@ -54,4 +54,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
@@ -143,7 +143,7 @@ index 020d78d..c390e54 100644
 +
  }  // namespace strata::kernels
 diff --git a/setup.py b/setup.py
-index a17eb68..2290b92 100644
+index a17eb68..14affab 100644
 --- a/setup.py
 +++ b/setup.py
 @@ -645,8 +645,8 @@ def main() -> int:
@@ -365,7 +365,7 @@ index 0ab1ce1..555c6f8 100644
      pt("ran");
      auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
 diff --git a/src/core/pinned.cu b/src/core/pinned.cu
-index 56573ce..2a2ce2d 100644
+index 56573ce..02225e1 100644
 --- a/src/core/pinned.cu
 +++ b/src/core/pinned.cu
 @@ -60,7 +60,21 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
@@ -562,7 +562,7 @@ index 35a73a2..8ebd423 100644
      if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
      cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
 diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
-index 2b963ad..05b08c3 100644
+index 2b963ad..0de3488 100644
 --- a/src/kernels/cpu/pool.cpp
 +++ b/src/kernels/cpu/pool.cpp
 @@ -54,6 +54,29 @@ std::vector<int> physical_cores(bool skip_first) {
@@ -843,10 +843,106 @@ index c439ee4..8788ac7 100644
      if (e != cudaSuccess) {
          std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
 diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
-index 3525b91..2a76d82 100644
+index 3525b91..9d7c601 100644
 --- a/src/kernels/cuda/iq_kernels.cu
 +++ b/src/kernels/cuda/iq_kernels.cu
-@@ -717,4 +717,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+@@ -268,6 +268,27 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
+     return d * sumi;
+ }
+ 
++// 27.09.2026: IQ4_XS (llama.cpp vecdotq.cuh, VDR 4): 32 values of sub-block iqs/4 per call - the four int32 words
++// of its nibbles against the matching q8_1 block, times the sub-block's 6-bit scale (scales_l / scales_h) - 32.
++__device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
++                                                     const int& kbx, const int& iqs) {
++    const block_iq4_xs* bq4 = (const block_iq4_xs*) vbq + kbx;
++    int sumi = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
++        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
++        const int u0 = get_int_b4(bq8_1[iqs / 4].qs, j + 0);
++        const int u1 = get_int_b4(bq8_1[iqs / 4].qs, j + 4);
++        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
++        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
++    }
++    const int ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
++    sumi *= ls - 32;
++    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs / 4].ds);
++    return d * sumi;
++}
++
+ // ---------------------------------------------------------------- the formats
+ // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
+ template<int TY> struct Fmt;
+@@ -279,6 +300,8 @@ template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
++template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
++    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_xs_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_s_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<22> { static constexpr int qk = 256, ipb = 8, step = 2;
+@@ -543,6 +566,17 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+         yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
+     }
+ }
++// Q8_0 (our IQ4X-Q8A file's token_embd): one "superblock" = 256 values = 8 blocks of 32; thread tid writes 8 values
++template<typename dst_t>
++__device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
++    const block_q8_0* x = (const block_q8_0*) vx + ibs * 8;
++    const int b = tid / 4, part = tid % 4;
++    const float d = (float) x[b].d;
++    for (int j = 0; j < 8; ++j) {
++        const int i = part * 8 + j;
++        yy[b * 32 + i] = cvt<dst_t>(d * (float) x[b].qs[i]);
++    }
++}
+ 
+ template<typename dst_t>
+ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
+@@ -557,6 +591,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
+         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+         case 11: dq_q3_k(vx, ibs, y, tid); break;
+         case 42: dq_q2_0(vx, ibs, y, tid); break;
++        case 8: dq_q8_0(vx, ibs, y, tid); break;
+         default: break;
+     }
+ }
+@@ -576,7 +611,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
+     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
+ }
+ 
+-bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
++bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 || t == 8; }
+ 
+ }  // namespace
+ 
+@@ -594,6 +629,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
+         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
++        case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+         default: return 0;
+     }
+ }
+@@ -619,6 +655,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
+         case 21: mmvq_kernel<21><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         case 22: mmvq_kernel<22><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         case 29: mmvq_kernel<29><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
++        case 23: mmvq_kernel<23><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         case 42: mmvq_kernel<42><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
+     }
+@@ -701,6 +738,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+         case 21: native_gu_kernel<21><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         case 22: native_gu_kernel<22><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
++        case 23: native_gu_kernel<23><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+     }
+@@ -717,4 +755,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
      check("native_expert_grouped/down");
  }
  
@@ -899,7 +995,7 @@ index a7801fa..84005ad 100644
          const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
          native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out);
 diff --git a/src/kernels/cuda/native_qsa_score.cu b/src/kernels/cuda/native_qsa_score.cu
-index 9ae4d11..d98aa9d 100644
+index 9ae4d11..689cffb 100644
 --- a/src/kernels/cuda/native_qsa_score.cu
 +++ b/src/kernels/cuda/native_qsa_score.cu
 @@ -32,6 +32,7 @@ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
@@ -966,6 +1062,19 @@ index 9ae4d11..d98aa9d 100644
      // In the reference: +0 then warp0 partial then warp1 partial, followed
      // by materialized ReLU, CONT(head0), ADD(head1), ADD(head2), ADD(head3).
      if(warp==0){
+diff --git a/src/kernels/iq_parity.cpp b/src/kernels/iq_parity.cpp
+index f9ffb8d..8bfae53 100644
+--- a/src/kernels/iq_parity.cpp
++++ b/src/kernels/iq_parity.cpp
+@@ -17,7 +17,7 @@
+ 
+ int main(int argc, char** argv) {
+     const std::string dir = argc > 1 ? argv[1] : "logs/iq_fixture";
+-    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K"};
++    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K", "Q8_0"};
+     int failures = 0;
+     cudaStream_t s;
+     cudaStreamCreate(&s);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
 index e82d7dd..d768cf1 100644
 --- a/src/program/generate.cpp

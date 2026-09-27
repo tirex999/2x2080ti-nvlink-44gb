@@ -5,8 +5,9 @@ Qwen3.8-Flash-Next. Из коробки Strata собирается только
 переносит её на 2080Ti (sm_75) и добавляет вторую карту как хранилище экспертов.
 
 На нашем стенде (2×2080Ti 22 ГБ, 2×Xeon Ice Lake, квант ISTA GSQ-RCO IQ3_XXS) это **50–68 т/с** на задачах
-«хомяки» и «аквариум». Strata без доработок на одной карте даёт 25–39 т/с. Таблицы, оценка сцен и сравнение с
-llama.cpp — на странице [Flash-Next](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html).
+«хомяки» и «аквариум». Strata без доработок на одной карте даёт 25–39 т/с. С нашим 4-битным квантом (эксперты
+IQ4_XS/IQ4_NL, плотная часть Q8_0) — 56–66 т/с. Таблицы, оценка сцен и сравнение с llama.cpp — на странице
+[Flash-Next](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html).
 
 ## Что в патче
 
@@ -18,13 +19,14 @@ llama.cpp — на странице [Flash-Next](https://tirex999.github.io/2x20
 | Таблица маршрутизации — какие эксперты зовутся чаще, копится между прогонами — и профиль для главной карты из неё | `expert_source.cpp`, `generate.cpp`, `tools/mk_profile_from_usage.py` | `STRATA_USAGE_DUMP=файл` |
 | Ядра гипер-связей на всю карту (было 41 блок на 68 мультипроцессоров); совпадают со штатными до округления fp32 | `fused_gr.cu` | `STRATA_GR_V1=1` — штатные |
 | Путь промахов по PCIe выкидывается из графа, если его доля 0 | `verify.*` | `--pcie-frac 0` |
+| Эксперты IQ4_XS на карте (скалярное произведение по образцу llama.cpp) и таблица токенов в Q8_0 — для квантов с 4-битными экспертами и плотной частью Q8_0 | `iq_kernels.cu`, `iq_parity.cpp` | — |
 | Для замеров: огромные страницы арены, запуск графа отдельным потоком, раскладка плотных проекций, поправка деления общих экспертов | `pinned.cu`, `verify.*`, `native_mmvq.cu`, `expert_source.cpp` | `STRATA_ARENA_THP=0`, `STRATA_ASYNC_LAUNCH=1`, `STRATA_MMVQ_UPSTREAM=1`, `STRATA_MMVQ_ROWS=4`, `STRATA_CARD2_BIAS` |
 
 ## Сборка
 
 ```bash
 git clone https://github.com/Niko1221/Strata && cd Strata && git checkout 6da1f66
-git apply --ignore-whitespace ../strata-2x2080ti.patch     # проверено: встаёт на чистую 0.1.2
+git apply ../strata-2x2080ti.patch     # проверено: встаёт на чистую 0.1.2
 # зависимости, пакет модели, MTP — по README Strata (setup.sh, tools/iq_pack.py, tools/mtp_fetch.py, tools/mtp_rt.py)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
       -DCMAKE_CUDA_ARCHITECTURES=75 -DSTRATA_GGML_DIR=/путь/к/llama.cpp
@@ -66,6 +68,9 @@ CUDA_VISIBLE_DEVICES=1,0 numactl --cpunodebind=1 --membind=1 ./build/strata \
 - **Перед замерами гасите простаивающие копии Strata.** Её рабочие ждут задачу в спин-цикле и занимают все ядра
   своего сокета; соседний процесс от этого замедлялся у нас в 3–4 раза.
 - `--pcie-frac`: с одной картой лучше 0.15 (заводское 0.55 рассчитано на PCIe 4.0), с двумя — 0.
+- Если голова модели (`output.weight`) в Q8_0, добавьте `--vram-reserve-mib 1024`. Запас по умолчанию, 700 МиБ,
+  рассчитан на голову Q5_K; без него движок пишет «mtp: the draft head does not fit». В `run-fast.sh` для этого
+  есть переменная `EXTRA`.
 - Не помогли: огромные страницы, окно черновика 6, запуск графа отдельным потоком, `--second-card-dup`
   (+2.5 % при росте промахов) — всё это оставлено выключенным.
 - Один запрос за раз; кэш между запросами не переиспользуется, каждый ход перечитывает весь контекст
