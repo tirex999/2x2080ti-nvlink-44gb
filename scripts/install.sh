@@ -108,7 +108,7 @@ if [ -n "$NVCC" ]; then
   ok "nvcc ${CV:-?}: $NVCC"
   [ "${CV%%.*}" = "13" ] || hm "nvcc ${CV:-?}, а torch собран под CUDA 13 — нужен тулкит 13.0"
 else
-  CUDA_HOME_FOUND=/usr/local/cuda-13.0
+  CUDA_HOME_FOUND=""   # не выдумывать каталог: FlashInfer берёт CUDA_HOME как есть и падает, если там нет bin/nvcc
   no "nvcc не найден — нет CUDA-тулкита 13.0"
   hm "Он нужен для ЗАПУСКА: FlashInfer компилирует ядра внимания и выбора токенов"
   hm "при первом старте. Без него сервер падает после прогрева с ошибкой"
@@ -245,6 +245,8 @@ if [ "$WITH_SERVICE" = "1" ] && [ "$(id -u)" = "0" ]; then
   echo "${B}Завожу службу${O}"
   MD=""
   [ -n "$MODEL" ] && MD="$DIR/models/${MODEL##*/}"
+  if [ -n "$CUDA_HOME_FOUND" ]; then CUDA_LINE="Environment=CUDA_HOME=$CUDA_HOME_FOUND"
+  else CUDA_LINE="# Environment=CUDA_HOME=<каталог CUDA-тулкита 13.0, в котором bin/nvcc>"; fi
   cat > /etc/systemd/system/vllm-2080ti.service <<UNIT
 [Unit]
 Description=vLLM 0.2.1-pre3 на 2x RTX 2080 Ti
@@ -255,7 +257,7 @@ StartLimitBurst=6
 [Service]
 Type=simple
 Environment=HOME=/root
-Environment=CUDA_HOME=$CUDA_HOME_FOUND
+$CUDA_LINE
 WorkingDirectory=$DIR
 ExecStart=$DIR/venv/bin/python -m vllm.entrypoints.openai.api_server \\
   --model ${MD:-ВПИШИТЕ_ПУТЬ_К_МОДЕЛИ} \\
@@ -278,13 +280,15 @@ UNIT
   systemctl daemon-reload
   ok "юнит: /etc/systemd/system/vllm-2080ti.service"
   [ -z "$MD" ] && hm "путь к модели не задан — впишите его в юнит перед запуском"
+  [ -z "$CUDA_HOME_FOUND" ] && hm "CUDA_HOME в юните закомментирован: поставьте тулкит 13.0 и впишите его каталог"
 fi
 
 echo
 echo "${B}Готово.${O} Запуск вручную:"
 echo
 echo "  source $DIR/venv/bin/activate"
-echo "  export CUDA_HOME=$CUDA_HOME_FOUND"
+if [ -n "$CUDA_HOME_FOUND" ]; then echo "  export CUDA_HOME=$CUDA_HOME_FOUND"
+else echo "  # сначала CUDA-тулкит 13.0 (см. выше), потом: export CUDA_HOME=<его каталог, в котором bin/nvcc>"; fi
 echo "  python -m vllm.entrypoints.openai.api_server --model <путь> \\"
 echo "      --tensor-parallel-size 2 --dtype half --gpu-memory-utilization 0.94 \\"
 echo "      --max-model-len 102400 --max-num-seqs 1 \\"

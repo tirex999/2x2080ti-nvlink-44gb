@@ -213,7 +213,7 @@ MTP. Но ей нужна ветка форка `weicj/vLLM-2080Ti-Definitive` *
 
 ```bash
 source ~/vllm-2080ti/venv/bin/activate
-export CUDA_HOME=/usr/local/cuda-13.0
+[ -x /usr/local/cuda-13.0/bin/nvcc ] && export CUDA_HOME=/usr/local/cuda-13.0
 
 python -m vllm.entrypoints.openai.api_server \
   --model ~/vllm-2080ti/models/Qwen3.8-27B-abliterated-AWQ-MTP \
@@ -243,9 +243,25 @@ python -m vllm.entrypoints.openai.api_server \
   подключать веб-интерфейс: он шлёт запросы с инструментами, и без этих
   ключей сервер отвечает ошибкой на второе же сообщение.
 - `--enable-force-include-usage` — чтобы интерфейс показывал счётчик токенов.
-- `export CUDA_HOME` — по этой переменной FlashInfer находит компилятор.
-  Без неё ищет `nvcc` в `PATH`, а у службы systemd `PATH` свой, короткий.
-  В юните то же самое пишется строкой `Environment=CUDA_HOME=/usr/local/cuda-13.0`.
+- `CUDA_HOME` — по этой переменной FlashInfer находит компилятор, и берёт её
+  **как есть, не проверяя**: укажет она на каталог без `bin/nvcc` — первый
+  старт упадёт. Поэтому строка выше ставит её, только если тулкит лежит в
+  `/usr/local/cuda-13.0`. Тулкит в другом месте (`which nvcc`,
+  `ls -d /usr/local/cuda*`) — впишите свой каталог, тот, в котором `bin/nvcc`,
+  или обойдитесь без переменной: тогда FlashInfer ищет `nvcc` в `PATH`, потом
+  в `/usr/local/cuda`. Так было у читателя: тулкит встал не в
+  `/usr/local/cuda-13.0`, строка `export` ломала запуск, без неё vLLM поднялся.
+  У службы systemd `PATH` свой, короткий, поэтому в юните каталог пишется явно:
+  `Environment=CUDA_HOME=<каталог тулкита>`.
+- `--safetensors-load-strategy=prefetch` — необязательный ключ, его можно
+  дописать в конец команды. С локального диска (ext4 и т. п.) vLLM веса заранее
+  не читает и пишет об этом в журнал: `Auto-prefetch is disabled because the
+  filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to
+  force prefetching, start vLLM with --safetensors-load-strategy=prefetch`. С
+  ключом файлы весов ещё до загрузки на карты читаются в кэш ОЗУ в несколько
+  потоков; на ответы это не влияет, только на загрузку. Если модель больше 90 %
+  свободной ОЗУ, vLLM предупредит, что памяти может не хватить, — тогда не
+  ставьте. Подсказал читатель; загрузку с ключом и без мы не сравнивали.
 - Самый первый старт долгий: у читателя прогрев шёл 8 минут, и всё это время
   в логе повторялось `No available shared memory broadcast block found in 60
   seconds`. Это не зависание — рабочие процессы заняты и не отвечают главному.
