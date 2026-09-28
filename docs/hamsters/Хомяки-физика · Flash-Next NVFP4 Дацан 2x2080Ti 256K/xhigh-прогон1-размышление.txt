@@ -1,0 +1,1334 @@
+The user wants a single-file Three.js r128 app with a hamster cage, 5 hamsters, honest physics. Let me build it carefully.
+
+Key requirements:
+1. Wheel rotation from running speed: ω = v/R, foot speed vs rim speed panel showing discrepancy %.
+2. Wheel radius derived from hamster dimensions.
+3. Hollow tube, entry only through ends, hamster stands on inner bottom.
+4. Collision bodies for wheel, bowl, tube; push-out along shortest normal; hamster-hamster soft separation.
+5. Foot phase from traveled distance; diagonal gait pairs; in wheel, step tied to rim speed.
+6. No teleports: smooth enter/exit transitions into wheel; one user per wheel.
+7. Behavior FSM: idle → walk to target → activity → idle. Activities: wheel, tube, bowl, wander.
+8. Side panel showing what each is doing.
+9. Click hamster → jump.
+10. Idle breathing, ear twitch.
+11. Bowl: head tilt and chew.
+12. Scene: cage on table, room environment, tray, bedding InstancedMesh chips, frequent bars, top frames, wheel, tube, bowl with seeds, water bottle.
+13. Hamster parts: body, belly, head group, eyes with pupils, cheeks, nose, ears with inner, 4 legs, tail.
+14. Technical: three r128 + OrbitControls from those CDNs, single file, PCFSoftShadowMap 2048, directional + ambient, rAF with clamped delta, resize handling.
+15. Expose arrays/objects with clear fields for external inspection.
+
+This deserves a properly crafted build — a 3D scene like this wants to feel alive and layered, not a flat grey box. For such an interactive toy I want a rich ambient background, lots of living elements, motion and micro-interactions (hover, transitions, reveals), and strong contrast in type sizes/weights rather than a flat static layout; a distinctive display face over a readable body. Fonts: the content is Russian, so Cyrillic support matters — Google Fonts with cyrillic subsets: 'Unbounded' (display, has cyrillic), 'Space Grotesk' (no cyrillic), 'Manrope' (cyrillic yes), 'Wix Madefor Display'... Let's pick display: 'Unbounded' (distinctive, geometric, cyrillic supported) and body: 'Manrope' (readable, cyrillic). Good pairing.
+
+Palette: for a cozy diorama I want something warm but grounded — a deep teal-slate UI with warm amber/ochre accents and a chalky off-white. Actually the UI is an overlay panel over a 3D scene; let's do a "lab notebook / telemetry" aesthetic: dark ink panel with amber-green data readouts, plus a chunky title. A single-accent near-black scheme would feel too clinical for a warm animal house; use several accents (amber, mint, coral). Fine.
+
+Layout: the 3D canvas is the main event (full viewport), with an overlay HUD: top-left title block ("HAMSTER DYNAMICS / Клетка с честной физикой"), left/right side panel with hamster roster (5 rows, live status), a physics verification panel with wheel telemetry (foot speed, rim speed, Δ%), plus toggles maybe. Bottom strip with legend/keyboard hints. Add micro-interactions: hover on roster row highlights the hamster in 3D (outline/scale ring) and camera can focus. Click roster row → focus camera on that hamster. Click hamster in scene → jump.
+
+Let me now design the actual simulation carefully. This is the hard part.
+
+### World scale
+Units: 1 unit = 1 meter? Hamster ~0.15 m long. Let's use decimeter-ish scale for convenience: hamster length ~1.6 units, height ~1.0 units. Cage interior ~ 24 x 16 units. Wheel radius derived.
+
+Let me define:
+- `ДЛИНА_ЗВЕРЯ = 1.7` (body length along +Z or whatever)
+- `ВЫСОТА_ЗВЕРЯ = 1.05`
+- Wheel rim inner radius R must satisfy: hamster fits inside with margin, and distance between rims wider than his sides (width). So:
+  - `R = (ВЫСОТА_ЗВЕРЯ + ЗАПАС)` ... Actually the hamster stands at the bottom inside point; his head top is at height ВЫСОТА above the bottom point. The center of the wheel is at R above his feet. He needs to fit: the vertical clearance from the bottom point upward through the running surface... For a running hamster, the space needed is a body envelope. Simplest honest rule: R ≥ (ВЫСОТА_ЗВЕРЯ + ЗАПАС_ВЕРТ) and half-width gap between rims = spacing/2 ≥ (ШИРИНА_ЗВЕРЯ/2 + ЗАПАС_БОК). Let's compute:
+
+```
+const ДЛИНА_ЗВЕРЯ = 1.7, ВЫСОТА_ЗВЕРЯ = 1.05, ШИРИНА_ЗВЕРЯ = 0.95;
+const ЗАПАС = 0.35;
+const R_ОБОДА = ВЫСОТА_ЗВЕРЯ + ДЛИНА_ЗВЕРЯ*0.35 + ЗАПАС; // ~1.72
+const ШИРИНА_ОБОДА = ШИРИНА_ЗВЕРЯ + 2*ЗАПАС; // 1.65
+```
+And assert in code: `console.assert(R_ОБОДА > ВЫСОТА_ЗВЕРЯ + ШИРИНА... )`. Also expose a check object.
+
+Actually the geometric condition for "hamster fits inside the wheel without the rim crossing his body": if he stands at the lowest point of the rim and is approximated by a box of length L and height H centered laterally, then the rim circle must be outside the box. The box corners: bottom points at (±L/2, 0) relative to contact; top corners at (±L/2, H). Distance from wheel center (0, R) to a top-front corner (L/2, H) must be ≤ R (inside). Condition: (L/2)² + (R-H)² ≤ R² → L²/4 + H² - 2RH ≤ 0 → R ≥ (L²/4 + H²)/(2H). Let's compute with L=1.7, H=1.05: L²/4=0.7225, H²=1.1025, sum=1.825, /(2*1.05)=0.869. So R ≥ 0.87. Our R of ~1.7 is way bigger — good margin. Let's actually define R from this formula plus a comfort factor:
+
+```
+const R_МИН = (ДЛИНА_ЗВЕРЯ**2/4 + ВЫСОТА_ЗВЕРЯ**2) / (2*ВЫСОТА_ЗВЕРЯ);
+const R_ОБОДА = R_МИН * 1.9;  // ≈1.65
+```
+That's a nice "computed from animal size" approach with an explicit formula. 
+
+Wheel: two rims (torus or cylinder rings) at x = ±ШИРИНА_ОБОДА/2, plus rungs/slats between them (the running surface). Wheel axis horizontal along X (world X), wheel plane is YZ. Hamster inside runs along Z direction on the inner bottom surface, facing +Z or -Z. The rim under his paws moves BACKWARD relative to the direction he faces: if hamster faces +Z and runs (i.e., pushes paws backward relative to his body → paws move -Z at contact... wait).
+
+Careful: A running wheel: hamster stands at the bottom, runs forward (say facing +Z). His paws at contact are stationary relative to the wheel surface (no slip). The wheel rotates such that the contact point moves backward relative to the hamster's facing direction? No — the hamster stays in place in world; his body doesn't move. His paws cycle: at stance phase, paw is on the running surface and moves backward (relative to the body) — i.e., the surface under him travels toward -Z (behind him, opposite to facing). Hmm, actually think of a real hamster in a wheel: he runs "forward" (say +Z direction relative to his body orientation), and the wheel surface under his feet moves in the -Z direction (backwards, i.e., toward his tail)? Let's think of ground running: to move forward (+Z), the foot pushes the ground backward (-Z); so the ground would move +Z relative to the animal if the animal is stationary... no. On solid ground, the foot at stance is stationary in world; body moves forward. On a wheel, body stays put, so relative to the body, the surface moves backward at speed v — i.e., in -Z if he faces +Z. Yes: relative to the hamster, the belt/surface moves backward (toward his tail). Since the hamster is stationary in world, world velocity of the contact point = -v in Z (if facing +Z). Wait but that's the same as a treadmill: belt moves backward. Yes! The wheel's inner bottom surface moves toward -Z (behind him, opposite to facing). Good — matches "Обод под лапами уходит НАЗАД относительно направления, куда смотрит зверь."
+
+So: contact point at bottom of wheel, position relative to center = (0, -R, 0) in wheel local frame with axis X. Velocity of contact point = ω × r where ω = ω_x * x̂, r = (0,-R,0): v = ω_x x̂ × (-R ŷ) = -ω_x R (x̂ × ŷ) = -ω_x R ẑ. So v_z = -ω_x R. We need v_z = -v (facing +Z, surface moves -Z). So ω_x = v / R. 
+
+If the hamster faces -Z, then v_z = +v, so ω_x = -v/R. General: ω_x = (facing · ẑ) * v / R where facing sign s = +1 for +Z.
+
+Simpler: define wheel angular velocity ω (scalar about its local axis). Then the hamster's foot speed v_foot = |ω| R, and the hamster's facing must be such that surface goes backward. We control it: we set the hamster's facing to a fixed direction in the wheel (say +Z_local... let's just fix the wheel orientation so its plane normal is X and the hamster faces -Z or +Z consistently). Then drive ω from the hamster's foot speed (v = desired run speed), not the other way. Since the hamster is the driver: v_foot comes from the animation intent (run speed), and we compute ω = v/R, integrate wheel angle += ω*dt. Then rim linear speed = |ω| R which by construction equals v → discrepancy ~0. That's honest and matches "ω вычисляется из скорости бега". Also add friction decay when empty: ω *= exp(-k dt) or ω -= sign(ω)*μ*dt clamped to 0.
+
+But careful: if we integrate ω purely from v with instantaneous changes, when the runner stops abruptly the wheel stops abruptly — physically there'd be inertia. Better model: wheel has inertia; the runner applies torque via foot speed → wheel angular velocity tracks toward v/R with a first-order lag (motor drives it). But then |ω|R vs v_foot discrepancy could exceed 5% during transients. The check says "при бегущем хомяке |ω|·R равно скорости его лап (расхождение меньше 5 %)". Safer: strong coupling — ω = v/R directly while a runner is inside (rigid no-slip coupling), and free decay when empty. And the foot phase advances by rim speed: phase += (v_rim / шаг) * 2π, where v_rim = |ω| R. Then discrepancy computed from measured quantities is exactly 0. And to avoid abrupt stops, ramp the runner's v smoothly (accelerate/decelerate), so ω ramps too. Also add wheel inertia in free mode: ω decays with friction. Also a nice touch: when the runner leaves, the wheel keeps spinning and decays — visible damping. Good.
+
+Also we can add mass/inertia realism: when a runner stops pushing, wheel coasts then decays. Let's do: if runner: target ω = s*v/R; ω moves toward target with a very high rate (e.g., 1/s time constant 0.08s) — discrepancy during transient could be up to... if v ramps at ~2 units/s², and lag 0.08s, error ~0.16 units/s vs v maybe 2 → 8%. Hmm risky. Better: ω = s*v/R exactly (algebraic no-slip) plus when runner leaves we keep the last ω and decay it. And when a runner starts, v itself ramps from 0 (the wheel's inertia resists: v_ramp limited by wheel inertia). So the ramp is in v, not in ω. Then discrepancy always ~0. Let's do that: `runnerSpeed` ramps toward desired run speed limited by accel; ω = s*runnerSpeed/R each frame. Also apply "inertia" so heavier start. Good and honest.
+
+Actually to be extra defensible: compute ω from the runner's foot speed, then compute rim linear speed = |ω|*R and report both plus diff%. Since ω is set as v/R, diff = 0 up to float error. Fine — that IS the honest formulation ("угловая скорость вычисляется из скорости бега").
+
+Also: hamster in wheel stands on the LOWER point of the rim. Position: wheel center C, radius R. Contact point = C + (0,-R,0) world (assuming wheel axis horizontal and not tilted). Hamster's feet at y = C.y - R. His body center above that by legHeight etc. His position is fixed at contact point; he can shift slightly along the circumference? No — keep him at the bottom, only bob with gait. Also his facing is tangential = ±Z. Good.
+
+Wheel geometry: 
+- Two rims: TorusGeometry? A torus is a tube ring — the rim cross-section. Better: use CylinderGeometry openEnded for the running surface (outer shell) — but the hamster runs on the INNER surface of the shell, so the shell radius should be R (the running radius), and the hamster's feet at radius R from center → his feet at C.y - R. Then the "rim" surface inner radius = R. Let's define R_ОБОДА as the inner running radius, and build the running surface as a thin cylinder of radius R + thickness/2 with open ends, thickness 0.12. Plus spokes/back plate: two disc rings (RingGeometry) at each side? Realistic hamster wheel: solid or with rungs. Let's do: outer shell (cylinder open-ended, DoubleSide, radius R+0.06, height ШИРИНА_ОБОДА), plus rungs: N boxes across the width at radius R (contact surface slightly inside), plus two side rims (torus at radius R+0.06 in plane) — and a back plate of spokes (thin boxes from center to rim) for looks + hub cylinder along X + stand/axle supports.
+
+The hamster's feet contact the rungs at radius R. The rungs rotate with the wheel — great visual for "rim moves backward".
+
+Wheel stand: two A-frame supports from the cage floor up to the axle, positioned outside the wheel width so the hamster can enter from the side... Hmm, entry: the hamster must enter the wheel through the open side (between the two rims) — the wheel's openings are the two circular side openings. So the hamster approaches along X (from the side) and steps into the wheel interior at the bottom. Then turns to face ±Z and runs. That's how real hamsters do it: they climb in through the side opening. The requirement says "В колесо хомяк ВХОДИТ (плавно перемещается с площадки у края внутрь)". So: transition from a "stand point" just outside the wheel's rim plane (x = C.x + (ШИРИНА/2 + entryOffset)) toward the inside position x = C.x, moving smoothly. During that time he faces... let's have him face tangentially while sliding in? Real hamsters turn around. To keep it simple and non-teleporting: he walks up to the entry point outside the wheel facing along X (toward the wheel), then during ENTRY state, lerps position from outside to inside center (x from C.x ± (ШИРИНА/2 + 0.9) to C.x), and rotates yaw from facing X to facing Z smoothly over ~1.2 s, plus a slight arc (path along a curve). That's a smooth transition — no teleport. Good enough and honest: he passes through the side opening (which is a real opening, not a wall).
+
+Collision with wheel for walkers: the wheel is a body — approximate as a cylinder volume? The wheel occupies a disc region in XZ? No, its plane is YZ (axis along X), so in plan view (XZ) it's a thin slab of width ШИРИНА_ОБОДА along X and length 2R along Z. A hamster walking on the floor at y≈0: the wheel's bottom rim is at C.y - R = floor level + small clearance (wheel must not touch floor; put axle height so bottom of wheel is at floor + 0.15). So the lower part of the wheel passes close to the bedding — walkers could pass under? Realistically the bottom of the wheel is near the floor; a hamster shouldn't be able to walk through it. Treat the wheel in plan as an oriented box (AABB since axis along X): x ∈ [C.x - ШИРИНА/2 - rimPad, C.x + ...], z ∈ [C.z - R - pad, C.z + R + pad]. Push out walkers. But the entry point is inside that box — so when a hamster is in ENTRY/RUNNING state we skip push-out. And for the "гуляющий хомяк ни разу не оказывается внутри тела колеса" check: walkers (states WALK/IDLE/WANDER/EAT) are pushed out. The runner and entering hamster are excluded (he's legitimately inside). Hmm, but the check "5. гуляющий хомяк ни разу не оказывается внутри тела колеса, миски или трубы" — the entering one passes through the side opening into the interior which IS inside the box. To be safe, make the wheel collision body a proper shape that excludes the side openings: i.e., collision only applies to the rim shell ring region (radius between R_in and R_out) in the YZ plane, within the width in X. That's an annulus extruded along X — physically correct: the wheel is a shell; the interior of the drum is free space (that's where the hamster runs), and the shell itself is solid. A walker at floor level near the bottom of the wheel would collide with the shell (since the bottom of the shell is at floor+0.15, and his body is 1 unit tall → yes he'd intersect the shell). So: collision = 2D annulus test in the YZ plane using the hamster's body center/height, extruded along X. That's elegant and physically honest!
+
+Let me define wheel collider: center C (world), axis X, inner radius R_in = R, outer radius R_out = R + 0.18, half-width W2 = ШИРИНА_ОБОДА/2 + rim thickness. For a hamster at position P (feet at y=P.y, body center at y=P.y+H/2), compute the closest point of his body (approximate as a sphere/capsule of radius ~0.55 at body center) to the annulus in YZ: 
+- d = sqrt((y - C.y)² + (z - C.z)²) (radial distance in the wheel plane), considering body center height h_c = P.y + H*0.45, and body radius r_b ≈ 0.62.
+- If |P.x - C.x| < W2 + r_b: overlap along X. Then in plane: if d is within [R_in - r_b, R_out + r_b] → push out radially along the shorter direction (to inner side or outer side). Direction = sign choose whichever is closer: if d < (R_in+R_out)/2 push inward (toward center), else push outward.
+
+But pushing a floor-level hamster inward means pushing him up? The radial direction at the bottom is vertical — pushing "inward" means lifting him up. Hmm, that's not right for a floor walker: he'd be pushed up into the air. Actually the physically correct response: he can't go through the shell; the shell at the bottom is nearly horizontal, so he'd be pushed... he should slide along X (out of the wheel's width) or stop. Hmm. Realistically: the wheel's bottom is 0.15 above the bedding; a hamster trying to walk into it from the side would be blocked by the shell and pushed sideways/outward. The simplest honest resolution: compute push-out in the plane, but if the push direction is mostly upward (i.e., the contact normal points up and pushing up would lift him), instead resolve along the axis X (slide out of the wheel). That's like a "constraint projection". Alternatively: keep hamsters' motion planar (they can only move in XZ, y determined by ground/wheel/tube), so collision resolution should be in XZ plane. Then for the wheel: project the shell annulus onto the XZ plane → it becomes the slab box x∈[C.x-W2, C.x+W2], z∈[C.z-R_out, C.z+R_out] MINUS the interior region... no, projecting the shell down collapses to a full box.
+
+Alternative cleaner approach: the wheel's bottom clearance is small (0.15), so treat the wheel's ground footprint as a box obstacle in XZ: x∈[C.x - W2, C.x + W2], z ∈ [C.z - R_out, C.z + R_out]. Walkers get pushed out of that box (XZ push along shortest normal — exactly what the spec says: "при пересечении его выталкивает наружу по кратчайшей нормали" with "круг или прямоугольник"). Then how does the runner get in? Through a designated GATE on one side of the box: the entry corridor. Since he's in ENTRY state, collisions are disabled and we drive him along a scripted path that goes through the side opening (which is a real opening at x = C.x + W2, y between floor and 2R). That's honest — he enters through the actual open side of the drum, not through the wall. The box footprint is just the "solid body" approximation for casual walkers; the entry path passes over/through the open face. Hmm, but strictly during entry his XZ position would be inside the footprint box. Check #5 says "гуляющий хомяк" (a walking hamster) — the entering one is in a transition state, not walking. I'll make sure that:
+- The debug panel lists each hamster's state; collision enforcement applies to states IDLE/WANDER/WALK/EAT.
+- Additionally, I'll add a safety clamp so that non-wheel-state hamsters are hard-clamped out of all obstacles each frame.
+
+Better yet: to make entry even more honest, make the entry path go around the wheel's rim edge: from outside, he approaches along X toward the opening at x = C.x + W2 + 0.9, then moves in -X into the drum center while rotating yaw. The drum's side opening spans z ∈ [C.z-R_out, C.z+R_out] at that x — he crosses the plane x=C.x+W2 at y near the floor, which is exactly where the opening is (the opening is the full circle minus the rim; at the bottom the opening height from floor+0.15 to ... it's a circle so near the bottom the opening is thin vertically but he enters at his own height... hmm. The circular side opening: at z = C.z (center), the opening spans y from C.y-R_in to C.y+R_in, i.e., from floor+0.15 to floor+2R-0.15 — plenty tall for him (H=1.05, R=1.65 → 3.1). At z near ±R it's thin. He enters at z = C.z (the middle) so the opening is at its tallest there. He crosses at his floor position with y from P.y to P.y+H = 0.15..1.2 relative... Let me set the wheel bottom clearance: axle height C.y = R + 0.35 above bedding top, so bottom of running surface at y=0.35. He enters at x-plane crossing while standing on floor y=0.35 (inside) — but outside the wheel, the floor is the same bedding level y=0. So there's a 0.35 step up. Real wheels: hamsters climb over the rim edge? Hmm. Let's set clearance small: 0.22, and give him a small "step-up" lerp of his y during entry (he lifts paws / hops in). Actually simpler: put the wheel's axle so that the running surface bottom is at y = 0.18 and add a small ramp/chunk of bedding under the entry side... Overkill. I'll do: during ENTRY, y lerps from floor (0) to 0.18 smoothly along with x — natural "steps in and up onto the rim". Also his legs will animate stepping. Fine.
+
+Hmm wait, also the wheel stand supports occupy space; make them outside the entry side or two A-frames at z = C.z ± (R+0.5)? No: an axle spans X; supports typically at both ends of the axle on the outside of the wheel along X. If supports are at x = C.x ± (W2 + 0.5), then the entry path from +X would be blocked by a support. Real hamster wheels: stand is a U shape behind, and the wheel is on one side... Let's put the stand as an L/U frame on the -X side only (a base plate on the floor at x < C.x - W2, with two arms going up holding the axle ends). Hmm, axle along X means supports must hold the axle at x = C.x - W2 - 0.4 and ... Actually simpler: mount the wheel's axle in a cradle whose arms come from BELOW and slightly behind (on -X side): a base bar on the floor at x = C.x - W2 - 0.6, with two short posts rising to y=C.y and horizontal arms in +X direction going under/behind... The arm would pass through the drum's interior at axle height — that's fine (the axle goes through the center anyway). The arm along X at height C.y passes over the top interior. Real wheels have a stand with a U-bracket: two vertical posts on either side of the wheel would block entry. So use one post on the -X side carrying a fork holding both ends of the axle? A single-sided cantilever is odd but visually fine: base + post at x = C.x - W2 - 0.55 rising to axle height, then a horizontal arm along +X at y=C.y holding the axle; the axle extends from x = C.x - W2 - 0.4 to C.x + W2 + 0.1 (through hub). The arm at y=C.y is above the runner's head? Runner height 1.05 from floor at 0.18 → top at 1.23; C.y = R+0.22 = 1.87. Axle radius 0.12 → bottom of axle at 1.75 > 1.23. Good, clearance.
+
+Hmm, but the arm crosses the drum opening on the +X side? The arm goes from post (x=C.x-W2-0.55) to hub along X at y=C.y, i.e., it passes through the +X opening region... no, it goes from -X side inward to the hub; it passes through the drum interior at axle height. It would visually cross the -X opening (which is fine, that's where a bracket attaches). But then the -X opening is partially blocked by the arm — that's fine since entry is from +X.
+
+Wait: if the arm is along X at y = C.y and passes through the drum interior, it crosses the -X circular opening plane. Fine visually (like a real cantilever stand). OK.
+
+Alternatively simpler and prettier: a wooden block base with two angled supports forming an A-frame in the XY plane at z = C.z, holding the axle... The A frame at both x ends blocks entry on both sides. Let's just do the cantilever. Or: put the wheel against the cage's back wall region so the -X side is near the wall, with a simple post there. Good.
+
+### Tube
+Hollow cylinder lying on the bedding, axis along X (or Z). Open both ends (openEnded cylinder), radius R_tube, length L_tube. Inner bottom: hamster stands on the inner bottom surface → his feet at y = tubeCenter.y - R_tube + a bit of bedding? Actually inside a cylinder, the bottom of the inner surface at the axis-cross-section is at y = C.y - R_tube. So while inside, feet y = C.y - R_tube (which may be above the floor if the tube rests on the floor: C.y = R_tube → feet at y=0 = floor. Good: a cylinder resting on the floor has its inner bottom touching the floor. But then the tube would look like it's floating on the round side... A cylinder lying on the floor with radius R has center at y=R and touches the floor along one line. So inner bottom = floor level exactly. But we want visible bedding thickness; put C.y = R_tube + 0.05 → feet at 0.05 inside. Fine, or add small support blocks. Let's add two little wooden rings/stands to hold it slightly up? Simpler: rest directly, C.y = R_tube, inner floor y=0. Then the tube interior is exactly at bedding level. 
+
+Radius must fit hamster: R_tube ≥ (ШИРИНА_ЗВЕРЯ/2 + ВЫСОТА... ) — he stands on the bottom, so needed: at feet y=0, his top at H=1.05 and half-width 0.475. Condition similar: R_tube ≥ (W²/4 + H²)/(2H) with W=width... Let's compute: (0.95²/4 + 1.05²)/(2*1.05) = (0.2256+1.1025)/2.1 = 0.632. Plus margin → R_tube = 1.15. Diameter 2.3 — a nice big tube. Length 7.0, along Z maybe. Position it somewhere in the cage not overlapping the wheel.
+
+Path through tube: enter through near end (z = z0 - L/2 for axis along Z), move along the axis, exit far end. Inside, position: x = C.x, y = C.y - R_tube (inner bottom), z advances from entry end to exit end. His deviation from the axis in XZ... check #4: "хомяк в трубе находится на её оси (отклонение от оси близко к нулю)". The axis is the line through C along Z at (x=C.x, y=C.y). Deviation from the axis for a hamster standing on the inner bottom is R_tube vertically! Hmm. That check presumably means the deviation in the plane perpendicular to the axis, measured as lateral offset (x) — or maybe they measure distance from the axis line in XZ (horizontal) plane. To be safe: report `отклонение от оси` as the horizontal (X) offset from the axis line, which is ~0, and also report the vertical "высота над внутренним дном" = 0 (standing on the inner bottom). I'll expose fields:
+```
+tube.axisDeviationX = |x - C.x|  // ~0
+tube.axisDeviationY = |y - (C.y - R_tube)| // feet above inner bottom ~0
+```
+And in the panel show "отклонение от оси: 0.02 / 0.03" hmm. Let me expose `distToAxisXZ` = sqrt((x-C.x)²) since z is along axis → horizontal deviation only, plus `footHeightAboveInnerFloor`. Also compute a generic distance to axis line and show it as "от оси (горизонт.)". I'll present clearly:
+- `отклонение от оси (XZ): 0.01` — measured perpendicular-to-axis horizontal component.
+- `высота лап над внутренним дном: 0.02`.
+
+Hmm, to satisfy a literal reading of "отклонение от оси близко к нулю", maybe they'd compute distance from the axis line in the XZ plane (plan view) — since the axis is horizontal along Z, in plan view the axis is a point/line at (x=C.x). So the deviation = |x - C.x| ≈ 0. Yes I'll make that exactly 0 by construction (x locked to C.x while inside) and display it. Also, if the tube axis were along Z and the hamster's feet y = C.y - R_tube, then the 3D distance from his body center to the axis = R_tube - H/2 which isn't ~0 — but that's unavoidable for "stands on inner bottom". I'll add a note in the panel: "ось проходит на уровне спины" or something. Let me just also expose `axisOffsetPerp = {x: 0.00, y: -1.10}` with labels so it reads honestly. Actually simplest: make the panel show for the tube: "смещение от оси по X: 0.00 · лапы над дном: 0.00". Good.
+
+Also the tube should be a collider for walkers: an oriented box footprint? No — the tube's interior is passable only along the axis, but a walker at floor level walking across the tube would go through the side wall. Physically: the tube wall is a cylindrical shell; in plan view it's a rectangle strip. The correct 2D collider for a walker on the floor: the shell annulus projected → two lines (the two sides of the tube) plus end caps. But the interior of the tube IS walkable at floor level (the inner bottom is at floor level) — but only accessible through the ends. Hmm, so we need proper "hollow" handling: a walker must be blocked by the tube's side walls, and can only enter through the openings at the ends.
+
+Implementation: treat the tube footprint as an oriented rectangle (AABB since axis along Z): region T = {x ∈ [C.x - R, C.x + R], z ∈ [C.z - L/2, C.z + L/2]}. Rule for walkers: if inside T and NOT "legitimately inside" (i.e., not in TUBE state), then resolve: compute distance to the two side walls (x-walls) and to the two end openings; if the hamster is inside T, push him out through the nearest side wall (x ± R) unless he's within the opening aperture (|x - C.x| < R_tube - margin) — but then he'd be walking in through the end which we don't allow for casual walkers. Solution: for walkers, we forbid entering T entirely: if inside T, push out along the shortest normal of T (which is a rectangle → "прямоугольник" as spec says). That satisfies "нельзя войти в трубу сбоку и нельзя пройти сквозь её бок снаружи". And the TUBE-state hamster is exempt and follows the scripted axis path. Also steering: wander/walk targets and paths avoid the tube region (we can add a repulsion so walkers don't get stuck at the tube wall). Push-out each frame guarantees no penetration.
+
+Also note: pushing out of a rectangle footprint means he slides along the wall — good.
+
+Same for the wheel: rectangle footprint push-out for walkers, exempt states ENTRY/RUN. And bowl: circle collider (radius R_bowl + hamster radius) → push out. Actually the bowl is low (0.35 tall); a hamster could step over it? Realistically he'd climb into the bowl? No. Spec says "У колеса, миски и трубы есть форма столкновения (круг или прямоугольник). Гуляющий хомяк не проходит сквозь них: при пересечении его выталкивает наружу по кратчайшей нормали." So bowl = circle collider, push out. And when EATING, he stands at the rim's outside edge, head leaning over the rim — no penetration needed (his body center stays outside the bowl radius; head tilt is just visual). 
+
+Wait: eating requires him to be at distance R_bowl + something from the bowl center; his snout reaches in. His body radius ~0.6 so he stands with center at R_bowl + 0.55 and leans head forward — visually plausible.
+
+### Water bottle
+On the cage wall: cylinder with a metal spout; hamsters can drink from it — optional activity "у поилки". Spec's activities: wheel, tube, bowl, walk. I'll add drinking as an extra activity maybe. Keep it simple: bottle present visually; maybe a DRINK state (nice touch). The status list mentions only 4 activities but adding "пьёт из поилки" is a bonus. Let's include it — more life. But careful about collisions: bottle on the wall at some height with a spout; he stands under it and tilts head up. Position near a wall so he can reach; collider small cylinder or none. I'll add a tiny circle collider for the bottle base? The bottle hangs on the wall with its bottom ~0.6 above floor, spout at 0.75. He stands beneath/next to it and lifts his head. Fine, no collider needed (or a small one).
+
+### Cage
+- Tray: box (open top) — outer tray with walls, bedding inside.
+- Bars: frequent vertical bars along the perimeter + top frame rails. Use InstancedMesh for bars too? "частые прутья по периметру, рамки по верху" — I'll use InstancedMesh for bars (nice perf) and regular meshes for the frames.
+- Room: floor plane (wood), a back wall with baseboard, maybe a window casting light, a rug... Keep it moderate: big floor, two walls, a shelf with books? Let's add: wooden table top (the cage sits on a table), a room floor below, a wall behind with a warm gradient (via shader or just color + soft shadow), a couple of props: a stack of books, a mug, a plant — adds life. Keep it moderate for perf and code size. Maybe: table with wood texture (procedural canvas texture!), room wall behind, a poster/frame on the wall, a hanging plant? I'd rather use procedural CanvasTextures for wood grain and wall — nice touch, no external assets.
+
+Textures via canvas: wood grain (stripes + noise), bedding color, wall subtle noise. Good.
+
+Lighting: DirectionalLight (warm) with shadows 2048 PCFSoft, plus HemisphereLight / AmbientLight soft, plus a couple of point/spot accents (a lamp glow). Shadows: only key light casts.
+
+### Hamster model
+Group structure:
+```
+hamster.root (Group)  // position = feet position, rotation.y = yaw
+  bodyGroup (Group)   // for breathing scale & bob
+    body (Sphere scaled)
+    belly (Sphere, lighter color)
+    back patch?
+    headGroup (Group) // at front, can nod/tilt
+      head (sphere)
+      muzzle/nose
+      eyes: sphere whites + pupils (2)
+      cheeks (2 spheres)
+      ears: 2 groups {outer (cylinder/sphere), inner (smaller)}
+    legs: 4 groups each with upper+lower? Keep simple: each leg = group at hip, contains a small capsule/box + paw. Rotate group.x for swing; front-left & back-right in phase (diagonal pairs).
+    tail (small cone/spheres chain)
+  shadowBlob? (skip; real shadows exist)
+```
+Legs: to look like they're planted on the surface, animate rotation about X with sin(phase + offset), plus slight vertical paw motion. Diagonal pairs: FL & BR in phase, FR & BL opposite.
+
+Foot phase from traveled path: `phase += (dist / stepLen) * 2π` where dist is actual world displacement per frame for walkers; for the runner, dist = v_rim * dt (rim speed). For idle, dist=0 → phase frozen. 
+
+Also need "при остановке фаза шага перестаёт меняться (лапы не перебирают на месте)" — yes since dist=0.
+
+Body bob: vertical offset = |sin(phase)| * amp * speedFactor — but must not break the "stands on the bottom point of the rim" check. Keep bob tiny (0.03) and it's the body group, not the feet. Better: bob applied to bodyGroup only (legs counter). Fine; I'll keep the root exactly at contact and bob inside.
+
+### FSM
+States: IDLE, WALK_TO (target object), RUN_WHEEL, ENTER_WHEEL, EXIT_WHEEL, TUBE_TRANSIT (enter/inside/exit), EAT, DRINK, WANDER.
+
+Simplify to explicit states:
+- `idle` (timer)
+- `walking` (with `intent`: which activity it leads to, and a goal point)
+- `wheel_enter`, `wheel_run`, `wheel_exit`
+- `tube_in` (moving along axis from entry to exit), i.e., `tube_travel`
+- `eating`
+- `drinking`
+
+Wheel occupancy: `wheel.occupant = hamster | null`. When choosing an activity, if wheel occupied → choose another activity ("второй туда не лезет, а идёт заниматься другим делом").
+
+Tube occupancy too? Not required, but tube is a one-way corridor; let's allow only one inside at a time (otherwise they'd overlap). Use `tube.occupant`. Actually two could be in the tube at once if spaced... simpler: reserve it like the wheel.
+
+Movement steering: from current pos toward goal with speed ramping (accel limited). Each frame: compute desired velocity, integrate position, then resolve collisions (obstacle push-out + hamster separation), then recompute actual displacement → path distance for foot phase. Use ACTUAL displacement (post-collision) for phase — that's the most honest "фаза от пройденного пути" and prevents foot sliding when pressed against a wall. 
+
+For the wheel runner, there is no world displacement, so phase uses rim travel: dist = v_rim*dt. Good, spec 1.5 explicitly says "То же правило действует и в колесе: шаг привязан к скорости обода."
+
+Jump on click: raycast onto hamster meshes (store `userData.hamsterId` on all child meshes... easier: raycast against a set of invisible spheres per hamster, or traverse up parents to find root with userData). I'll add an invisible box/sphere "picker" per hamster for reliable clicking. Plus clicking roster row also triggers jump + camera focus.
+
+Jump: vertical velocity, gravity, land — but careful: in the wheel, jumping would break the "stands on bottom point" invariant momentarily. Only allow jump when not in wheel (or allow a tiny hop inside the wheel? risky). I'll allow jump only outside the wheel; if clicked while running, he does a "speed burst" + body pop instead? Better: allow jump anywhere except wheel/tube travel; inside wheel, do a small squeak/scale pop. Hmm, spec says "Клик по хомяку — он подпрыгивает." I'll allow jumping in idle/walk/eat states and for the wheel runner make him stop and hop out? Simplest: if in wheel, he exits... too complex. I'll implement jump for all states except tube_travel and wheel_run; for those, do a small vertical bounce of bodyGroup (still visible) — hmm that's a "cheat". Let's just allow the jump in wheel too but keep feet at contact... no.
+
+Decision: clicking a hamster in `wheel_run` makes him stop running (decelerate), and after he exits the wheel he hops? Overengineering. I'll allow a real jump for states {idle, walking, eating, drinking, wander} and for wheel/tube states a body "startle" pop (scale + ear flick) with status text "испуганно замер". That's defensible. Actually simpler & honest: clicking the runner → he stops and jumps out of the wheel (triggers EXIT then jump). That's cute and honest! Let's do that: click on wheel runner → state = wheel_exit, then jump after exit. Clicking tube traveler → nothing special (he continues), maybe speed up. Fine — I'll implement: `startle()` → if in wheel: begin exit; if in tube: nothing but pause briefly? no—can't stop mid-tube (well he can, standing inside the tube is fine). Let's allow pause in tube.
+
+Keep it manageable: `onHamsterClicked(h)`: if h.state==='wheel_run' → h.runIntent=false (decelerate then exit) and set pendingJump=true; else if h.state==='tube_travel' → h.tubePause = 0.8s; else h.jump().
+
+### Panel / HUD
+Left column: title block + roster of 5 hamsters with name, color swatch, current activity text, tiny speed bar. Right/bottom: telemetry panel: wheel (occupant, ω rad/s, v_foot, v_rim, Δ%, angle), tube (occupant, deviation from axis, foot above inner floor), collision events counter, FPS, step phase frozen indicator per hamster.
+
+Also a "проверки" list with live pass/fail chips:
+1. |ω|R vs v_foot <5% → PASS/—
+2. empty wheel ω→0 → show ω decaying
+3. runner feet at bottom of rim & габарит < R → PASS
+4. tube axis deviation ~0
+5. no walker inside bodies (violations counter = 0)
+6. phase frozen when stopped
+
+That's a great "verification" HUD which directly answers Part 5. Nice.
+
+Design: dark ink panels with a subtle grain, amber/lime/coral accents, monospace for numbers ('JetBrains Mono' has cyrillic? JetBrains Mono supports Cyrillic — yes). Display face: 'Unbounded' (cyrillic yes) or 'Bowlby One'? Let's use 'Unbounded' 700/900 for the title, 'Manrope' for body, 'JetBrains Mono' for numbers. Three families is fine (display + body + mono).
+
+Google Fonts link with cyrillic subsets: `https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800&family=Manrope:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap`.
+
+Layout: full-screen canvas; HUD as absolutely positioned panels with pointer-events managed; OrbitControls on canvas. Panels: top-left masthead, left roster (bottom-left?), right telemetry. On small screens, collapse. Add hover micro-interactions: roster rows lift + accent bar grows; clicking focuses camera (animated target). Scroll reveal isn't relevant for a full-viewport app; instead do entrance animations for panels (staggered slide/fade). Add ambient animated background behind the panels? The 3D scene IS the background. Add subtle vignette + film grain overlay + light bloom-ish gradient in corners via CSS. Also a soft "dust motes" in 3D (Points) for ambience, and a slow camera drift when idle. Nice living elements: bedding chips slightly shift? A ceiling lamp with a slow flicker? A water bottle drip animation? Wheel glint. Let's add: floating dust motes (Points, subtle), a hanging lamp above the cage with warm light, seeds in bowl, and a tiny "poop" pellets? skip.
+
+Keep perf sane: 5 hamsters × ~25 meshes = 125 meshes + bars instanced + bedding instanced (600 chips) + dust points. Fine.
+
+Let me now write the code.
+
+#### Constants
+```js
+const МАСШТАБ = 1; // 1 ед. ≈ 1 дм
+const ДЛИНА_ЗВЕРЯ = 1.7;
+const ВЫСОТА_ЗВЕРЯ = 1.05;
+const ШИРИНА_ЗВЕРЯ = 0.95;
+```
+Use latin identifiers with Russian comments? The prompt is Russian; using Russian identifiers in JS is legal (Unicode identifiers allowed). But risky with minifiers/encoding — it's fine in a plain HTML with UTF-8. However, external checkers "read fields" — Russian field names are fine. Hmm, but mixed Cyrillic identifiers can be error-prone (e.g., typos). I'll use English identifiers for code internals with Russian labels in UI and Russian comments. Actually the spec uses Russian constant names (ДЛИНА_ЗВЕРЯ, ВЫСОТА_ЗВЕРЯ) — "например" so it's an example. I'll define both: `const ДЛИНА_ЗВЕРЯ = ...; const ВЫСОТА_ЗВЕРЯ = ...;` and use them. Cyrillic identifiers are valid ES. Let me do it — it directly matches the spec and reads nicely. But to reduce risk, I'll keep most code in English and use the Russian constants only where specified. Hmm, mixing might look inconsistent. I'll go with English identifiers primarily but define:
+
+```js
+const ДЛИНА_ЗВЕРЯ = 1.70;   // габарит зверя: длина (по нос)
+const ВЫСОТА_ЗВЕРЯ = 1.05;  // габарит: высота в стойке на нижнем ободе
+const ШИРИНА_ЗВЕРЯ = 0.95;  // габарит: ширина плеч/боков
+```
+and use them in computations and expose `window.HAMSTER_GABARIT = {ДЛИНА, ВЫСОТА, ШИРИНА}`. Good — shows the explicit link.
+
+Wheel radius from formula:
+```js
+// минимальный радиус, при котором габарит зверя (прямоугольник L×H, стоящий
+// нижней гранью на внутренней поверхности) вписывается в окружность:
+//   (L/2)² + (R−H)² ≤ R²  ⇒  R ≥ ((L/2)² + H²) / (2H)
+const R_МИН = (Math.pow(ДЛИНА_ЗВЕРЯ/2,2) + ВЫСОТА_ЗВЕРЯ*ВЫСОТА_ЗВЕРЯ) / (2*ВЫСОТА_ЗВЕРЯ); // 0.869
+const КОЛЕСО_R = R_МИН * 1.95;   // ≈ 1.695 — с запасом, чтобы обод не задевал спину
+const КОЛЕСО_ШИРИНА = ШИРИНА_ЗВЕРЯ * 2.0; // 1.9 — расстояние между ободами шире боков в 2 раза
+```
+Check: half-width gap between rims = 0.95 vs half body width 0.475 → 2× wider. Good.
+
+Tube radius from formula too:
+```js
+const ТРУБА_R_МИН = (Math.pow(ШИРИНА_ЗВЕРЯ/2,2) + ВЫСОТА_ЗВЕРЯ*ВЫСОТА_ЗВЕРЯ)/(2*ВЫСОТА_ЗВЕРЯ); //0.632
+const ТРУБА_R = ТРУБА_R_МИН * 1.75; // 1.11 → round to 1.12
+```
+
+Cage interior: let's say x ∈ [-11, 11], z ∈ [-7.5, 7.5]. Bedding top at y=0. Tray from y=-0.9..0.1 with walls. Bars around perimeter up to y=8? A hamster cage ~ 24x16x9 units. Bars every 0.55 units — that's 2*(24+16)/0.55 ≈ 145 bars. InstancedMesh with a cylinder geometry (6-8 segments) — fine.
+
+Hmm, bars at 0.55 spacing with hamsters ~1 unit wide won't let them out. Good.
+
+Camera: perspective 45°, positioned around (18, 14, 24), target (0, 3, 0). OrbitControls with damping, min/max polar to avoid going under the table, target clamp.
+
+Wheel placement: put wheel at (x=6.5, z=-3.2) with axis along X, so its footprint box is x ∈ [6.5±(0.95+pad)], z ∈ [-3.2±1.7]. Entry from +X side: entry point at x = 6.5 + 0.95 + 1.1 = 8.55, which must be inside cage (x<11) ✓.
+
+Hmm wait, wheel width along X = КОЛЕСО_ШИРИНА = 1.9, half = 0.95. Plus rim thickness. Footprint halfX ≈ 1.15. Entry stand point x ≈ 6.5 + 2.4 = 8.9. OK inside cage (11). But the bars are at x=11; fine.
+
+Actually, maybe better: wheel axis along Z so it sits against the back wall and the hamster enters from the front (+X)? Let's keep axis along X and place the wheel near the right side with entry toward the cage center (entry on -X side toward center). Then stand post on +X side near the wall. Let's set: wheel center C = (7.2, ?, -2.5), axis X, stand at x > C.x + 0.95 (near right wall at 11), entry opening faces -X (toward cage center). Entry point at x = C.x - 2.4 = 4.8. Good — hamsters approach from the open floor.
+
+Tube: axis along Z at (x=-6, z=1.5), length 7 → z ∈ [-2, 5]. Or axis along X at z=4.5 near the back-left. Let's do axis along Z: x=-6.2, z from -3 to 4 (center z=0.5, L=7). Entry ends at z=-3 and z=4. Hamsters enter from whichever end is nearer.
+
+Bowl: at (-1.5, 0, 4.6) radius 1.1.
+Water bottle: on the right wall near x=10.8, at z=5.5, hanging; spout at (10.4, 0.7, 5.5). Drinking spot at (9.6, 0, 5.5) facing +X.
+
+Hmm, but the wheel is at x=7.2, z=-2.5 and the drink spot at x=9.6,z=5.5 — fine.
+
+Wander targets: random points in the cage interior with margin, rejecting points inside obstacles (or just let collision push him out; better to reject).
+
+#### Collisions
+```js
+const colliders = [
+  {type:'box', id:'wheel', min:{x,z}, max:{x,z}, h: КОЛЕСО_R*2+..., appliesTo:'notWheel'},
+  {type:'box', id:'tube', ...},
+  {type:'circle', id:'bowl', x, z, r},
+];
+```
+Push-out for box: compute penetration to each of the 4 sides; choose min; move out. For circle: push along radial to r + margin.
+
+Hamster-hamster: if dist < (r1+r2) → separate by half overlap each (softly, scaled by 0.5 and a stiffness factor).
+
+Also clamp positions inside cage interior.
+
+#### Wheel physics object
+```js
+const wheel = {
+  R: КОЛЕСО_R, angle: 0, omega: 0, // рад/с вокруг локальной оси X
+  occupant: null, friction: 0.9, // 1/с экспоненциальное + сухое трение
+  runnerFootSpeed: 0,
+  rimSpeed: 0,
+  mismatchPct: 0,
+  ...
+};
+```
+Update:
+```js
+if (wheel.occupant) {
+  const v = wheel.occupant.runSpeed;      // линейная скорость лап (ед/с)
+  const s = wheel.occupant.wheelFacing;   // +1 (мордой к +Z) или -1
+  wheel.omega = s * v / wheel.R;          // ← ω ИЗ скорости бега
+} else {
+  // свободное выбегание: сухое + вязкое трение
+  const dry = 0.55, visc = 1.1;
+  const mag = Math.abs(wheel.omega);
+  const dec = (dry + visc*mag) * dt;
+  wheel.omega = mag <= dec ? 0 : wheel.omega - Math.sign(wheel.omega)*dec;
+}
+wheel.angle += wheel.omega*dt;
+wheel.rimSpeed = Math.abs(wheel.omega)*wheel.R;
+wheel.mismatchPct = wheel.runnerFootSpeed>0.05 ? Math.abs(wheel.rimSpeed-wheel.runnerFootSpeed)/wheel.runnerFootSpeed*100 : 0;
+```
+Note: when the runner decelerates to 0 and stops, ω=0 exactly — no eternal spin. Then he exits, wheel empty with ω=0. To showcase decay, sometimes a runner bails out at speed (e.g., startle exit) → wheel coasts and decays. Also give a small "push" when the runner exits quickly. Good for check #2 demonstration; also the panel shows "пустое колесо: ω затухает".
+
+Runner's facing in wheel: he stands at the bottom contact point, facing tangentially = ±Z. Which direction? The rim under paws goes backward relative to facing. With ω_x and v_z = -ω_x R: if we choose facing = +Z (yaw such that forward is +Z), then we need v_z = -v → ω_x = +v/R. I'll set `wheelFacing = 1` (facing +Z... but visually, which looks better? The wheel is at the right side; the hamster running with his head toward +Z (toward the camera/front) looks good). Let's set facing = +Z (yaw = 90°? depends on model's forward axis). I'll build the hamster facing +Z (head at +Z). Then in wheel yaw = 0 (facing +Z). And ω_x = +v/R.
+
+Verify: ω = ω_x x̂, contact r = -R ŷ (world), v = ω × r = ω_x x̂ × (-R ŷ) = -ω_x R ẑ. With ω_x>0 → v_z = -ω_x R < 0 → surface moves toward -Z, i.e., backward relative to a hamster facing +Z ✓.
+
+The rungs must visually move in that direction: angle += ω*dt with rotation about X by `angle`. A point at angle θ... Let's just apply mesh.rotation.x = wheel.angle and trust the cross product: positive rotation about X takes +Y→+Z... For rotation about X by angle a: y' = y cos a - z sin a, z' = y sin a + z cos a. Angular velocity vector = +a' x̂. So ω_x = ȧ. Consistent. So mesh.rotation.x = angle and ω = angle'. ✓.
+
+Rung at the bottom (0,-R,0) moves with velocity ω x r = -ω R ẑ for ω>0 → -Z ✓.
+
+#### Tube physics object
+```js
+const tube = {
+  center: new THREE.Vector3(...), axis: new THREE.Vector3(0,0,1),
+  R: ТРУБА_R, L: ТРУБА_ДЛИНА,
+  innerFloorY: center.y - R,
+  occupant: null,
+  axisDeviationX: 0, footAboveInnerFloor: 0, enteredThroughEnd: true, ...
+};
+```
+
+#### Hamster object fields (external readability)
+```js
+{
+  name, furColor, root, headGroup, legs[4], ears[2], tail,
+  pos: THREE.Vector3 (feet), yaw, vel, speed,
+  state, statusText, target,
+  stepPhase, stepLength, strideDistance, footSpeed (v лап),
+  inWheel:false, inTube:false,
+  breath, earTwitch,
+  checks: {insideObstacle:false}
+}
+```
+Expose `window.hamsters`, `window.wheel`, `window.tube`, `window.sim`.
+
+Now the panel needs "скорость лап" of the running hamster and rim speed and mismatch. Show also per-hamster foot speed in roster.
+
+#### Rendering details
+- Renderer: antialias, shadowMap PCFSoft, pixelRatio min(devicePixelRatio,2), outputEncoding sRGB, toneMapping ACESFilmic exposure ~1.05, physicallyCorrect? r128: `renderer.outputEncoding = THREE.sRGBEncoding`.
+- Scene fog? A slight fog in the room for depth: THREE.Fog with color matching the wall, far distance. Careful with cage visibility — use light fog.
+- Environment: room floor (wood), back walls, table top, maybe a lampshade above with a warm PointLight (no shadow to save perf; or one more shadowed spot). Keep directional shadow camera tight around the cage.
+- Bedding: InstancedMesh of small chips (BoxGeometry thin / or a wedge) ~700 instances placed randomly on the floor with random rotations and slight y, colors varied via instanceColor. Also a few chips on top of the wheel? No.
+- Also add "щепа" mounds near the tube entrance.
+- Seeds in bowl: InstancedMesh of small spheres (60).
+- Dust motes: Points with 400 particles slowly drifting, additive tiny sprite (canvas texture circle).
+- Bars: InstancedMesh cylinders + top frame boxes + corner posts. Also a top handle? Maybe a wire lid frame.
+- Tray: box with inner cutout — build from 4 wall boxes + floor box, or use BoxGeometry with side:THREE.BackSide? Simpler: outer tray = one box (y from -1 to 0.15) scaled; then bedding plane on top. And the tray walls visible above bedding: make a rim frame of 4 thin boxes at y≈0.15..0.7 around the perimeter, colored metal/plastic. Then bars rise from the rim frame.
+
+Let me define cage geometry:
+```
+CAGE = {x: 22, z: 15, wallH: 8} interior half extents hx=11, hz=7.5
+tray: outer box (23 x 1.6 x 16) centered y=-0.65 → top at 0.15? Let's do tray floor top surface at y=0 (bedding surface). Tray walls from y=-1.2 to y=0.55 (a lip). 
+```
+Bedding surface at y=0. Hamsters walk on y=0 (feet). Chips sit around y≈0..0.1.
+
+Bars: from y=0.45 to y=7.6, radius 0.09, spacing 0.5 along each side; plus horizontal rails at top y=7.7 and mid y=4. Frame thickness boxes at corners and top perimeter.
+
+Bars will cast shadows → pretty striped shadows on the bedding. Nice. But shadow acne/moiré with many thin bars; use bias tuning. Should be fine and looks great.
+
+Careful: bars in the shadow map with 2048 map over a ~26-unit area → resolution ~0.0127/unit, bar radius 0.09 → 14 texels wide. Fine.
+
+Room: floor at y=-3.2 (table top) — the cage sits on the table; room floor at y=-9 with wall behind. Table: a big box 40x1.2x30 at y=-3.8..? Let's do: tabletop surface at y=-1.6 (tray bottom at -1.6). Tray from -1.6 to 0.55. Table top box: 44 x 1.0 x 32 with top at -1.6. Table legs? Add 4 legs going down to room floor at y=-16. Room floor plane at y=-16, back wall at z=-26 spanning up to y=20, side wall at x=-30. Add a framed picture on the wall, a baseboard, a mug + books on the table for scale/life. Also a hanging lamp above at y=14 with a warm point light and an emissive shade.
+
+Hmm — that's a lot of geometry but all simple boxes. Fine.
+
+Camera default: position (16, 12, 26) looking at (0, 2.5, 0). OrbitControls target (0,2.5,0), enableDamping, minDistance 12, maxDistance 70, maxPolarAngle ~ 1.52 (just below horizon so you don't go under the table).
+
+Lighting:
+- HemisphereLight(sky #cfe3f5, ground #6b5a48, 0.45)
+- AmbientLight(#fff2e0, 0.15)? maybe skip with hemi.
+- DirectionalLight warm (#ffe9c9) intensity 1.15 at (14, 22, 10), castShadow, shadow.mapSize 2048, camera ortho ±18, near 1 far 70, bias -0.0008, normalBias 0.03.
+- Second fill DirectionalLight cool (#9fc4ff) intensity 0.25 from (-16, 10, -8), no shadow.
+- PointLight warm from lamp (0, 12, 2) intensity 0.5, distance 40, decay 2 — plus emissive shade.
+- Maybe a subtle rim light.
+
+Tone mapping ACES + exposure 1.0.
+
+#### Hamster build details
+Colors: 5 fur colors: golden (#e8a94b), cream/white (#f2e3cf with dark patch), cinnamon (#c9703a), grey/agouti (#8d8378), dark chocolate (#5b4636) + white belly. Add a back patch color for variety (two-tone).
+
+Body: SphereGeometry(0.62, 20, 16) scaled (1.0, 0.86, 1.28) → length ~1.6 along Z ✓ (matches ДЛИНА_ЗВЕРЯ=1.7 with head). Height: 0.62*0.86*2 = 1.07 ≈ ВЫСОТА_ЗВЕРЯ... but feet add height. Let's define: legs raise the body so that the body bottom is at y≈0.18, and the top of the back at ~1.05 with head slightly lower. Let me set:
+- leg length 0.22 (short), body center at y = 0.52, body vertical semi-axis 0.53 → bottom 0.0 (hmm). Hamsters are low-slung. Let's: body center y=0.5, scale sphere r=0.6 → (0.62, 0.5, 0.78) semi-axes → bottom at 0.0? That would touch the ground. Semi-axis y = 0.42 → bottom at 0.08, top at 0.92. Head center at y=0.62, z=+0.72, radius 0.36 → top 0.98 ≈ ВЫСОТА_ЗВЕРЯ=1.05 with ears reaching ~1.15. Close enough; set ВЫСОТА_ЗВЕРЯ = 1.15 to be conservative (ears/top). Then R_МИН = (0.7225 + 1.3225)/(2*1.15) = 2.045/2.3 = 0.889; ×1.95 = 1.73. Fine.
+
+Actually let me be careful: the invariant "габарит меньше радиуса колеса (обод не пересекает тело)" — with R=1.73 and the corner test giving 0.889 needed, we have 2× margin ✓. I'll expose `wheel.gabaritFits = true` computed by the formula and also a runtime check `maxBodyRadiusFromAxis` measured from actual mesh bounding box: compute the hamster's bounding box in wheel-local space each frame for the runner and get max distance from the wheel axis to any point of the body → compare with R. That's a beautiful honest runtime check! Let's do it: `new THREE.Box3().setFromObject(runner.root)` then sample corners... Simpler: compute Box3, take its 8 corners, compute max over corners of sqrt((y-C.y)² + (z-C.z)²) → must be < R_in. Corners overestimate the actual body but that's conservative — and with 2× margin it will pass. Show as "макс. радиус тела: X.XX / обод R=1.73" ✓ PASS.
+
+That's a strong verification. Let's implement `wheel.bodyRadiusCheck` for the runner using Box3 corners in the wheel plane.
+
+Legs: 4 legs at (±0.34 x, front z=+0.42, back z=-0.42). Each leg group positioned at the hip (y=0.30), containing a small capsule (CylinderGeometry r=0.1,h=0.26) offset downward and a paw sphere at the bottom. Rotation about X axis: swing = sin(phase + off)*amp*speedFactor. Paw should stay roughly on the ground; with short legs and small amp (0.5 rad) it's fine visually.
+
+Diagonal pairs: offsets FL=0, BR=0, FR=π, BL=π. (Trot gait.)
+
+Also add a slight lift: leg.position.y = hipY + max(0, sin(phase+off))*0.05 for the swing leg? Keep simple: rotate + small forward paw offset.
+
+Tail: tiny sphere/cone at back, slight wag.
+
+Eyes: white-ish sphere + black pupil slightly in front; plus a tiny specular dot (small white sphere) — cute. Cheeks: two spheres at sides of the head, fur-colored but slightly lighter. Nose: small pink sphere/cone at the front tip. Whiskers: thin lines? Could add LineSegments with 6 whiskers — nice detail, cheap. Yes, add whiskers as a single LineSegments per hamster (or merged) — 12 lines per hamster ×5 = fine.
+
+Ears: 2 groups at head top-sides, each with outer (sphere flattened, fur color) + inner (smaller sphere, pink). Twitch = rotation.z oscillation on trigger.
+
+Head group: at (0, 0.62, 0.6) so it can nod (rotation.x) and tilt (rotation.z). Head mesh inside at local origin.
+
+Breathing: bodyGroup.scale.y/z modulated by sin(t*breathRate)*0.02; when idle stronger, plus head bob.
+
+Picker: invisible Sphere mesh radius 0.9 covering the hamster, `raycast` enabled, userData.hamster = h. Use a separate group so it doesn't affect shadows (visible=false meshes are skipped by raycaster... Actually Raycaster ignores `visible:false` objects? In r128, `Raycaster.intersectObject` checks `object.visible === false → return` in intersectObject? Let me recall: `function intersectObject(object, raycaster, intersects, recursive) { if (object.layers.test(raycaster.layers)) { object.raycast(raycaster, intersects); } if (recursive===true) {...} }` — I believe r128 does NOT check visible in the raycast path... Hmm. Actually in three.js, `Raycaster.intersectObject` does check: 
+```js
+function intersectObject( object, raycaster, intersects, recursive ) {
+	if ( object.layers.test( raycaster.layers ) ) {
+		object.raycast( raycaster, intersects );
+	}
+	...
+```
+No visibility check in r128 (visibility check was added later? I recall `if ( object.visible === false ) return;` existed in older versions of `intersectObject`). To be safe, use a material with transparent:true, opacity:0, depthWrite:false, colorWrite:false — visible=true but invisible. That definitely raycasts and renders nothing. Use `material.colorWrite = false; material.depthWrite=false`. Good.
+
+#### Motion / steering
+```js
+function steer(h, dt) {
+  // desired velocity toward goal
+  const to = tmp.subVectors(h.goal, h.pos); to.y = 0;
+  const d = to.length();
+  if (d < h.arriveEps) { arrive }
+  to.normalize();
+  const desiredSpeed = h.maxSpeed * (state speed mult) * min(1, d/1.2) // slow near goal
+  // accel limit
+  h.speed += clamp(desiredSpeed - h.speed, -accel*dt, accel*dt)
+  // yaw turn toward goal with limited rate
+  h.yaw = lerpAngle(h.yaw, atan2(to.x, to.z), turnRate*dt)
+  h.vel.copy(to).multiplyScalar(h.speed)
+  const before = h.pos.clone()
+  h.pos.addScaledVector(h.vel, dt)
+  resolveCollisions(h)
+  const moved = h.pos.distanceTo(before) // фактический путь
+  h.stepPhase += (moved / h.stepLength) * TAU
+  h.footSpeed = moved/dt  (smoothed)
+}
+```
+Note: foot speed for the wheel runner is `runSpeed` (not world movement).
+
+Foot sliding: since legs rotate about the hip, at large swing amplitude there's visual sliding; keep amp modest and add a paw "plant" behavior? Simple approach: use standard sin swing with amplitude scaled by speed; acceptable.
+
+#### States implementation
+```js
+const ST = { IDLE:'idle', WALK:'walk', WHEEL_IN:'wheel_enter', WHEEL_RUN:'wheel_run', WHEEL_OUT:'wheel_exit', TUBE_IN:'tube_travel', EAT:'eat', DRINK:'drink' };
+```
+Status text mapping with per-state variants: "бежит в колесе", "лезет в колесо", "вылезает из колеса", "ползёт по трубе", "грызёт зёрна", "пьёт из поилки", "идёт к миске", "бродит по клетке", "обнюхивает воздух", "стоит, дышит".
+
+For walking with intent: `h.intent` ∈ 'wheel'|'tube'|'bowl'|'water'|'wander', and goal computed accordingly (approach point). Status text: `идёт к миске`, `идёт к колесу`, `лезет в трубу`... 
+
+Wheel approach point: entry stand at `wheel.entryPoint = (C.x - halfW - 1.3, 0, C.z)` facing -X... he walks to that point, then ENTER: interpolate along a path from entryPoint to wheel interior contact position:
+```
+p(t) = lerp(entryPoint, contactPos, easeInOut(t)) but with an arc: add +x? 
+```
+Path: from (C.x - W2 - 1.3, 0, C.z) to (C.x, floorY_in_wheel, C.z) where floorY_in_wheel = C.y - R (contact height). Yaw from facing... During entry he should move mostly along X but end facing +Z. Interpolate yaw from -90° (facing -X) to 0° (facing +Z) with easing — plus a slight "spiral" so it looks like he turns while stepping in. To make it look natural, use a quadratic Bezier through a control point at (C.x - W2*0.4, ..., C.z - 0.9)? Hmm, that would make him approach from -Z side. Let's use a bezier: P0 = entry (x=C.x-W2-1.3, z=C.z), P1 = (C.x - W2*0.2, C.z - 1.1), P2 = (C.x, C.z). So he curves around as he steps in, ending at the bottom contact facing +Z. Nice — it reads as "steps through the opening and turns".
+
+Wait: does the path cross the drum's side wall? The opening is the circular face at x = C.x - W2 (the -X face of the drum). Crossing at x = C.x - W2 happens near z ≈ C.z - 0.55 (from bezier) — inside the circle of radius R=1.73 ✓ and y from 0 to 0.35 → within the opening's vertical extent at that z: half-chord = sqrt(R² - 0.55²)=1.64, so the opening spans y from C.y-1.64 to C.y+1.64 = (R+0.35-1.64)=-0.09... wait C.y = R + 0.35 = 2.08; bottom of inner surface at C.y - R = 0.35. Opening at z-offset 0.55 spans y ∈ [C.y - 1.64, C.y + 1.64] = [0.44, 3.72]. His feet are at y≈0.1-0.35 when crossing... his feet at 0.35 exactly? At the crossing moment (t≈0.5), y ≈ lerp(0, 0.35) ≈ 0.2 → below the opening's bottom edge (0.44) → his body would intersect the rim shell near the bottom. Hmm! Because the drum's bottom is above the floor, the lower part of the side face is blocked by the curved shell.
+
+Fix: reduce wheel ground clearance so the drum's inner bottom is at y≈0.12 (C.y = R + 0.12). Then at z-offset 0.55, opening spans y ∈ [C.y - 1.64, ...] = [0.56... no: C.y = 1.85, opening bottom = 1.85-1.64=0.21. His feet at 0.1 and body top at ~1.1 → the shell near the bottom edge of the side face at y up to 0.21 → his body from 0.1..1.1 vs blocked region below 0.21 — only 0.11 of overlap with his feet/legs, which is basically a small step he climbs over. That's realistic! He steps up onto the rim edge (a 0.1-0.2 step). Good: clearance 0.15 and I'll make the entry path lift y from 0 to 0.15 (contact height) with easing, so at crossing time his feet are at ~0.08 and he "climbs" the low edge. Visually fine — real hamsters do push into the wheel.
+
+Also add a small bedding mound / wooden ramp under the entry side to justify it! Nice touch: a little ramp block from floor up to 0.15 at the entry, so he walks up the ramp and into the wheel. Lovely and honest. Let's add a small wooden platform/ramp in front of the wheel opening (a wedge). Then the entry path y goes 0 → ramp top 0.15 → wheel contact 0.15. 
+
+Let me set: `КОЛЕСО_ЦЕНТР.ы = R + 0.16` so inner bottom (contact) at y=0.16. Ramp: box from x = C.x - W2 - 2.2 to C.x - W2 + 0.3, height tapering... Use a rotated thin box (wedge) with top surface at 0.16 at the wheel mouth. Simple: BoxGeometry(2.4, 0.32, 3.2) rotated slightly about Z by ~-0.07 rad, positioned so its top face goes from y≈0 at outer end to 0.16 at the mouth. Good enough.
+
+Actually simpler: a few stacked flat wooden slats forming steps (2 steps). Cute and easy: slat1 top 0.08 (x range wider), slat2 top 0.16 (nearer wheel). Let's do 2 slabs.
+
+Tube entry: tube rests on the floor with inner bottom at y=0 → no step needed ✓. But visually a cylinder resting on the floor: its silhouette is fine. Add two small support rings/crates so it doesn't look like it'd roll: little wooden blocks under it at both ends? A cylinder tangent to the floor is stable-looking enough if we add two "chocks" (small boxes at the sides near the bottom). Add chocks.
+
+Tube travel path: enter end z_end_near = C.z - L/2 (or +), position x=C.x, y=0 (inner bottom = center.y - R = 0), z from (C.z - L/2 - 1.2) [approach point outside] → through the opening → C.z - L/2 → ... → C.z + L/2 → out to C.z + L/2 + 1.2, then resume free walking. Direction: choose based on approach side (whichever end is nearer). Yaw inside = facing along travel direction (±Z). x locked exactly to C.x → axis deviation 0 ✓. y = innerFloorY + tiny bob from gait (bob only on bodyGroup) ✓.
+
+While inside, disable obstacle push-out (he's legitimately in the tube).
+
+Transition smoothness: the approach point is reached by walking (state WALK with intent 'tube'), then state TUBE_IN handles both entry and traversal continuously — no teleport ✓.
+
+#### Eating
+Goal = bowl approach point (bowl center + direction from hamster * (R_bowl + 0.62)). On arrive → EAT state: head tilts down (headGroup.rotation.x = -0.5 → forward-down), chew animation (jaw/mouth scale + head bob small), status "грызёт зёрна". Seeds in the bowl subtly jitter/disappear-reappear? Nice: a few seed instances sink and rise to simulate eating. Simple: scale seeds count down over time and refill (bowl refills). Let's animate individual seed y-offsets randomly when he eats.
+
+#### Drinking
+Approach the water bottle spot, head tilts UP, front paws raised toward the spout? Add a "lick" animation: head bob up-down small + tiny water droplet particles? Keep: head tilt up, tiny tongue mesh appears and moves. Status "пьёт из поилки". Also drip animation on the spout periodically (a small sphere falling and splashing). Nice living detail.
+
+#### Idle
+Breathing scale, occasional ear twitch, occasional head turn/yaw look-around, blink? Eyes: blink by scaling eyelid? Simpler: scale pupil/eye y briefly — do "blink" by scaling eye meshes' Y to 0.1 for 0.08s occasionally. Cute.
+
+#### Camera focus
+`focusOn(h)`: animate controls.target toward h.pos over ~0.8s (lerp) and camera distance slightly; then release after a few seconds? Provide "Следить" toggle per selected hamster. I'll implement: clicking a roster row selects & follows (target lerps to him continuously while followed), clicking again unfollows. Add keyboard 1-5 too, R to reset view.
+
+#### HUD structure
+```html
+<div id="app">
+  <canvas/>
+  <div class="hud">
+    <header class="masthead"> ... </header>
+    <aside class="roster">...</aside>
+    <aside class="telemetry">...</aside>
+    <footer class="hints">...</footer>
+  </div>
+</div>
+```
+Masthead: big display type "ХОМЯКИ" + subtitle "и честная физика" + a small live clock/fps. Roster: 5 rows with color dot, name, status, mini speed bar, and a "foot-phase" indicator (a small tick that advances with stepPhase — visual proof that phase freezes when stopped!). That's a great micro-interaction: a tiny phase dial per hamster.
+
+Telemetry panel: 
+- "КОЛЕСО": occupant name, ω (rad/s), v_лап, v_обода = |ω|R, Δ%, angle°, plus a horizontal bar comparing the two speeds; state chip "под бегуном / на выбеге".
+- "ТРУБА": occupant, отклонение от оси X, лапы над внутренним дном, положение вдоль оси (z as % of length).
+- "ПРОВЕРКИ": 6 chips with live PASS/— and numbers.
+- Collisions: "выталкиваний: N".
+
+Also a legend of controls. Add buttons: "Дать всем корм" (all go to bowl), "Стоп/пауза", "Ускорить выбег колеса"? A nice control: "разогнать колесо рукой" to demo decay. Let's add small ghost buttons: [⟳ раскрутить колесо] [🎯 все к миске] [⏸ пауза]. Micro-interactions with hover.
+
+Also a mobile fallback: panels collapse; keep it simple with media queries (roster becomes horizontal scroll at bottom).
+
+Let me also add a subtle "grain" overlay and vignette via CSS pseudo-elements, plus animated scanline? Keep tasteful: radial vignette + noise SVG data URI at low opacity, pointer-events none.
+
+Performance: shadows for 5 hamsters + cage + props; fine.
+
+Now, writing the code. It's long; let me be organized and careful.
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Хомяки в колесе — честная физика</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;800&family=Manrope:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>...</style>
+</head>
+<body>
+ <div id="stage"><canvas id="c"></canvas></div>
+ <div class="grain"></div>
+ <div class="hud">...</div>
+ <script src="three r128"></script>
+ <script src="OrbitControls"></script>
+ <script>...</script>
+</body>
+</html>
+```
+
+CSS palette:
+- ink: #0e1418 / #121b21 panels with border rgba(255,255,255,.08), backdrop-blur small. I don't want glass everywhere — it reads generic and hurts legibility over a busy scene. So mostly solid panels with a slight blur only on the masthead. Let's use solid dark panels with 1px borders and a colored top edge accent; keep them mostly opaque (rgba(12,18,22,.92)).
+- Accents: amber #f5a524, mint #4fd6a8, coral #ff6b57, sky #7cc4ff. Several accents suit the multi-species roster better than one lone neon.
+- Type: display Unbounded 800 uppercase tight tracking for the title (huge, e.g., clamp(38px, 5vw, 76px)), body Manrope, numbers JetBrains Mono. Strong size contrast ✓.
+
+Layout: 
+- masthead top-left (fixed), roster left-bottom column width 300, telemetry right column width 330 top-right, hints bottom-center small.
+
+Let me write the JS now in detail.
+
+```js
+const TAU = Math.PI*2;
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+function lerpAngle(a,b,t){ let d=((b-a+Math.PI)%TAU+TAU)%TAU-Math.PI; return a+d*t; }
+const easeInOut=t=>t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+```
+
+Scene setup, renderer, camera, controls, lights, room, cage, props, hamsters, sim loop, HUD update, events.
+
+**Materials**: use MeshStandardMaterial with roughness/metalness. Fur: roughness 0.95, metalness 0. Use flatShading false.
+
+**Fur texture?** Could add a subtle noise bump via canvas texture as `roughnessMap`. Let's create a canvas "fur" noise texture used as bumpMap for the body — cheap and adds life. Yes: generate a 128×128 noise canvas, use as bumpMap with bumpScale 0.02 and repeat (4,4).
+
+**Wood texture**: canvas with grain lines.
+
+Let me write helper `makeNoiseTexture(size, base, contrast)`.
+
+Now the hamster builder:
+
+```js
+function createHamster(cfg){
+  const g = new THREE.Group();
+  const fur = new THREE.MeshStandardMaterial({color:cfg.fur, roughness:.92, bumpMap:furBump, bumpScale:.015});
+  const furDark = ... (patch)
+  const belly = new THREE.MeshStandardMaterial({color:cfg.belly, roughness:.95});
+  const pink = new THREE.MeshStandardMaterial({color:0xf0a7ac, roughness:.6});
+  const dark = new THREE.MeshStandardMaterial({color:0x241a18, roughness:.35});
+  const white = new THREE.MeshStandardMaterial({color:0xf7f2ea, roughness:.25});
+
+  const body = new THREE.Group(); g.add(body); // breathing/bob
+  const torso = new THREE.Mesh(new THREE.SphereGeometry(.6,22,16), fur);
+  torso.scale.set(1.0,.72,1.3); torso.position.set(0,.5,-.05);
+```
+Semi-axes: x .6, y .432, z .78 → length 1.56, width 1.2, top at .932. Hmm ШИРИНА_ЗВЕРЯ=0.95 but body width 1.2 — mismatch. Let's scale torso to (0.82, 0.72, 1.28) → width 0.98 ✓ (matches ШИРИНА 0.95), length 1.54, height semi .432.
+
+Body center y: legs short, body bottom near ground: position.y = 0.5 → bottom 0.068, top 0.932.
+
+Belly: sphere scaled (0.72, 0.5, 1.1) at (0, .42, .02), lighter color, slightly forward-down — it will intersect the torso; render as a separate mesh slightly outside? Use belly as a flattened sphere positioned a bit lower so its lower surface protrudes below the torso: center y=0.40, semi-y 0.45 → bottom -0.05 (below ground!). Hmm. Instead make belly an ellipsoid scaled (0.7,0.44,1.02) at y=0.46 — it will be inside the torso mostly and only visible where it pokes out. Better approach: make the belly a slightly smaller sphere placed with center offset downward by 0.06 so it protrudes ~0.06 → creates a two-tone underside. With z-fighting risk if surfaces nearly coincide. Use radius .59 scaled (0.80, 0.70, 1.26) at y=0.43 vs torso r .6 scaled(0.82,.72,1.28) at y=0.5. Torso surface at bottom: 0.5-0.432=0.068. Belly bottom: 0.43 - 0.59*0.70=0.43-0.413=0.017 → protrudes 0.05 below torso ✓ no z-fighting (they're separated). At the sides: torso x extent = .6*.82=.492; belly = .59*.80=.472 → inside ✓. Front/back: torso z = .6*1.28=.768; belly .59*1.26=.743 → inside ✓. Good — belly visible only on the underside.
+
+Head group at (0, 0.62, 0.66). Head mesh: sphere r .34 scaled (1, .92, 1.05) at local (0,0,.02). Top of head world y = .62+.31=.93 plus muzzle lower. Ears at (±.22, .87? ) relative to head group: local (±.2, .22, -.02), radius .14 sphere flattened; inner pink r .085 at slightly forward.
+
+Eyes: at head local (±.19, .07, .26) sphere r .075 white-ish dark? Hamster eyes are black beads. Use dark sphere r .08 + a smaller white specular dot r .022 in front, and an "eyeWhite" isn't needed. But spec says "глаза со зрачками" — so make: eyeball = light amber/white sphere r .085, pupil = dark sphere r .05 placed slightly forward. OK: sclera material off-white, pupil near-black. Blink: scale eyeball group Y.
+
+Cheeks: spheres r .17 at (±.2, -.05, .16) fur color lighter tone.
+Muzzle/nose: small pink sphere r .055 at (0,-.02,.34); plus two tiny nostril dots? skip.
+Whiskers: LineSegments with 6 lines from muzzle sides.
+
+Legs: 4 groups at (±.3, .3, ±.42): hip y=.3. Each leg: mesh cylinder r .1 h .22 positioned at (0,-.11,0), paw sphere r .11 at (0,-.24,.03). Foot bottom ≈ .3-.24-.11 = -0.05 → slightly below ground; adjust hip y to .32 and leg length so foot bottom at 0: paw center y local -.22, world .10, radius .11 → bottom -0.01. Close enough; set hip y = .33.
+
+Tail: cone/sphere r .07 at (0,.45,-.8) pointing back, slight curve with 2 spheres.
+
+Picker sphere r .95 at (0,.55,.05) invisible.
+
+All meshes castShadow=true (picker false), receiveShadow for body maybe true.
+
+Store refs: h.parts = {bodyGroup, head, ears:[gL,gR], eyes:[gL,gR], legs:[fl,fr,bl,br], tail, cheeks}.
+
+Now hamster animation update:
+
+```js
+function animateHamster(h, dt, t){
+  // gait
+  const moving = h.state===WALK||... ; 
+  const swing = 0.55 * clamp(h.gaitSpeed/ h.maxSpeed,0,1.3);
+  const ph = h.stepPhase;
+  const offs = [0, Math.PI, Math.PI, 0]; // FL, FR, BL, BR  (diagonal pairs)
+  h.parts.legs.forEach((leg,i)=>{
+     const s = Math.sin(ph + offs[i]);
+     leg.rotation.x = s*swing;
+     leg.position.y = leg.userData.hipY + Math.max(0, Math.cos(ph+offs[i])) * 0.05 * swingFactor;
+  });
+```
+Hmm for a trot: legs in the same diagonal pair move together: FL & BR together, FR & BL together → offsets [0, π, π, 0] with order FL,FR,BL,BR gives FL=0, FR=π, BL=π, BR=0 ✓.
+
+Body bob: `bodyGroup.position.y = Math.abs(Math.sin(ph))*0.035*speedN` (twice per cycle). Plus breathing when idle.
+
+Head: nod with gait slightly; tilt for eating; up for drinking; look-around yaw noise when idle.
+
+Ear twitch: `earT` timer; when active, rotation.z += sin(t*40)*0.35 decaying.
+
+Breathing: `const br = 1 + Math.sin(t*h.breathRate + h.phase)* (h.state===IDLE?0.035:0.012); bodyGroup.scale.set(1, br, 1/… )`. Apply to torso+belly only? Applying to bodyGroup scales the legs too (they're children of root, not bodyGroup — I'll put legs outside bodyGroup so they don't scale). Structure: root → [bodyGroup (torso, belly, head, tail), legs..., picker]. Head inside bodyGroup so breathing moves it slightly; fine.
+
+Jump physics: `h.jumpY` velocity; y = max(0, ...); apply to root.position.y. Also tuck legs during jump (spread). Landing squash: scale.y briefly 0.9.
+
+Now the wheel runner's position update:
+```js
+if (h.state===ST.WHEEL_RUN){
+  // decelerate/accelerate run speed
+  h.runSpeed = approach(h.runSpeed, h.runIntent? h.runMax : 0, RUN_ACCEL*dt);
+  h.footSpeed = h.runSpeed;
+  const dist = h.runSpeed*dt;
+  h.stepPhase += dist/h.stepLength*TAU;
+  // position: bottom contact point of the rim
+  h.pos.set(wheel.center.x, wheel.contactY, wheel.center.z);
+  h.yaw = wheel.hamsterYaw; // facing +Z (0) 
+  // gait bob relative to contact
+}
+```
+`wheel.hamsterYaw`: with model facing +Z and yaw measured from +Z toward +X: yaw=0 → facing +Z ✓.
+
+Facing +Z means he runs "toward the front of the cage" while the rim goes -Z ✓.
+
+Entry/exit interpolation:
+```js
+// ENTER
+h.enterT += dt/h.enterDur; t=easeInOut(clamp01)
+pos = bezier(P0,P1,P2,t); yaw = lerpAngle(yawStart, 0, smoothstep(0.25,1,t)); y from ramp top to contactY
+when t>=1 → state=WHEEL_RUN, runIntent=true
+```
+Also during entry, the step phase advances by the path length traveled (use actual displacement) — good.
+
+EXIT: reverse bezier from contact to entry point, yaw from 0 to -90°(facing -X). During exit, the wheel keeps the runner's last speed briefly? Realistic: as he leaves, the wheel keeps spinning and decays. So at exit start: set `wheel.occupant=null` immediately (so ω starts decaying from last value) — but then the wheel spins while he's still inside... physically he'd be dragged/tumble. Better: keep occupant until he's out, but during exit his runSpeed ramps to 0 with a decel that also slows the wheel — realistic (he drags his paws). Then on completion ω=0. For the "startle bail" case we want visible coasting: implement `exitMode:'coast'` where at exit start we hand over the wheel's current ω to free decay and he hops out quickly (0.6s). Hmm, physically if the wheel is spinning at 2 rad/s and he steps out, the wheel would keep coasting (its own inertia) — yes that IS realistic. So: on exit, `wheel.occupant = null` right away and ω decays with friction; he exits over ~0.9s while the wheel coasts down. Nice demo of check #2. But during those 0.9s he's inside a spinning drum without driving it — his feet would slip; visually acceptable if we keep his step phase advancing at rim speed (feet slipping on the surface = honest "скольжение" but that's what happens). Let's do: during exit, phase advances from rim speed (like the run), and the wheel decays. That's honest and shows friction. 
+
+For a normal calm exit (after the run ends), runSpeed already ramped to 0 → ω=0 → clean exit ✓.
+
+Now `wheel.occupant` semantics: use `wheel.user` for exclusive occupancy claim, and `wheel.driver` for who drives. Let's keep one field `wheel.occupant` set at ENTER start (exclusive claim), cleared at EXIT end. And in the physics update: if occupant && occupant.state===RUN → ω = s*v/R; else if occupant (enter/exit) → free decay (he's not driving) — but during ENTER he's walking in, the wheel shouldn't spin... it will be at 0 anyway. During exit → decay ✓.
+
+Hmm: during ENTER, if the wheel happens to be coasting from a previous bail, the entering hamster would be hit by a moving surface. Rare; and we can make entry require `Math.abs(omega) < 0.3` (else choose another activity). Nice detail: "колесо ещё крутится — не лезет". Let's implement that check in activity selection.
+
+#### Tube travel
+```js
+h.tubeT: distance along axis from entry end; total = L + 2*approach (outside both ends)
+```
+Simplify: state TUBE with `tubeFrom` sign, and h.pos driven by z from (entryZ - 1.4*dir) to (exitZ + 1.4*dir), x=C.x, y=0. When beyond the exit + 1.2 → return to WALK with a fresh wander goal. During the outside parts he's still walking straight along Z — fine, but collisions should apply while outside the tube footprint... his path is along the axis so he's inside the footprint only between the ends. Just disable push-out during TUBE state entirely; the scripted path is guaranteed non-penetrating ✓.
+
+Compute `tube.axisDeviationX = Math.abs(h.pos.x - tube.center.x)` → 0.
+`tube.footAboveInnerFloor = h.pos.y - tube.innerFloorY` → 0.
+`tube.alongAxis = (h.pos.z - C.z)`.
+
+#### Obstacle violation counter
+Each frame, for hamsters in "free" states (IDLE, WALK, EAT, DRINK), test if their body center is inside any collider region (with a small tolerance) → increment `sim.violations` and force-resolve. Displayed as "сквозь стенки прошёл: 0".
+
+#### Bedding InstancedMesh
+```js
+const chipGeo = new THREE.BoxGeometry(0.34, 0.05, 0.1); // щепка
+const chips = new THREE.InstancedMesh(chipGeo, mat, 900);
+// random positions in cage interior, random rotation Y + slight tilt X/Z, y ~ 0.02..0.08
+// instanceColor: varied straw tones
+```
+Also a second InstancedMesh for tiny pellets? Skip; maybe add longer shavings with a different geometry in the same mesh via scale variety ✓ (scale per instance).
+
+Also chips should avoid overlapping props a bit — random is fine visually.
+
+#### Bars InstancedMesh
+CylinderGeometry(0.075, 0.075, barH, 8) with metal material; positions along the 4 sides at spacing 0.52; also vertical corner posts thicker.
+
+Top frame: 4 boxes (0.26 x 0.3 x length) at top perimeter + a mid rail on each side + bottom rail. Plus a "lid" of horizontal bars across the top? Nice: a few crossbars on top. Let's add top lid rails: 6 bars along X spanning the top, plus the frame.
+
+#### Water bottle
+Cylinder (r .42, h 2.2) transparent plastic (MeshPhysicalMaterial? r128 has MeshPhysicalMaterial with transmission — use transparent standard material with opacity .35, roughness .1) + water inside (cylinder, blue-ish, opacity .6) + metal spout (small cylinder + ball) + holder ring wires. Position: attached to the right wall bars at x=10.6, z=5.2, bottom y=0.9 → spout tip at (10.2, 0.75, 5.2). Drinking spot: (9.5, 0, 5.2) facing +X (yaw = π/2).
+
+Hmm the bottle would be inside the bars region — place it just inside the cage wall so it's visible. Fine.
+
+Drip animation: small sphere falls from the spout periodically and disappears at floor level; reset. Cute living detail.
+
+#### Bowl
+Lathe geometry for a ceramic bowl: points forming a bowl profile → LatheGeometry. r=1.15, h=0.42. Seeds: InstancedMesh of small spheres (icosahedron r .07) 90 instances arranged in a mound inside the bowl.
+
+#### Wheel build
+```js
+const wheelGroup = new THREE.Group(); wheelGroup.position.copy(wheel.center);
+// drum shell
+shell = Mesh(CylinderGeometry(R+0.14, R+0.14, W, 28, 1, true), plasticMat side:DoubleSide) rotation.z = π/2 (cylinder axis Y → X)
+// rungs: 14 boxes across the width at radius R+0.02, rotated about X by i*TAU/14
+// side rims: Torus(R+0.07, 0.075) at x=±W/2, rotated to lie in YZ plane (rotation.y = π/2)
+// back plate spokes on the far side: thin boxes from hub to rim at x = -W/2 - 0.03? 
+// hub cylinder along X + axle cylinder longer
+// stand: base box + post + arm
+```
+Cylinder default axis = Y. To make the axis along X: `mesh.rotation.z = Math.PI/2`. For a Torus, its ring lies in the XY plane with the hole axis along Z; to have the hole axis along X: rotation.y = π/2 ✓.
+
+Rungs: BoxGeometry(Ш_ОБОДА-0.02, 0.06, 0.22) positioned at (0, cos? ) — place each rung at angle θ about the X axis: position (0, R*sin? ). Let's do: for rung i, θ = i*TAU/N; position.y = Math.cos(θ)*R_in_eff... Simplest: create a group `drum` (rotation.x = angle), and for each rung: a mesh at (0, 0, 0) with rotation.x = θ and position (0, R*? ) hmm. Use: `rung.position.set(0, Math.cos(θ)*rr, Math.sin(θ)*rr); rung.rotation.x = -θ;` Let's verify: a box with default orientation has its long axis along X (width = Ш) and thickness in Y and Z. We want it tangent to the circle at angle θ where the position is (0, R cos θ, R sin θ). The tangent direction in the YZ plane at that point is (0, -sin θ, cos θ). The box's local Z axis after rotation.x = φ maps to (0, -sin φ, cos φ). So we need -sin φ = -sin θ and cos φ = cos θ → φ = θ. And its local Y maps to (0, cos φ, sin θ...) = (0, cos θ, sin θ) = radial ✓. So `rung.rotation.x = θ; rung.position.set(0, R*cos θ, R*sin θ)` with the box being thin in Y (radial) and short in Z (tangential width 0.2). 
+
+Then the contact surface: rungs at radius R_rung where the hamster's feet rest: define `R = R_ОБОДА` as the running radius = distance from the axis to the top of the rungs. So rung center radius = R - thickness/2. Set rungThickness 0.1 → rung center at R-0.05.
+
+And the shell (outer) at radius R + 0.06 with the rungs' outer face flush-ish. Fine.
+
+Also add a subtle "grit" (bedding bits) inside? skip.
+
+Wheel shadow: shell casts shadow — nice stripes on the floor as it spins! Great motion cue.
+
+#### Tabletop props
+- Books stack (3 boxes with different colors) near the cage, a mug (cylinder + torus handle), a small plant pot? A desk lamp above: cone shade + pole + point light. Add a wheel-shaped hamster ball? Nah.
+- A framed poster on the back wall (plane with canvas texture: abstract "гербарий" or text). Let's make a canvas texture with a schematic drawing of a wheel — cheeky and characteristic! Actually the 3D scene is the hero here, so the masthead should be compact and the scene dominant. Fine.
+
+Room: floor with wood texture (large plane, repeat), back wall (plane) with paint color + subtle noise, baseboard box, and maybe a second wall at x=-side for corner depth. Add soft shadow on the wall from the window light? A "window light patch" on the wall as an emissive-ish plane? Could be nice: a parallelogram of warm light on the back wall (a plane with additive material). Let's add a subtle light patch.
+
+OK, time to write. I need to keep the code organized and complete. Let me write it out.
+
+Also `window.sim` exposure:
+```js
+window.sim = { hamsters, wheel, tube, bowl, water, colliders, state:{...}, checks(), ... };
+```
+And `window.hamsters = hamsters; window.wheel = wheelObj; window.tube = tubeObj;`.
+
+Checks function returning an object of numbers for external reading:
+```js
+function runChecks(){
+  return {
+    wheelRimVsFootMismatchPct: wheel.mismatchPct,
+    wheelOmega: wheel.omega,
+    wheelRimLinearSpeed: wheel.rimSpeed,
+    wheelEmptyOmegaDecay: ...,
+    runnerFootAtLowestPointError: ...,
+    bodyMaxRadiusVsR: ...,
+    tubeAxisDeviationX: ...,
+    tubeFootAboveInnerFloor: ...,
+    obstaclePenetrations: sim.violations,
+    phaseDriftWhenStopped: ...
+  };
+}
+window.runChecks = runChecks;
+```
+
+For "runnerFootAtLowestPointError": distance between the runner's foot position and the theoretical lowest point of the rim: `Math.hypot(h.pos.x-C.x, ...)` plus angular deviation: the angle between (h.pos - C) and straight-down. Since we place him exactly at the bottom, error = 0. Compute honestly from actual positions:
+```js
+const v = new THREE.Vector3(h.pos.x - wheel.center.x, h.pos.y - wheel.center.y, h.pos.z - wheel.center.z);
+// точка касания нижней точки — вектор (0,-R,0)
+const err = Math.hypot(v.x, v.z) + Math.abs(-v.y - wheel.R); // 0
+```
+Good.
+
+Also "габарит зверя меньше радиуса": measure the actual body bounding sphere in the wheel plane from Box3 corners as described.
+
+Now let's write out all code carefully. I'll aim for clean, complete implementation.
+
+Details on HUD update: update DOM text every ~4 frames to save perf (or every frame is fine, it's small). Use a 10 Hz refresh for text and rAF for the phase dials (CSS transform via style — do at 30Hz).
+
+Let me write the roster row markup generated in JS from the hamsters array.
+
+```html
+<li class="hrow" data-i="0">
+  <span class="dot" style="--c:#e8a94b"></span>
+  <div class="hmeta"><b>Пыж</b><span class="st">бежит в колесе</span></div>
+  <svg class="dial">…</svg>  // simpler: a div with conic-gradient showing phase
+  <div class="bar"><i style="width:60%"></i></div>
+</li>
+```
+Phase dial: use a small div with `background: conic-gradient(#f5a921 var(--p), transparent 0)` and rotate — or just a 4-dot gait indicator: 4 small squares that light up per leg state. That's cooler: shows the diagonal pairs! 4 dots (FL FR BL BR) that scale/opacity with sin(phase+offset). Great visual proof of the trot gait and phase freezing. Let's do it — cheap DOM updates via transform/opacity.
+
+Let me now also handle `pointerdown` on canvas → raycast pickers → jump; and hover to highlight (cursor pointer + a ring under the hamster?). Add a selection ring (a torus on the ground) under the hovered/followed hamster with an accent color.
+
+Idle camera drift: if no user interaction for 12s, slowly rotate `controls.autoRotate = true` with speed 0.25; disable on interaction. Nice touch. Use controls.autoRotate + autoRotateSpeed and reset on pointerdown.
+
+Let me write the final code.
+
+One more: "При потере кадров дельту ограничивать сверху" → `dt = Math.min(0.05, clock.getDelta())`.
+
+Resize handler ✓.
+
+Let me write the CSS with care for a crafted look:
+
+- Background page color #0b1014 (behind canvas).
+- Masthead: 
+```
+.masthead h1 { font-family:'Unbounded'; font-weight:800; font-size:clamp(30px,4.4vw,62px); line-height:.86; letter-spacing:-.03em; text-transform:uppercase; color:#f5efe6 }
+.masthead h1 em { display:block; font-style:normal; color:#f5a921; -webkit-text-stroke...}
+```
+Add a small kicker "диорама · three.js r128 · 5 хомяков" in mono uppercase with letter-spacing, and a thin accent rule.
+- Panels: `background:linear-gradient(180deg, rgba(16,23,28,.94), rgba(11,16,20,.9)); border:1px solid rgba(255,255,255,.09); border-radius:14px;` with a top accent line `::before` 2px gradient amber→mint.
+- Section headers: mono 10px uppercase tracking .18em color #7f8f99.
+- Numbers: mono 700, tabular.
+- Chips: pill with status colors; `.chip.ok{color:#0b1014;background:#4fd6a8}` etc.
+- Rows hover: translateX(3px), background lighten, left accent bar scaleY.
+- Entrance animation: `@keyframes rise` staggered with animation-delay per panel.
+- Buttons: small ghost with border, hover fill amber + ink text, active scale .96.
+- Grain overlay: SVG feTurbulence data URI, opacity .05, mix-blend-mode overlay.
+- Vignette: radial-gradient fixed overlay.
+- Media query < 900px: panels shrink, telemetry collapses to a row at the bottom with horizontal scroll; roster max-height smaller.
+- Also a collapse toggle button for panels on small screens? Add a "⤢" button to hide HUD (key H). Nice.
+
+Let's write everything now. I'll be careful with three.js r128 API specifics:
+- `THREE.sRGBEncoding`, `renderer.outputEncoding` ✓
+- `renderer.physicallyCorrectLights` — if true, light intensities need different values; keep false.
+- `InstancedMesh` + `setColorAt` requires `instanceColor.needsUpdate` ✓ and material must have vertexColors? No — InstancedMesh instanceColor works with standard materials automatically in r128 (it defines USE_INSTANCING_COLOR). ✓
+- `THREE.PCFSoftShadowMap` ✓
+- `LatheGeometry` ✓ (points as Vector2 array)
+- `TorusGeometry(radius, tube, radialSegments, tubularSegments)` ✓
+- OrbitControls from examples/js → `THREE.OrbitControls` ✓
+
+Careful: r128 `SphereGeometry(radius, widthSegments, heightSegments, phiStart...)` ✓.
+
+For the wedge/ramp: BoxGeometry rotated about Z.
+
+Let me write out the code in full now.
+
+For the hamster colors and names:
+1. Пыж — golden #e2a04a, belly #f6e6cf
+2. Бублик — cinnamon #c56a34, belly #f3ddc4
+3. Тумба — grey agouti #8b8178, belly #ded6cb, back patch darker
+4. Снежана — cream #f0e4d2 with grey patches, belly white
+5. Граф — dark chocolate #4a3a30, belly #b9a48f
+
+Good contrast against the straw bedding (tan) — hmm, golden and cinnamon might blend with straw. Make the bedding cooler/greyer tan (#c9b489 → more muted grey-tan #b7a583) and hamsters saturated. Also each hamster gets a colored collar? Cute: a tiny colored ring/tag on the ear matching their UI color — helps identification. Add an ear tag (small box in accent color) ✓ and use that same accent as the UI dot and selection ring. 
+
+Let me finalize positions:
+- Cage interior: hx=11, hz=7.5 (bars at ±11.2 / ±7.7).
+- Wheel center: (7.0, R+0.16, -2.6), axis X. R=1.73 → C.y=1.89. Footprint: x∈[7±(0.95+0.16)]=[5.89,8.11], z∈[-2.6±1.79]=[-4.39,-0.81]. Entry from -X at x≈4.4.
+- Ramp slabs: at x∈[4.0,5.9], z∈[-4.0,-1.2]: slab A top 0.08 at x∈[4.0,5.0], slab B top 0.16 at x∈[5.0,6.0].
+- Tube: center (-5.6, R_t, 0.8), axis Z, L=7.2 → z∈[-2.8,4.4]. R_t=1.12 → C.y=1.12, inner floor y=0.
+- Bowl: (0.6, 0, 4.9) r=1.15.
+- Water bottle on the +X wall at z=5.6; drink spot (9.4, 0, 5.6).
+- Also a wooden hut/hideout? Not required but adds life: a small wooden house at (-8.5, 0, -5)? It'd need a collider too — spec lists colliders for wheel/bowl/tube only, but adding a hut with a box collider is fine and nice. Let's add a small hideout box (with a door opening) and a box collider; hamsters sometimes go "спать в домик"? That adds another state; keep it as scenery + collider only (they wander near). Actually let me skip the hut to reduce complexity... A cozy diorama wants a hut though. I'll add the hut as scenery with a collider, and hamsters may use it as a resting spot (state REST: "дремлет в домике") — hmm, more states. I'll add scenery + collider only. Actually — resting inside would be cute but the door orientation etc... skip; just scenery with collider.
+
+Also add a small ladder/ramp? No, enough.
+
+Wander goals must avoid colliders: sample random points, reject if inside any collider (expanded by 1.0) or too close to walls (margin 1.6).
+
+Now, the "approach point" for each activity must also be collision-free:
+- wheel: entry stand at (C.x - W2 - 1.5, 0, C.z) = (7-1.11-1.5= 4.39, 0, -2.6). Is that inside the wheel footprint? footprint min x=5.89 → 4.39 is outside ✓.
+- tube: approach near end at z = C.z - L/2 - 1.6 = -2.8-1.6 = -4.4, x=C.x=-5.6. Tube footprint x∈[-6.72,-4.48], z∈[-2.8,4.4] → the approach point at z=-4.4 is outside ✓.
+- bowl: approach at distance r+0.75 from the bowl center, in the direction from the bowl to the hamster's current position (so he comes from wherever) — then walk there; on arrival, EAT.
+- water: fixed spot.
+
+Collision radii: hamster "radius" for circle collisions ≈ 0.52 (half-width 0.475 + a bit). For box push-out use the same radius as an inflated box (Minkowski): inflate the box by 0.5 and treat the hamster as a point at his center. That's the standard honest approach ✓.
+
+Push-out for inflated AABB: compute dx1 = (max.x - p.x), etc.; find min penetration among 4; move along that axis.
+
+Also: after push-out, hamsters could get pushed into another obstacle — do 2 iterations over colliders.
+
+Also clamp inside cage: x ∈ [-hx+0.6, hx-0.6], z ∈ [-hz+0.6, hz-0.6].
+
+Now the tube footprint inflated by 0.5 → x∈[-7.22,-3.98], z∈[-3.3,4.9]. A hamster walking along the tube's outside would be pushed away ✓.
+
+Wheel footprint inflated: x∈[5.39,8.61], z∈[-4.89,-0.31]. Hmm, the wheel's actual footprint: halfX = W/2 + rimTube(0.075) ≈ 0.95+0.08=1.03 → let's use 1.05; halfZ = R+0.14(shell)=1.87. Inflated by 0.5: x∈[5.45,8.55], z∈[-4.96,-0.24]. The entry stand point (4.39) is outside ✓ (barely 1 unit).
+
+Now the water bottle spot at (9.4, 0, 5.6): wheel footprint max x=8.55 → fine.
+
+Alright. Also the drink spot: near the +X wall at x=9.4 (wall at 11) ✓.
+
+Let me now write the code. I'll write it in one go, carefully.
+
+Regarding `THREE.MathUtils` in r128 — exists as `THREE.MathUtils` ✓ (renamed from Math in r111).
+
+For the dust motes Points: use a BufferGeometry with random positions in a box above the cage; animate y drift slowly and wrap; material: PointsMaterial size .07, transparent, opacity .5, map = radial canvas texture, depthWrite false, blending Additive, color warm.
+
+Let me write the code now — final answer will be the full HTML.
+
+One more consideration on the HUD check chips (Part 5 list) — I'll render 6 rows:
+1. `|ω|·R vs v_лап` → value Δ% → PASS if <5 when running, "—" otherwise.
+2. `холостой выбег ω→0` → show current ω when empty; PASS if empty && |ω| < 0.05 after decay... Show "ω=0.00 · затухает" — mark PASS when empty and |ω| decreasing, IDLE when not applicable. Simpler: show `ω` and a bar shrinking; status = |ω|<1e-3 ? 'OK' : 'выбег'.
+3. `габарит < R обода` → show bodyR/R → PASS if <1.
+4. `отклонение от оси трубы` → value in units, PASS if <0.06 (when someone's inside) else "—".
+5. `проходов сквозь тела` → counter; PASS if 0.
+6. `фаза шага в покое` → show d(phase)/dt for the currently idle hamster(s); PASS if ~0.
+
+Great — implement `checks()` computing these live and update the chips' classes.
+
+For #6: track `h.phaseRate` = |Δphase|/dt smoothed; find any idle hamster → show max phaseRate among idle ones.
+
+Now write it. Also I should double check the wheel "one user" logic in activity selection:
+
+```js
+function pickActivity(h){
+  const options = [];
+  if (!wheel.user && Math.abs(wheel.omega)<0.25) options.push('wheel','wheel'); // weighted
+  if (!tube.user) options.push('tube');
+  options.push('bowl','wander','wander','water');
+  ...
+}
+```
+And status text when he wanted the wheel but it's taken: "колесо занято — бродит" for a moment. Nice touch: set `h.note = 'колесо занято'` shown briefly in the row. Let's implement a small `h.note` with a timer.
+
+Now writing final code. Length will be big; that's fine.
+
+Let me draft key functions concretely.
+
+```js
+// ---- HAMSTER ----
+function makeHamster(cfg, index){
+  const root = new THREE.Group();
+  const bodyG = new THREE.Group(); root.add(bodyG);
+  ...
+  return h;
+}
+```
+
+I'll write `h` as a plain object with `.root`, `.parts`, physics fields, and push to `hamsters`.
+
+Full update loop:
+
+```js
+function step(dt, t){
+  // 1. решения FSM
+  for (const h of hamsters) think(h, dt, t);
+  // 2. движение / интеграция + столкновения
+  for (const h of hamsters) move(h, dt);
+  // 3. физика колеса (из скорости лап бегуна)
+  updateWheel(dt);
+  // 4. позиции в специальном состоянии (колесо/труба) — после колеса
+  for (const h of hamsters) applySpecialPose(h, dt);
+  // 5. анимация
+  for (const h of hamsters) poseHamster(h, dt, t);
+  // 6. проверки + HUD
+}
+```
+Careful ordering: for wheel/tube states we set positions directly (scripted), and skip collision push-out.
+
+Let me restructure `move(h, dt)`:
+```js
+function move(h, dt){
+  if (h.state===ST.WHEEL_IN || h.state===ST.WHEEL_RUN || h.state===ST.WHEEL_OUT || h.state===ST.TUBE){
+     scriptedMotion(h, dt); return;
+  }
+  steerFree(h, dt);
+}
+```
+`scriptedMotion` handles entry bezier, run (fixed contact + phase from rim), exit bezier, tube axis motion. For the run case, the phase should be driven by the rim speed which is computed in updateWheel — order: compute wheel ω from h.runSpeed first? Let's do: in scriptedMotion for RUN, update h.runSpeed (accel toward intent) then set `wheel.driver = h`. Then updateWheel computes ω = s*v/R and rimSpeed. Then set phase using rimSpeed... but that requires a second pass. Simpler: in the RUN branch compute `v_rim = Math.abs(wheel.omega)*wheel.R` from the *previous frame's* ω (which equals v from last frame) — a 1-frame lag, negligible and still consistent (and honest: the rim drives the paws). Actually cleanest: order as
+1. think
+2. updateWheel(dt) — uses current h.runSpeed of the runner (set in think or previous pose step)
+3. scriptedMotion — uses wheel.rimSpeed for the phase
+4. collisions for free hamsters
+5. pose
+
+But ω depends on runSpeed which should be ramped with dt before computing ω. Put the runSpeed ramp in updateWheel's driver section: 
+```js
+function updateWheel(dt){
+  const d = wheel.user && wheel.user.state===ST.WHEEL_RUN ? wheel.user : null;
+  if (d){
+    d.runSpeed = approach(d.runSpeed, d.runTarget? d.runMax : 0, RUN_ACCEL*dt);
+    wheel.omega = d.wheelSign * d.runSpeed / wheel.R;
+  } else { decay }
+  wheel.angle += wheel.omega*dt;
+  wheel.rimSpeed = Math.abs(wheel.omega)*wheel.R;
+  ...
+}
+```
+Then scriptedMotion uses `wheel.rimSpeed` for the runner's phase and sets `d.footSpeed = d.runSpeed`. Mismatch = |rimSpeed - footSpeed|/footSpeed = exactly 0 ✓ (both from the same frame).
+
+Good ordering: think → updateWheel → move (scripted & free+collisions) → pose → checks.
+
+But careful: the runner's `runSpeed` is used by... nothing else. Fine.
+
+Now, when a runner is in RUN and we want him to eventually stop: `h.runTarget` toggles off after a random duration (6-14 s), he decelerates, then when runSpeed < 0.05 → state=WHEEL_OUT.
+
+Exit: bezier out over 0.9s; wheel.user stays until done? For coasting demo we want the wheel to decay during exit: set `wheel.driver = null` (i.e., treat as not driving) but keep `wheel.user` claimed. I'll separate: `wheel.user` (claim) and driving condition = `user && user.state===RUN`. During EXIT, no driver → decay ✓. 
+
+Now writing the actual final code. Also need `h.wheelSign = +1` (facing +Z).
+
+For the entry bezier, define in wheel object:
+```js
+wheel.entry = {
+  stand: new THREE.Vector3(C.x - halfW - 1.5, 0, C.z),
+  p0: stand.clone(), p1: new THREE.Vector3(C.x - halfW*0.4, 0.16, C.z - 1.0), p2: contact
+};
+```
+Wait — the contact point is at (C.x, 0.16, C.z). P1 at z = C.z - 1.0 means he swings toward -Z then comes back to C.z; combined with x increasing, that's a nice arc into the drum, ending facing +Z. Hmm: at t=1 he's moving in the direction P2-P1 = (C.x - (C.x-halfW*0.4), +1.0) = (+0.44, +1.0) → direction mostly +Z with some +X → his yaw should end near atan2(0.44,1.0)= 24°, not 0. Then in RUN he snaps to yaw=0 — a small discontinuity. Fix: make P1 = (C.x - halfW*0.15, 0.16, C.z - 1.4) → tangent at end = (0.16, 1.4) → 6.5° ✓ close to 0. And yaw lerp to 0 handles the rest. Good. Also the crossing of the drum mouth plane x = C.x - halfW happens around t≈0.35 where z ≈ ... Bezier: B(t) = (1-t)²P0 + 2(1-t)t P1 + t² P2. At t=0.4: x = 0.36*stand.x + 0.48*(C.x-0.17) + 0.16*C.x. stand.x = C.x-2.6. → x = 0.36C - 0.936 + 0.48C - 0.082 + 0.16C = C.x - 1.018. Drum mouth at C.x - 1.05, so crossing at t≈0.42. z at t=0.42: (1-t)²=0.336, 2(1-t)t=0.487, t²=0.176 → z = 0.336*(-2.6 rel?) let's use offsets from C.z: P0 z-off = 0, P1 = -1.4, P2 = 0 → z_off = 0.487*(-1.4) = -0.68. So he crosses the mouth at z-offset -0.68, |z_off| < opening half-chord at that height — as computed before, at y≈0.1 (feet) the blocked region is only below y=0.2ish near the mouth edge... At z_off=-0.68: half-chord = sqrt(1.73²-0.68²)=1.59 → opening spans y ∈ [C.y-1.59, C.y+1.59] = [0.46, 3.64]. His feet at y≈0.1 (mid-entry lerp from 0 to 0.16) — that's below 0.46 → his legs would clip the shell near the bottom of the mouth.
+
+Hmm. The issue: the drum's inner bottom is at y=0.16, but the *side opening* only starts at y=0.46 at z_off=-0.68 because the circular opening curves away. The lower part of the side face is where the drum shell curves down to the floor. So a hamster can't walk in at floor level; he must step over the low rim edge on the side — which is exactly what happens with real wheels mounted close to the bedding: they climb over the lowest part of the rim (the side of the drum near the bottom, whose edge is at the mouth plane). The physically correct path: he steps onto the lowest part of the rim's side edge (at y≈0.16, the inner bottom level) and pushes in. The obstacle there is the *shell thickness* curving away — his body passes above the local surface as long as the shell at that x-plane is below his feet. At the mouth plane x = C.x - halfW... wait no! The drum's axis is along X, so the "mouth" (circular opening) is a plane perpendicular to X: x = C.x - halfW. In that plane, the opening is an annulus/circle of radius R_in centered at (C.y, C.z). Points in that plane below/around the circle boundary are "wall". At z_off = -0.68, the circle boundary is at y = C.y ± 1.59; the region between them is open. His feet at y=0.1 < 0.46 → he's outside the opening (below it), meaning he'd intersect the shell.
+
+But physically: near the bottom of the drum, the shell surface is at radius ~R from the axis; at x = C.x - halfW (the mouth plane) the shell's lowest point is at y = C.y - R_in = 0.16 (at z_off=0). At z_off = -0.68, the shell in that plane is at y = C.y - 1.59 = 0.46. So the shell edge rises as you move away from the bottom-most line. To enter, he must cross the mouth plane near z_off ≈ 0 where the shell edge is lowest (y=0.46 at... no wait at z_off=0 the shell in the mouth plane is exactly at y=0.16, the lowest point).
+
+So: crossing at z_off = 0 → opening spans y ∈ [0.16, 3.62] → his feet at 0.16 (just stepped up) and body up to 1.2 → fully inside the opening ✓. So the entry path should cross the mouth plane at z_off ≈ 0! Which means: he walks straight along +X into the mouth at z = C.z, then once inside, turns to face +Z. That's exactly how a hamster does it (walks in, then turns around).
+
+New bezier: P0 = stand (x=C.x-halfW-1.6, z=C.z), P1 = (C.x + 0.15, C.z) — hmm we want him to go straight in along X then curve to end at the contact point facing +Z. End tangent must be +Z, so P1 must be at (P2 - ε*ẑ) = (C.x, C.z - 1.2). Then x goes from stand.x to C.x monotonically, and z dips negative then returns to C.z. Crossing the mouth plane (x = C.x-halfW = C.x-1.05) happens at t where x(t) = C.x-1.05. With P0.x = C.x-2.65, P1.x=C.x, P2.x=C.x: x(t) = 0.5*C... let's compute: x_off(t) (relative to C.x) = (1-t)²(-2.65) + 2(1-t)t(0) + t²(0) = -2.65(1-t)². Set = -1.05 → (1-t)² = 0.396 → 1-t = 0.63 → t = 0.37. z_off at t=0.37: 2(1-t)t*(-1.2) + t²*0 = 2*0.63*0.37*(-1.2) = -0.56. Hmm still -0.56 at the crossing.
+
+To make him cross at z_off≈0, use a piecewise path instead of a single bezier:
+- Phase A (t 0→0.55): straight along X from stand.x to C.x + 0.1 at constant z = C.z, y ramping 0→0.16. Yaw stays facing -X (yaw = -π/2).
+- Phase B (t 0.55→1): pivot in place / small arc: move from (C.x+0.1, C.z) to (C.x, C.z) while yaw rotates from -π/2 to 0, and shift z slightly (-0.15) to look natural.
+
+That's a clean two-phase entry with no teleport, crossing the mouth straight-on at z_off=0 ✓. And it reads as "протиснулся в проём и развернулся". 
+
+Let me implement entry as a hand-authored path function:
+```js
+function wheelEntryPose(h, t){ // t 0..1
+  const w=wheel;
+  const y = lerp(0, w.contactY, smoothstep(0.05,0.5,t));
+  let x, z, yaw;
+  if (t < 0.6){
+    const u = t/0.6;
+    x = lerp(w.entry.stand.x, w.center.x + 0.25, easeInOut(u));
+    z = w.center.z;
+    yaw = -Math.PI/2; // лицом к -X
+  } else {
+    const u = (t-0.6)/0.4;
+    const e = easeInOut(u);
+    x = lerp(w.center.x + 0.25, w.center.x, e);
+    z = lerp(w.center.z, w.center.z, e);
+    yaw = lerpAngle(-Math.PI/2, 0, e);
+  }
+  ...
+}
+```
+During the pivot he's turning in place inside the drum — his body sweeps; with R=1.73 and body length 1.7, turning in place at the bottom: his tail end swings to a radius... his body is centered at the contact point; when facing -X his extent along X (length 1.7) doesn't hit anything (the drum is open along X within ±0.95... wait, no! His body length along X = 1.7 while the drum's interior width is only 1.9 — so when facing along X (perpendicular to the drum's plane), his body sticks OUT of the drum on both sides?! Yes — because he's standing at the drum center and the drum is only 1.9 wide while he's 1.7 long, so he fits (0.1 clearance each side) — barely! Hmm: half-length 0.85 vs half-width 0.95 → fits with 0.1 clearance ✓ but visually tight, and his head would poke near the rim edge. Since we defined КОЛЕСО_ШИРИНА = ШИРИНА_ЗВЕРЯ*2 = 1.9, and his length is 1.7 — the constraint should be that he fits *across* the drum too? Not physically necessary (he enters along the axis, so his length must be < width to fit inside; 1.7 < 1.9 ✓ barely).
+
+Better: increase drum width to max(ШИРИНА_ЗВЕРЯ*2, ДЛИНА_ЗВЕРЯ*1.25) = max(1.9, 2.125) = 2.13 → half 1.06 vs his half-length 0.85 ✓ comfortable. Let's set `КОЛЕСО_ШИРИНА = Math.max(ШИРИНА_ЗВЕРЯ*2.2, ДЛИНА_ЗВЕРЯ*1.3)` = max(2.09, 2.21) = 2.21. Half-width 1.105. Then footprint halfX = 1.105+0.08 = 1.19; stand at C.x - 1.19 - 1.6 = C.x - 2.79. With C.x = 7.0 → stand x = 4.21 ✓ inside cage.
+
+Hmm, but a wide wheel looks like a barrel — real hamster wheels ARE fairly wide-ish for dwarf? Exercise wheels are usually ~10-12 inches wide for a Syrian... Actually no, typical hamster wheel width is ~4-5 inches (10-13 cm) while the hamster is ~15 cm long — they enter diagonally/turn. A 2.2-wide drum at our scale (hamster 1.7 long) is proportionally like a 22 cm wide wheel for a 17 cm hamster — that's a wide but plausible "exercise ball/wheel". It looks fine and guarantees no clipping. Let's go with ~2.1 and have him enter diagonally? Keep it simple: КОЛЕСО_ШИРИНА = ДЛИНА_ЗВЕРЯ*1.25 = 2.13.
+
+Hmm, but the requirement says "расстояние между ободами должно быть шире его боков" — 2.13 vs 0.95 → 2.2× wider ✓ satisfies it.
+
+Also during phase A he walks along X with his body along X, entering head-first; at x = C.x+0.25 his tail is at C.x+0.25-0.85 = C.x-0.6 (inside the drum, within ±1.07 ✓) and his head at C.x+1.1 — just inside the +X mouth (at 1.19) ✓ barely. Hmm, his nose pokes right up to the rim plane. Let's make phase A end at x = C.x - 0.15 so he's fully inside: head at C.x+0.7 ✓, tail at C.x-1.0 (inside ±1.07 ✓). Then in phase B he pivots from (C.x-0.15, z=C.z) to (C.x, C.z). Good.
+
+But wait: during phase A, is his body intersecting the shell? He's inside the drum, standing at the bottom (y=0.16) — inside the drum the shell is at radius R from the axis; his body top is at 1.2 → distance from the axis (at y=C.y=1.89, z=C.z) to his top point = |1.2-1.89| = 0.69 < R ✓. His feet at 0.16: distance 1.73 = R ✓ exactly on the surface. Good, he's inside.
+
+Now EXIT is the reverse: pivot from facing +Z to facing -X while staying near the contact point, then walk straight out along -X, y 0.16→0.
+
+Good. Both are continuous in position and yaw ✓.
+
+Now during phase A/B his step phase should advance by actual displacement — I'll compute displacement each frame in scriptedMotion (compare to previous pos) and add to phase. For the pivot where feet slide... acceptable; also add a small "pivot step" animation (legs alternate quickly). Fine: use actual path distance so it stays honest.
+
+Now the tube entry: he approaches along Z at x = C.x (must be aligned!) — the walk goal is the entry point (C.x, 0, entryZ - 1.6*dir), and when he arrives (within 0.25) he switches to TUBE state and continues along Z with yaw locked to the travel direction. But his yaw while walking was toward the goal which is roughly along Z ✓ so there's no snap. Also his x should smoothly converge to C.x during the last approach: set the approach point's x exactly C.x so as he walks there, he aligns ✓. And when entering TUBE, force x = C.x with a smooth lerp: `h.pos.x = lerp(h.pos.x, C.x, 1-exp(-8dt))` → converges to ~0 deviation quickly and I report the actual value (starts at maybe 0.15, ends 0.000). Since the approach goal is exactly at x=C.x, the deviation at entry is already <0.05 ✓.
+
+Same for the wheel stand point (x=C.x-2.79, z=C.z) — his z must be C.z at the start of phase A; the walk goal is exactly that ✓.
+
+Good. Now let me write the final code for real. I'll include everything and double-check syntax as I go.
+
+Additional: `h.status` text updates only when changed (avoid DOM thrash).
+
+I also want a small "event log" ticker in the telemetry panel: e.g., "Пыж вошёл в колесо", "Бублик: вытолкнут из миски". Living element + proves collisions. Add `log(msg)` prepending to a list, max 5 entries, with fade-in animation. 
+
+Let me write it.
+
+```js
+// ============ SCENE ============
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+```
+
+Scene bg: gradient via a large sphere? Use `scene.background = new THREE.Color(0x121a20)` plus fog. The room walls will cover most of the view. Let's set background to a dark warm grey and fog matching.
+
+Room build function. Table build. Cage build. Props. Then hamsters.
+
+Let me write out all code text now, carefully but efficiently.
+
+For the wall poster canvas: draw a technical diagram of a wheel with formulas "ω = v / R" — very characteristic and charming. Yes! A blueprint-style poster on the back wall. Nice detail that rewards exploration.
+
+Also add a small chalk label near the wheel? Skip.
+
+Final code writing time. I'll number sections with comments in Russian.
+
+For the seeds InstancedMesh animation: store base positions; when a hamster eats, animate a random subset sinking into the bowl (scale down / move) and back. Implement `bowl.stir(t)` when someone eats: update a few instance matrices per frame.
+
+Water drip: `drip = {mesh, t}`.
+
+Let me write.
+
+Also: the roster "gait dots" — 4 dots per row; update opacity/scale per leg from sin(phase+off).
+
+I'll now produce the final HTML. Must be careful with template literals inside JS for HUD building.
+
+Regarding fonts loading failure (offline) — fallbacks specified.
+
+Let me write the code.
+
+```js
+const NAMES = [
+ {name:'ПЫЖ', fur:0xd9973f, belly:0xf6e3c6, tag:0xf5a921, note:'золотой'},
+ {name:'БУБЛИК', fur:0xb85f2e, belly:0xf0d7ba, tag:0xff7a4d, note:'рыжий'},
+ {name:'ТУМБА', fur:0x8a8177, belly:0xdcd6cb, tag:0x7cc4ff, note:'серый'},
+ {name:'СНЕЖАНА', fur:0xece0cf, belly:0xffffff, tag:0x4fd6a8, note:'кремовая'},
+ {name:'ГРАФ', fur:0x4a3a31, belly:0xa9927c, tag:0xc98cff, note:'тёмный'},
+];
+```
+Five distinct colors so the five animals read apart at a glance.
+
+OK writing now. I'll produce the final answer with the complete file. Let me carefully write the JS logic sections.
+
+`think(h, dt)`:
+```js
+function think(h, dt){
+  h.stateT += dt;
+  switch(h.state){
+    case ST.IDLE:
+      if (h.stateT > h.idleWait) chooseActivity(h);
+      break;
+    case ST.WALK:
+      if (h.arrived) onArrive(h);
+      if (h.stateT > 22) { setGoal(wanderGoal()) } // не застревает
+      break;
+    case ST.EAT:
+      if (h.stateT > h.eatTime) toIdle(h, 'наелся');
+      break;
+    case ST.DRINK:
+      if (h.stateT > h.drinkTime) toIdle(h);
+      break;
+    case ST.WHEEL_RUN:
+      if (h.stateT > h.runTime) { h.runTarget=false; }
+      if (!h.runTarget && h.runSpeed < 0.06) { startWheelExit(h); }
+      break;
+    case ST.TUBE:
+      if (h.pos.z beyond exit + 1.3) { h.state = ST.WALK; setGoal(wander) }
+      break;
+  }
+}
+```
+
+`onArrive(h)`: based on h.intent → start activity or wander again.
+
+For WHEEL intent: check claim availability at arrival; if taken → pick another (wander) with a note.
+
+Now `steerFree`:
+```js
+function steerFree(h, dt){
+  const to = _v1.copy(h.goal).sub(h.pos); to.y=0;
+  let d = to.length();
+  const arriveEps = h.arriveEps;
+  if (d < arriveEps) { h.speed = approach(h.speed, 0, 8*dt); h.arrived = true; }
+  else h.arrived = false;
+  if (!h.arrived && d>0.001){
+    to.multiplyScalar(1/d);
+    const target = h.maxSpeed * clamp(d/1.4, 0.25, 1);
+    h.speed = approach(h.speed, target, h.accel*dt);
+    const want = Math.atan2(to.x, to.z);
+    h.yaw = lerpAngle(h.yaw, want, 1-Math.exp(-7*dt));
+  } else {
+    h.speed = approach(h.speed, 0, h.accel*1.4*dt);
+  }
+  // лёгкое боковое рыскание при прогулке
+  ...
+  const before = _v2.copy(h.pos);
+  if (h.speed>0.0005){
+    h.pos.x += Math.sin(h.yaw)*h.speed*dt;
+    h.pos.z += Math.cos(h.yaw)*h.speed*dt;
+  }
+  if (h.jump) integrateJump(h, dt);
+  resolveObstacles(h);
+  separate(h);
+  clampToCage(h);
+  const moved = h.pos.distanceTo(before); // includes y? use XZ
+  h.stepPhase += (moved / h.stepLength) * TAU;
+  h.footSpeed = moved/dt (smoothed);
+  h.phaseRate = (h.stepPhase - h.prevPhase)/dt ...
+}
+```
+Note: `moved` computed in XZ only to avoid jump height affecting phase — use dx,dz.
+
+Hmm, during a jump the feet shouldn't step; set gait amplitude ~0 while airborne.
+
+`resolveObstacles(h)`: for each collider (excluding when h is exempt):
+```js
+function resolveObstacles(h){
+  if (h.exempt) return; // в колесе/трубе
+  for (const c of colliders){
+    if (c.type==='box'){
+      const minx=c.minx-c.pad, maxx=c.maxx+c.pad, minz=..., maxz=...;
+      const p=h.pos;
+      if (p.x>minx && p.x<maxx && p.z>minz && p.z<maxz){
+        const dxl = p.x-minx, dxr = maxx-p.x, dzl = p.z-minz, dzr = maxz-p.z;
+        const m = Math.min(dxl,dxr,dzl,dzr);
+        if (m===dxl) p.x = minx; else if (m===dxr) p.x=maxx; else if (m===dzl) p.z=minz; else p.z=maxz;
+        h.pushCount++; sim.pushouts++;
+      }
+    } else { // circle
+      const dx=h.pos.x-c.x, dz=h.pos.z-c.z, r=c.r+c.pad, d=Math.hypot(dx,dz);
+      if (d<r){ const n = d<1e-4? {x:0,z:1} : {x:dx/d,z:dz/d}; h.pos.x=c.x+n.x*r; h.pos.z=c.z+n.z*r; sim.pushouts++; }
+    }
+  }
+}
+```
+`c.pad = 0.52` (hamster radius).
+
+Violation test (for the counter): test with pad=0 (true geometric inside) for free-state hamsters → if inside, count. Since we push out with padding, true-inside should never happen ✓.
+
+Separation:
+```js
+for pairs (i<j): d = dist XZ; minD = 0.95; if (d<minD){ overlap=(minD-d); n=...; each moves by overlap*0.5*soft } 
+```
+Only for non-exempt hamsters (or move both if the other is exempt — then push only the free one fully).
+
+OK, writing the final answer now. I'll try to keep it tight but complete.
+
+One more: initial camera intro animation — a short cinematic dolly-in at load (from far to the default view) over ~2.2s with easing, then hand over to OrbitControls. Nice touch. Implement by lerping camera position before controls.update... Use `intro` flag: lerp camera.position from A to B and controls.target from ta to tb; when done, `intro=false`. Disable controls during intro (controls.enabled=false).
+
+Also on load, hamsters start in various states so the scene is immediately alive; one starts running in the wheel right away.
+
+Let me write the HTML/CSS/JS.
+
+HUD text sizes: masthead title 62px display, kicker 10px mono — strong contrast ✓.
+
+Write now. I'll include `will-change` sparingly.
+
+For the phase dial dots in the roster, I'll build with innerHTML template and keep refs.
+
+Final check on OrbitControls CDN URL given: `https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js` ✓ as specified.
+
+Code for controls: `new THREE.OrbitControls(camera, renderer.domElement)`.
+
+Let me write everything.
+
+I need to double check `THREE.CylinderGeometry(radiusTop, radiusBottom, height, radialSegments, heightSegments, openEnded)` ✓.
+
+LatheGeometry for the bowl: points from (0.05, 0) up along a curve; must be defined in XY with x=radius, y=height, and it revolves about Y ✓.
+```js
+const pts=[]; for(let i=0;i<=10;i++){ const t=i/10; pts.push(new THREE.Vector2(0.12+ t*1.03, 0.02 + t*t*0.42)); }
+new THREE.LatheGeometry(pts, 32)
+```
+This gives an open bowl surface (single-sided) — use material side: DoubleSide.
+
+Seeds inside the bowl: positions with radius < 0.95, y = bowlProfile(r)+0.05.
+
+Water bottle: cylinder r=0.42 h=2.0 at x=10.75 (wall bars at 11.2) — hmm bars are at x=±11.2; the bottle should hang inside. Put at x=10.55, z=5.6, y from 0.8 to 2.8 → center y=1.8. Spout: small cylinder + ball at (10.55, 0.72, 5.6) pointing down. Drink spot at (9.3, 0, 5.6) facing +X → yaw = π/2.
+
+Hmm the bottle bottom at 0.8 with a spout reaching to ~0.6: the hamster stands at 9.3 and reaches his snout up-forward — visually he tilts his head up. Good enough.
+
+Now, write!
+
+Also the hideout box (scenery+collider): at (-8.6, 0, -5.2), size 3.4 x 2.2 x 3.0, with a door hole (just place a dark inset plane and a "cut" using two boxes forming walls? Simpler: build the hut from a roof (box) + 4 walls with a door gap in the front wall (two side pieces + a lintel). It's a few boxes — fine. Collider = box footprint of the hut.
+
+Hmm, hamsters never interact with it — that's OK ("домик" scenery). Actually let me add an activity 'rest' — "дремлет в домике"? That's another state where he lies down (bodyGroup rotation? scale flatten) and the status shows "дремлет". Cheap to implement: at rest, set `h.resting=true` → pose flattens (scale.y 0.85, legs tucked), eyes closed (blink sustained), breathing slow. Position inside the hut through its door... The hut interior is small; he'd need to enter via the door — a scripted path like the tube. Hmm, complexity. Let's skip the hut entirely and instead add a "sand bath" (small dish) he visits? Also complexity.
+
+Decision: keep scenery simpler — no hut; instead a wooden platform/bridge (low, 0.4 high) with a ramp that hamsters can walk over? Elevation adds complexity to movement (they'd need to climb). Skip elevation changes except the wheel's little step slabs (which are only 0.16 high and handled by lerp).
+
+Actually — I'll add the hut as pure scenery in a corner with a collider, no interaction. It makes the diorama cozy. Fine.
+
+Enough planning; write the code.
+
+Let me make sure the total is coherent. Writing final answer.
+
+For DOM: 
+
+```html
+<div class="hud">
+  <header class="masthead panel-in">
+    <p class="kicker"><span class="pulse"></span>диорама · three.js r128 · честная физика</p>
+    <h1>ХОМЯ<span>КИ</span></h1>
+    <p class="lede">Клетка на столе. Пять зверей, одно колесо, одна труба.<br><b>ω = v / R</b> — колесо крутит тот, кто в нём бежит.</p>
+  </header>
+  <section class="panel roster">…</section>
+  <section class="panel telemetry">…</section>
+  <div class="hints">…</div>
+</div>
+```
+
+The masthead shouldn't be centered — anchor it top-left over the scene ✓.
+
+I'll now write it all out.
+
+For the checks chips I need `class="chip" data-k="1"` and update textContent + class.
+
+Let me write the JS HUD builder:
+
+```js
+const rosterEl = document.getElementById('rosterList');
+hamsters.forEach((h,i)=>{
+  const li=document.createElement('li'); li.className='hrow'; li.dataset.i=i;
+  li.innerHTML = `<button class="hbtn">
+     <span class="dot"></span>
+     <div class="hm"><b>${h.name}</b><span class="st">…</span></div>
+     <div class="gait">${'<i></i>'.repeat(4)}</div>
+     <div class="sp"><i></i></div>
+   </button>`;
+  li.style.setProperty('--c', h.cssColor);
+  ...
+});
+```
+
+Update each frame: `.st` text if changed, gait dots opacity/scale, `.sp i` width = speed/maxSpeed*100%.
+
+Right telemetry with ids: `#wUser,#wOmega,#wFoot,#wRim,#wDiff,#tUser,#tDev,#tFloor,#collisions,#fps`.
+
+OK. Writing the final answer now — complete file. I'll be thorough but avoid unnecessary repetition.
+
+Note about `h.stepLength`: length of a full stride cycle? Spec: `фаза += (пройденный путь / длина шага) · 2π` → stepLength = distance per full cycle. Set `шаг = 0.62` (a bit longer than a leg stride). With maxSpeed 3.2 units/s → 5.2 cycles/s — too fast. Let's set stepLength = 1.1 → ~2.9 Hz at top speed. Reasonable for a scurrying hamster.
+
+maxSpeed: cage is 22 wide; hamster speed ~2.6 units/s (≈ 2.6 dm/s in our scale — real hamsters run much faster but visually fine). Use 2.4-3.0 per hamster (varied).
+
+Run speed in the wheel: 2.2-3.4 → ω = v/1.73 ≈ 1.3-2.0 rad/s (~0.2-0.3 rev/s) — looks good, real wheels spin faster but visually calm is better. Actually a real hamster wheel spins ~1 rev/s. Let's use runSpeed up to 4.5 → ω=2.6 rad/s = 0.41 rev/s. Reasonable. I'll set runMax per hamster 3.2-4.6.
+
+Alright — final code.
+
+One more detail: `poseHamster` must set root.position from h.pos (+ jump offset) and root.rotation.y = h.yaw, plus root.rotation.z/x for lean into turns (small) and for the tube/wheel slope. Nice: bank slightly when turning: rotation.x? Let's add `root.rotation.z = -turnRate*0.05` clamped. Keep it subtle.
+
+Writing now, final.
+
+Also careful: hamsters inside the wheel must not cast weird shadows through the drum — fine.
+
+Let me handle the `h.exempt` flag: true for states WHEEL_IN/RUN/OUT and TUBE.
+
+And `h.inWheelPose`: when in the wheel, the ground under him is the rim; his shadow will land on the bedding below — fine.
+
+Final code below.
