@@ -111,7 +111,9 @@ def run(i):
 
 
 good = 0
-for i in range(1, RUNS + 1):
+# 28.09.2026: BENCH_START - номер первого прогона (добор прогонов, не затирая прежние), по умолчанию 1
+START = int(os.environ.get("BENCH_START", "1"))
+for i in range(START, START + RUNS):
     try:
         good += 1 if run(i) else 0
     except Exception as e:
