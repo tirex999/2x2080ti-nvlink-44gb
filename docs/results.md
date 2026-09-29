@@ -577,7 +577,7 @@ max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
 <!-- dacan-2809 -->
 ## 14. Flash-Next на своём движке DACAN
 
-Форк Strata под эту модель и эту машину: [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN). Замеры 28.09,
+Форк Strata под эту модель и эту машину: [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN), веса — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN). Замеры 28.09,
 эксперты NVFP4, плотная часть Q8_0, обе карты и оба сокета, контекст 262 144, KV int8.
 
 | что | число | как мерили |

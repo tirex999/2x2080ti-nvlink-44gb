@@ -343,7 +343,7 @@ Hermes подмешивает `extra_body` провайдера в каждый 
 <!-- dacan-2809 -->
 ### Свой движок: DACAN (Дацан) — втрое быстрее
 
-Лучшее, что мы получили на этой модели, — наш форк Strata, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN),
+Лучшее, что мы получили на этой модели, — наш форк Strata, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN) (веса — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)),
 собранный под одну модель и эту машину: эксперты NVFP4 считают оба сокета Ice Lake на AVX-512 VNNI, плотная часть —
 на главной карте, вторая карта — сопроцессор каждого слоя по NVLink, черновики MTP.
 

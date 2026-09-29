@@ -9,7 +9,7 @@
 ## Новое 28.09, вечер: движок зовётся DACAN (Дацан), контекст 256K, узел делится с виртуальной машиной
 
 После правок дня это уже не Strata автора, а свой движок под одну модель и одну машину. Назвали его **DACAN**
-(Дацан), форк переименован: [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN). Он собран под
+(Дацан), форк переименован: [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN), веса для него — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN). Он собран под
 Qwen3.8-Flash-Next (архитектура `qwen4exp`: 48 слоёв, 512 экспертов, 10 на токен + общий, MTP) на двух
 2080 Ti с NVLink и двух сокетах Ice Lake с AVX-512 VNNI. Имя Strata дальше — только про оригинал автора.
 
