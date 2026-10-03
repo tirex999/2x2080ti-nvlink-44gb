@@ -399,7 +399,123 @@ em{color:var(--mut)}
 </tr>
 </tbody>
 </table></div>
-<p>Обе машины выходят на максимум на <strong>64 потоках</strong> и после этого падают — хотя ядер 144 и 128. Это же видно и на модели: <code>-t 32</code> обыгрывает <code>-t 64</code> и <code>-t 96</code>.</p>
+<p>30.08 обе машины выходили на максимум на <strong>64 потоках</strong> и дальше падали, хотя ядер 144 и 128. Это же видно и на
+модели: <code>-t 32</code> обыгрывает <code>-t 64</code> и <code>-t 96</code>. На тихом нынешнем узле 03.10 128 потоков дали чуть больше 64
+(274 против 269), а провал остался только у 96 потоков с закреплением — разбор ниже.</p>
+<h3>Закрепление по NUMA: замер 03.10</h3>
+<p>Нынешний узел, 16 планок 2666, тот же <code>membw</code> (массивы 4 ГиБ×3, лучшее из трёх). Соседняя ВМ на время замера
+выключена; DACAN в контейнере простаивал, его состояние проверялось до и после каждого прогона. Страницы ложатся
+первым касанием. Привязка к узлам — <code>numactl</code>. Скрипт — <a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/blob/main/scripts/membw_numa.sh"><code>scripts/membw_numa.sh</code></a>.</p>
+<p>Вся машина, два круга через дробь:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>потоков</th>
+<th style="text-align: right;">без закрепления</th>
+<th style="text-align: right;">закреплены (<code>OMP_PROC_BIND=spread OMP_PLACES=cores</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16</td>
+<td style="text-align: right;">198.1 / 197.5</td>
+<td style="text-align: right;">198.5 / 199.0</td>
+</tr>
+<tr>
+<td>32</td>
+<td style="text-align: right;">245.3 / 257.3</td>
+<td style="text-align: right;">256.0 / 257.3</td>
+</tr>
+<tr>
+<td>64</td>
+<td style="text-align: right;">265.9 / 269.4</td>
+<td style="text-align: right;">266.6 / 268.9</td>
+</tr>
+<tr>
+<td>96</td>
+<td style="text-align: right;">255.8 / 254.5</td>
+<td style="text-align: right;"><strong>198.3 / 197.6</strong></td>
+</tr>
+<tr>
+<td>128</td>
+<td style="text-align: right;">273.3 / 274.1</td>
+<td style="text-align: right;"><strong>273.8</strong> / 271.5</td>
+</tr>
+</tbody>
+</table></div>
+<p>Где лежит память:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>раскладка</th>
+<th style="text-align: right;">потоков</th>
+<th style="text-align: right;">закреплены</th>
+<th style="text-align: right;">без закрепления</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>сокет 0, своя память</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">134.4</td>
+<td style="text-align: right;">135.3</td>
+</tr>
+<tr>
+<td>сокет 1, своя память</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">132.8</td>
+<td style="text-align: right;">132.6</td>
+</tr>
+<tr>
+<td>сокет 0 читает память узла 1 (через UPI)</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">70.8</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>сокет 1 читает память узла 0 (через UPI)</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">70.8</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>вся машина, <code>numactl --interleave=all</code></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">181.3</td>
+<td style="text-align: right;">181.9</td>
+</tr>
+<tr>
+<td>оба сокета, вся память на узле 0</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">95.0</td>
+<td style="text-align: right;">95.2</td>
+</tr>
+<tr>
+<td>оба сокета, вся память на узле 1</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">94.8</td>
+<td style="text-align: right;">94.6</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>На тихой машине закрепление потоков почти ничего не даёт</strong>, если страницы легли первым касанием: на 64 потоках
+266–269 в обоих режимах. 30.08 без закрепления было 221.3 против 268.2: тогда на узле работали другие машины, и
+планировщик уводил потоки от их памяти. Под нагрузкой разница есть и сейчас. В тот же день, при работающей соседней
+ВМ (50 ядер), сокет 0 со своей памятью дал 127.9 с закреплением и 119.3 без.</p>
+<p><strong>Решает не закрепление потоков, а где лежит память.</strong> Своя память — 133–135 ГБ/с на сокет, чужая через UPI —
+70.8, почти вдвое меньше.</p>
+<p><strong>Чередование страниц (<code>--interleave=all</code>) отдаёт треть полосы:</strong> 182 против 269, потому что половина обращений
+уходит на чужой сокет. Так у нас запускались llama.cpp и FreeToken. DACAN раскладывает экспертов по узлам первым
+касанием (<code>--numa</code>).</p>
+<p><strong>Вся память на одном узле хуже, чем один сокет:</strong> 95 против 134. Второй сокет читает через UPI, а потоки с
+равными долями ждут самого медленного. Так было у Strata до 27.09, когда вся арена лежала под
+<code>numactl --membind=1</code>.</p>
+<p><strong>96 потоков с закреплением проваливаются до 198.</strong> Мест-ядер 64, половине ядер достаётся по два потока, и равные
+доли на них считаются вдвое дольше. С закреплением брать 64 или 128 потоков.</p>
+<p>Пик — 274 ГБ/с на 128 потоках, 80% от теоретических 341 ГБ/с (16 каналов × 2666 МТ/с × 8 байт).</p>
+<p>На общем узле своей памяти у сокета может не хватить. 03.10 у работающей службы DACAN арена лежала неровно:
+78 ГиБ на узле 0 и 49 на узле 1 (<code>/proc/&lt;pid&gt;/numa_maps</code>). При её запуске узел 1 занимала соседняя ВМ (72.6 ГиБ),
+и часть строк второго сокета легла на узел 0, откуда он читает их через UPI.</p>
 <h3>Третья конфигурация: 2933</h3>
 <p>Замерена раньше, на другой машине.</p>
 <div class="tw"><table>
