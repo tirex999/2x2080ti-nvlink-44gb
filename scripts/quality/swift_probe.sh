@@ -2,9 +2,9 @@
 # Swift 1.5 шаг 1 (03.10.2026, слово Вадима «Делай все по очереди»): Swift GSQ-RCO IQ3_XXS против базового
 # ISTA GSQ-RCO IQ3_XXS на одном движке DACAN, одинаковые задачи (хомяки, аквариум; low / medium / xhigh), выборка
 # галереи (bench_ext.py: T 0.6, top_p 0.95, top_k 20). Служба strata-serve на время снята; trap возвращает её всегда.
-# Журнал /root/swift_probe_0310.log, галерея /root/gallery_0310.
+# Журнал $LOG (по умолчанию /root/swift_probe_0310.log), галерея /root/gallery_0310; задачи — TASKS (по умолчанию хомяки аквариум).
 set -u
-LOG=/root/swift_probe_0310.log
+LOG=${LOG:-/root/swift_probe_0310.log}
 Q=/root/quality_0310
 exec >> "$LOG" 2>&1
 say() { echo "$(date '+%H:%M:%S') $*"; }
@@ -41,7 +41,7 @@ up() {  # up <имя>: поднять движок с /root/strata19/strata-serv
 }
 
 bench() {  # bench <подпись> <полное имя> <квант>
-    for key in хомяки аквариум; do
+    for key in ${TASKS:-хомяки аквариум}; do
         for lvl in low medium xhigh; do
             say "задача $key $lvl"
             (cd $Q && BENCH_BASE=http://127.0.0.1:8000 BENCH_CTX=262144 BENCH_OUT=/root/gallery_0310 \

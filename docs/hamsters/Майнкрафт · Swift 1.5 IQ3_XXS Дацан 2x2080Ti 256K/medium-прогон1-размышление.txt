@@ -1,0 +1,230 @@
+The user wants a complete Minecraft-style voxel game in a single HTML file. Let me carefully build this step by step.
+
+Key requirements:
+1. Single HTML file with Three.js r128 from CDN
+2. Voxel world with chunks (16x16x80)
+3. Procedural terrain with noise
+4. First-person controls with pointer lock
+5. Block breaking/placing with raycasting
+6. Hotbar UI
+7. Sky, clouds, water plane
+8. Collision detection
+9. Chunk management (generate, mesh, unload)
+
+Let me plan the architecture:
+
+1. Global variables: scene, camera, renderer, chunks Map, player state
+2. Noise functions: hash, smooth noise, fractal noise (2D and 3D)
+3. Terrain generation per chunk
+4. Mesh building per chunk (face culling - only add faces adjacent to air)
+5. Chunk management loop each frame
+6. Player physics (gravity, jump, WASD, collision)
+7. Raycasting for block interaction
+8. UI: crosshair, hotbar, start overlay
+9. Sky background, fog, lights, clouds, water plane
+
+Let me write this carefully:
+
+Block colors:
+- 0: air
+- 1: grass 0x4caf50
+- 2: dirt 0x795548
+- 3: stone 0x9e9e9e
+- 4: sand 0xe7d9a8
+- 5: wood 0x8d6e63
+- 6: leaves 0x2e7d32
+- 7: snow 0xffffff
+
+Lighting multipliers: top=1.0, sides=0.8, bottom=0.55
+
+Chunk key: "cx,cz" where cx=floor(x/16), cz=floor(z/16)
+
+For meshing, I need to check all 6 faces of each block. If the neighbor is air, add that face.
+
+Face definitions (using world coordinates):
+- Top (+Y): normal (0,1,0), vertices form a quad at y+1
+- Bottom (-Y): normal (0,-1,0), vertices form a quad at y
+- Front (+Z): normal (0,0,1)
+- Back (-Z): normal (0,0,-1)
+- Left (-X): normal (-1,0,0)
+- Right (+X): normal (1,0,0)
+
+For each face, 2 triangles = 6 vertices.
+
+Let me define the 6 faces with their vertex offsets:
+
+Top face (y+1): vertices (x,y+1,z), (x+1,y+1,z), (x+1,y+1,z+1), (x,y+1,z+1)
+Triangles: (0,1,2), (0,2,3)
+
+Bottom face (y): vertices (x,y,z+1), (x+1,y,z+1), (x+1,y,z), (x,y,z)
+Triangles: (0,1,2), (0,2,3)
+
+Front face (+Z, z+1): vertices (x,y,z+1), (x+1,y,z+1), (x+1,y+1,z+1), (x,y+1,z+1)
+Triangles: (0,1,2), (0,2,3)
+
+Back face (-Z, z): vertices (x+1,y,z), (x,y,z), (x,y+1,z), (x+1,y+1,z)
+Triangles: (0,1,2), (0,2,3)
+
+Left face (-X, x): vertices (x,y,z), (x,y,z+1), (x,y+1,z+1), (x,y+1,z)
+Triangles: (0,1,2), (0,2,3)
+
+Right face (+X, x+1): vertices (x+1,y,z+1), (x+1,y,z), (x+1,y+1,z), (x+1,y+1,z+1)
+Triangles: (0,1,2), (0,2,3)
+
+For the lighting multiplier per face:
+- Top: 1.0
+- Sides (front, back, left, right): 0.8
+- Bottom: 0.55
+
+Now for the noise function, I need integer hash:
+
+```
+function hash(x, y, z) {
+    let h = x * 374761393 + y * 125204340 + z * 1073741827;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h = h ^ (h >> 16);
+    return (h & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For 2D noise, I'll use bilinear interpolation with smoothstep.
+
+For 3D noise for caves, similar approach in 3D.
+
+Terrain generation:
+- m = fractal2D(x*0.004, z*0.004) - large scale
+- h = fractal2D(x*0.02, z*0.02) - medium scale
+- H = floor(5 + m*m*58 + h*10)
+
+Column fill:
+- y=0: stone (unbreakable)
+- y < H-3: stone
+- 3 layers under surface: dirt (sand if H<=16, stone if H>=37)
+- Surface (y=H): snow if H>=46, stone if H>=37, sand if H<=16, grass otherwise
+
+Caves: for y in [3, H-2], if 3D noise at (x,y,z)*0.09 > 0.67, set air
+
+Trees: on grass surface, hash < 0.02, 4 wood blocks, leaves layers
+
+Player physics:
+- Gravity: 25 m/s²
+- Jump: 8.5 m/s
+- Speed: 5.5 m/s
+- Box: half-width 0.3, height 1.8, eye 1.62
+- Spawn at x=8, z=8, above terrain
+
+Collision: axis-separated. Move per axis, check overlap with all non-air blocks in the bounding box, revert on overlap.
+
+Raycasting: from camera center, max distance 6, against chunk meshes.
+
+Let me now write the complete file. This is going to be quite long.
+
+For the mesh building, I need to be careful with face definitions and make sure normals point outward.
+
+Let me define faces more carefully:
+
+```
+const FACES = [
+    // [dx,dy,dz, vertices offsets for 4 corners, normal]
+    {dir:[0,1,0], corners:[[0,1,0],[1,1,0],[1,1,1],[0,1,1]], light:1.0}, // top
+    {dir:[0,-1,0], corners:[[0,0,1],[1,0,1],[1,0,0],[0,0,0]], light:0.55}, // bottom
+    {dir:[0,0,1], corners:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]], light:0.8}, // front (+z)
+    {dir:[0,0,-1], corners:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]], light:0.8}, // back (-z)
+    {dir:[-1,0,0], corners:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]], light:0.8}, // left (-x)
+    {dir:[1,0,0], corners:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]], light:0.8}, // right (+x)
+];
+```
+
+Each face has 4 corners forming a quad. Two triangles: (0,1,2) and (0,2,3).
+
+The vertex positions are block position + corner offset.
+
+For colors, I multiply the block's RGB by the light factor.
+
+Let me structure the code now. I'll write it all out.
+
+For chunk management:
+- Each frame, check chunks within 5 of player (generate data if missing)
+- Build meshes for chunks within 4 whose 4 neighbors have data (max 2 per frame)
+- Remove chunks farther than 7
+
+Player position to chunk: cx = Math.floor(px/16), cz = Math.floor(pz/16)
+
+For the hotbar, I'll use HTML/CSS overlay.
+
+For the crosshair, a small CSS cross at center.
+
+Let me write this out now. I need to be very careful to get everything right.
+
+One important thing: the mesh uses world coordinates for vertices, and the mesh is placed at origin (no translation). This makes raycasting straightforward.
+
+For collision detection, I need to check all blocks that the player's AABB overlaps with. The player AABB is:
+- x: px - 0.3 to px + 0.3
+- y: py to py + 1.8
+- z: pz - 0.3 to pz + 0.3
+
+For each axis movement, I move the player, then check if any block in the AABB is non-air. If so, revert.
+
+Let me think about the collision more carefully:
+- Move X by dx. Check all blocks in new AABB. If any is solid, revert X.
+- Move Y by dy. Check all blocks in new AABB. If any is solid, revert Y. If moving down and reverted, set onGround = true.
+- Move Z by dz. Check all blocks in new AABB. If any is solid, revert Z.
+
+For checking blocks in AABB:
+```
+function collides(px, py, pz) {
+    const minX = Math.floor(px - 0.3);
+    const maxX = Math.floor(px + 0.3);
+    const minY = Math.floor(py);
+    const maxY = Math.floor(py + 1.8);
+    const minZ = Math.floor(pz - 0.3);
+    const maxZ = Math.floor(pz + 0.3);
+    for (let x = minX; x <= maxX; x++)
+        for (let y = minY; y <= maxY; y++)
+            for (let z = minZ; z <= maxZ; z++)
+                if (getBlock(x, y, z) !== 0) return true;
+    return false;
+}
+```
+
+For the raycast, I'll use Three.js Raycaster against the chunk meshes array.
+
+Let me also handle the tree generation carefully. Trees are generated per-column during chunk generation. The trunk goes up 4 blocks from surface. Leaves form layers: 5x5 at y+4 and y+5 (2 layers), 3x3 at y+6, 1 at y+7.
+
+Wait, re-reading: "4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)"
+
+So:
+- Trunk: y=H+1 to H+4 (4 wood blocks)
+- Leaves: 5x5 centered at (x,z) at y=H+5 and y=H+6
+- Leaves: 3x3 centered at (x,z) at y=H+7
+- Leaves: 1 block at y=H+8
+
+Only place into air cells.
+
+For the tree check, I need to make sure the trunk fits inside the chunk (local coords). The 5x5 leaves might extend outside the chunk, so I need to handle that. Actually, since we're generating chunk by chunk, leaves from a tree in one chunk might extend into a neighbor chunk. This is tricky.
+
+The spec says "when a per-column hash < 0.02 and the trunk fits inside the chunk". So I only generate trees where the trunk is inside the chunk. For leaves that extend outside, I'll need to handle them. Actually, let me re-read: "leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)".
+
+I think the approach is: when generating a chunk, for each column in the chunk that has grass and hash < 0.02, generate the tree. For leaves that extend outside the chunk, I'll write them into the neighbor chunks' data. This requires accessing neighbor chunk data.
+
+Actually, a simpler approach: when generating a chunk, also check for trees in columns from neighboring chunks that would place leaves in this chunk. This is the standard approach for Minecraft-like generators.
+
+Let me implement it as: when generating chunk (cx, cz), iterate over all columns in a slightly expanded area (to catch trees from neighbors), and for each tree, place blocks. Blocks outside the chunk are ignored (they'll be placed when the neighbor chunk generates).
+
+Actually, the simplest approach that works: when generating a chunk, only generate trees whose trunk is inside this chunk. For leaves extending into neighbors, we write them into the neighbor's data array if it exists. If the neighbor doesn't exist yet, the tree will look incomplete until the neighbor generates.
+
+A better approach: when generating chunk (cx,cz), for each column in the expanded range (cx-1 to cx+16+1, cz-1 to cz+16+1 in world coords), check if it's a tree spot. If so, place blocks. Only write blocks that fall within this chunk. This way, trees from neighbors will be handled when those chunks generate.
+
+Let me implement this: for each chunk, iterate over columns from (cx*16 - 2) to (cx*16 + 17) and (cz*16 - 2) to (cz*16 + 17). For each column that has grass surface and tree hash < 0.02, generate the tree. Write blocks only if they fall within this chunk's bounds.
+
+This ensures trees are complete when viewed from any angle.
+
+OK let me write the full code now. This is going to be a big file.
+
+Let me also think about performance. With max 4 chunks generated per frame and max 2 meshes built per frame, the world loads gradually. The raycast is against all chunk meshes in the global array.
+
+For clouds: ~25 flat white transparent boxes at height ~90, drifting slowly, wrapping around player.
+
+For water: semi-transparent blue plane at height 14.3, re-centered on player each frame.
+
+Let me write it all out now.

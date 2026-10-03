@@ -1,0 +1,1348 @@
+We need answer user asks build mc.html single HTML file. Need produce final only code block. Need think carefully. Need ensure satisfies spec. Let's design complete file.
+
+Need output exactly one code block with entire mc.html. No text. Need include Three.js r128 script tag. Must work file://. Use global THREE.
+
+Let's reason implementation details thoroughly.
+
+Requirements:
+- First-person voxel sandbox endless procedural world.
+- Blocks IDs colors. Unit cubes rendered vertex colors and one shared MeshLambertMaterial. Fake lighting top 1.0 sides 0.8 bottoms 0.55.
+- Chunks 16x16 columns, 80 high. Global Map key "cx,cz" value: {data: Uint8Array(16*80*16?), mesh}. Write global read/write block helpers using chunk=floor(world/16), local=world-chunk*16 so negative works. Missing chunk or y outside 0-79 returns air.
+- Each frame: generate block data for chunks within 5 of player max 4 per frame; build meshes for chunks within 4 whose 4 neighbors already have data max 2 per frame; for chunks farther than 7 remove mesh dispose geometry delete entry.
+- Meshing: one BufferGeometry per chunk. Loop all non-air blocks, each side neighbor global read helper air add face 2 triangles to flat pos/norm/color arrays. Use world coordinates vertices and mesh at origin. Keep chunk meshes in global array for raycasting, write rebuild function.
+- Terrain deterministic no Math.random. Value noise: integer-coordinate hash 0-1 mix large prime multipliers xor-shifts, smoothed 2D via bilinear smoothstep, 4 octaves fractal, 3D for caves. Height m = fractal at coords*0.004, h = fractal at coords*0.02, H=floor(5 + m*m*58 + h*10). Fill: y0 unbreakable stone; below H-3 stone; 3 layers under surface dirt (sand if H<=16, stone if H>=37); surface = snow if H>=46, stone if H>=37, sand if H<=16, otherwise grass. Caves: y between 3 and H-2 if 3D noise pos*0.09 >0.67 set air. Trees: on grass, per-column hash <0.02 and trunk fits inside chunk: 4 wood up, leaves 5x5 layer twice, then 3x3, then 1 top (only into air).
+- Player controls: PerspectiveCamera fov 75 far 400 rotation order YXZ driven yaw/pitch. Start overlay pointer lock; mouse look only while locked sensitivity 0.002 clamp pitch. Player box half-width .3 height 1.8 eye 1.62 spawn above terrain at x=8,z=8. Gravity 25/s jump space vel 8.5 WASD 5.5 m/s relative yaw. Axis-separated collision against all non-air blocks (move per axis, revert on overlap; landing sets on-ground). Falling below y -20 teleport spawn.
+- Break/place: CSS crosshair center. Each frame raycast camera center max distance 6 against chunk meshes. From hit point p and face normal n: break target = floor(p - n*0.5), place cell = floor(p + n*0.5), per component. Outline targeted block black wireframe box. Only while pointer locked: left click sets target air (not y0); right click places selected block if cell air and does not overlap player. After edit rebuild chunk, and neighbor chunk if block sits on chunk border. Suppress context menu.
+- Hotbar bottom center: 7 slots colors numbers dark bar; selected white border; keys 1-7 or wheel wraps.
+- Sky background/fog, lights, clouds ~25 flat white transparent boxes height ~90 drifting wrapping player. Water: large semi-transparent blue plane height 14.3 re-centered each frame.
+- UI overlay start fullscreen title controls Click to play; reappears when pointer lock released. Body no margins fullscreen canvas resize.
+
+Need be careful with raycasting and face normals for BufferGeometry. If using THREE.Raycaster intersectObjects(meshes). Each intersection has point, face.normal? In Three r128, Intersection.face.normal is face normal in object local coordinates? Since geometry vertices world coords and mesh at origin, object transform identity so same world. But face.normal from raycast maybe not normalized? It should be. For BoxGeometry? Our custom faces normals set. However Raycaster intersection for BufferGeometry: face.normal available, but maybe normal attribute? We'll use intersect.face.normal. Need if geometry uses indexed? We can non-indexed. Face has a,b,c,normal. Good.
+
+Potential issue: raycasting against chunk meshes with world coordinates and mesh.position (0,0,0). If geometry positions are world coordinates, intersection.point is world. face.normal local equals world. Good.
+
+Need ensure chunk rebuild updates global meshes array. Could store meshes in Map entries and global array. For raycast, array of meshes. When delete dispose remove from array.
+
+Chunk data indexing: 16x80x16. index = (y*16 + z)*16 + x? Need consistent. Let's define CHUNK_SIZE=16, HEIGHT=80. data[x + y*16 + z*16*16]? Simpler: idx = (x * 16 + z) * 80 + y? Or (y*16+z)*16+x. Need local x,z,y. For loops x,z,y. Use index = (y * CHUNK_SIZE + z) * CHUNK_SIZE + x. readBlock worldX,worldY,worldZ: if y<0||>=HEIGHT return 0. cx=Math.floor(x/16), cz=Math.floor(z/16); lx=x-cx*16; lz=z-cz*16; chunk=chunks.get(key); if !chunk return 0; return chunk.data[(y*16+lz)*16+lx]. Need Math.floor for negative works. local = x - cx*16 (integer). For writeBlock: ensure chunk exists? If missing maybe generate? For edits we know existing. But helper could create empty chunk if needed. Set data idx. If y 0 unbreakable? writeBlock can ignore y=0? Spec left click not y0; place maybe no y0? We'll enforce in edit. writeBlock can set any but protect y0? Could set if y==0 return? But generation sets stone. For safety if y==0 return false? But if placing at y0? place cell floor(p+n*0.5) might be 0? If target bottom face of y1 block, normal down -> place cell below = y0; but spec not y0 for break only. Place should maybe allow y0? It says unbreakable stone. Better prevent edit at y0. For writeBlock if y==0 and data already stone? Could no-op. We'll implement setBlock returns false if y<1 or >=HEIGHT? But generation uses setGenerated directly not via helper? Could use data assignment. For player collision readBlock sees y0 stone.
+
+Chunk generation: Need generate chunk block data only for within 5 max per frame. We can have function ensureChunkData(cx,cz) creates {data:new Uint8Array(16*80*16), mesh:null}. Fill using world coords. Need no Math.random. Use hash and noise.
+
+Hash implementation: integer-coordinate hash giving 0-1 mix large prime multipliers and xor-shifts. Could implement function hash3(x,y,z) returns [0,1). For value noise lattice at integer coords. Example:
+function hash(x,y,z){ let n = x*374761393 + y*668265263 + z*2147483647; n = (n ^ (n >> 13)) * 1274126177; n = n ^ (n >> 16); return (n & 0x7fffffff)/0x7fffffff; }
+But JS bitwise with large numbers? Need use Math.imul or modulo. Since x,y,z can be big maybe beyond 32-bit. Use modular arithmetic: let n = (x*374761393 + y*668265263 + z*1274126177) % 2147483647; n = Math.imul(n ^ (n >> 13), 1274126177); n = n ^ (n >> 16); return (n & 0x7fffffff)/0x7fffffff. But x*large may exceed safe integer if x large. For typical player coords maybe thousands, product ~1e12 safe (<9e15). Could use modulo each term: ((x % MOD)*const + ... ) % MOD. Need negative handling. Use ((n%MOD)+MOD)%MOD. But hash only needs deterministic; bitwise on numbers up to MOD okay. Let's define MOD = 2147483647. function mod(n){ n %= MOD; return n<0?n+MOD:n; } function hash3(x,y,z){ let n = (mod(x)*374761393 + mod(y)*668265263 + mod(z)*1274126177) % MOD; n ^= n >> 13; n = Math.imul(n, 1274126177) % MOD; n ^= n >> 16; return (n & 0x7fffffff)/0x7fffffff; } But Math.imul returns signed 32-bit; with mod maybe okay but could negative. Better: n = Math.imul(n, 1274126177) & 0x7fffffff? Then xor shifts. Simpler: use uint32 operations: function hash3(x,y,z){ let n = (x * 374761393 + y * 668265263 + z * 1274126177) >>> 0; n ^= n >>> 13; n = Math.imul(n, 1274126177) >>> 0; n ^= n >>> 16; return (n >>> 0) / 4294967295; } But x*const may exceed safe for huge coords. For file demo okay? Could be endless but player likely not millions. Use modulo to avoid overflow: let a = ((x % MOD)+MOD)%MOD; etc. n = (a * 374761393 + b * 668265263 + c * 1274126177) % MOD; n = Math.imul(n ^ (n >>> 13), 1274126177) & 0x7fffffff; n ^= n >>> 16; return n / 0x7fffffff. Need ensure positive. This is okay.
+
+Value noise 2D: lattice integer grid. For x,z floats. ix=floor(x), fz=floor(z); fx=x-ix, fz=z-fz. smoothstep t*t*(3-2t). v00=hash(ix,iy? no for 2D use hash3(ix,0,fz) maybe). bilinear: a=v00+(v10-v00)*sx; b=v01+(v11-v01)*sx; return a+(b-a)*sy. fractal: sum octaves with freq*2 amp*0.5 normalize? Spec 4 octaves combined into fractal noise. Could return weighted sum / total amplitude or maybe raw sum normalized. Need m,h in [0,1]? For height formula m*m*58 + h*10. If fractal returns ~0..1. Implement: let value=0, amp=1, freq=1, max=0; for i 0..3: value += noise2(x*freq,y?)*amp; max+=amp; amp*=0.5; freq*=2; return value/max. For x,z scaled by coord*0.004 etc. For 3D noise similarly hash3(ix,iy,iz) and trilinear smoothstep. Could implement noise3. Caves threshold >0.67. fractal3 maybe normalized. Use noise3 directly? Spec: plus a 3D version for caves; likely fractal? "Implement simple value noise yourself... smoothed 2D noise ... 4 octaves combined into fractal noise, plus a 3D version for caves." Could use noise3 single octave or fractal3. We'll implement noise3 with bilinear/trilinear and fractal3 with 4 octaves? Caves threshold 0.67; if fractal normalized maybe many >0.67? Need tune. Could just use noise3 at pos*0.09 (single octave) >0.67. But "fractal noise" for terrain, plus a 3D version for caves maybe single value noise. Let's implement fractal3 maybe with 3 octaves? If normalized, threshold 0.67 yields some caves but not too many. Single smooth noise at scale .09 has large blobs; >0.67 maybe 1/3 volume? Since hash random uniform smoothed, values range 0-1, >0.67 ~33% of cells within y range -> huge caves. Maybe threshold high and fractal normalized reduces variance? Need not perfect. Could use fractal3 normalized with amplitude sum: average tends around .5, variance lower; >0.67 maybe less but still many. Could define caveNoise = noise3(x*0.09,y*0.09,z*0.09); if >0.67 air. That might create big holes. Accept? Need playable mountains not too broken. Maybe use 3D fractal with threshold .68 and only y 3..H-2. But large caves could make terrain weird. Let's tune: Use hash noise but maybe cave condition >0.75? Spec says exceeds 0.67. Must follow. Could make noise3 output biased lower by using hash values squared or combination? But spec says value noise. If threshold fixed, we can design fractal3 normalized with higher octaves making variance smaller? Actually average of multiple smoothed noises tends to normal around .5 std maybe ~0.2; >0.67 maybe 18%. Still caves. Could use caveNoise = fractal3(x*0.09,y*0.09,z*0.09); if >0.67 air. Okay.
+
+Height formula: H = floor(5 + m*m*58 + h*10). If m,h 0..1, max 73, min 5. Good. Need clamp? y up to 79; H can be 73. Good. m*m means m squared. If fractal returns maybe negative? Ensure [0,1].
+
+Column fill: y=0 stone unbreakable. For y from 1 to min(H-1, HEIGHT-1): if y < H-3? below H-3 stone. The 3 layers under surface dirt: which exactly? "below H−3 stone; the 3 layers under the surface dirt (sand if H ≤ 16, stone if H ≥ 37); surface = ..." Let's parse. Surface at y=H? Usually block IDs at y=H? If height H means top solid y=H? y0..H inclusive? Need decide. If H=floor(...). Fill: y0 stone; below H-3 stone; the 3 layers under the surface dirt... surface = ... If surface is at y=H, then layers under surface are y=H-1,H-2,H-3? But says below H-3 stone, so those three maybe H-1,H-2,H-3? Wait if below H-3 stone (y < H-3), and 3 layers under the surface dirt: y = H-3,H-2,H-1? But then below H-3 excludes y=H-3. Maybe "below H−3 stone; the 3 layers under the surface dirt" means y from H-3 to H-1 are dirt/sand/stone, and y < H-3 stone. Surface at y=H. So fill for y=1..H: if y < H-3: stone; else if y < H: subsurface (dirt or sand or stone); if y == H: surface. Need ensure when H small (<3) handle. For H=5, y<2? y=1 stone? 3 layers under surface: y=2,3,4? below H-3=2: y<2 stone; y=2..4 subsurface; surface y=5. Good. For H<=16 subsurface sand, surface sand. For H>=37 subsurface stone, surface snow/stone. For mid 17..36 subsurface dirt, surface grass.
+
+Caves: for y between 3 and H-2 inclusive? "between 3 and H−2" likely inclusive. If cave noise > .67 set air. But don't remove y0, maybe y=1,2? y>=3. It can make holes under subsurface. Ensure if surface block at H not removed (caves only up to H-2). Good.
+
+Trees: on grass, when per-column hash <0.02 and trunk fits inside chunk: 4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air). Need generate within chunk. For each column x,z in chunk if surface is grass (after fill?) at y=H? Need tree base maybe at H+1? "4 wood blocks up" from ground: trunk occupies y=H+1..H+4? Leaves layers: likely around top of trunk. Need define. If surface block at H, place wood at y=H+1..H+4. Leaves 5x5 layer twice: maybe at y=H+3 and H+4? Then 3x3 at H+5, then 1 at H+6. Or leaves as canopy around top: two 5x5 layers at y=H+3,H+4, then 3x3 at H+5, then 1 at H+6. Need only into air. Trunk fits inside chunk: x,z local not near edges? For 5x5 leaves could extend outside chunk. Spec says trunk fits inside chunk maybe for tree generation? "when ... and the trunk fits inside the chunk" Could mean only generate if x,z local within [2,13]? To avoid out-of-chunk leaves? But since readBlock can access neighbor chunks for meshing, but generation only this chunk; leaves outside not generated until neighbor chunk generated. If tree near border could be incomplete unless we also write to neighbors? Simpler: require trunk local x,z in 2..13 so 5x5 leaves within same chunk (center ±2). That's "trunk fits inside the chunk" maybe. We'll do if lx>=2 && lx<14 && lz>=2 && lz<14. Then place wood/leaves only into air. Need avoid placing above HEIGHT-1.
+
+Need generation order: fill column, caves, then trees? Trees should be on grass surface; after caves may leave holes but tree only if surface grass at H and no cave removed surface (caves up to H-2 so surface intact). Need maybe check data[idx(H)]==GRASS. Then place trunk/leaves.
+
+Meshing: For each chunk with data, build arrays positions, normals, colors. Loop x 0..15,z 0..15,y 0..79. id=data[idx]; if 0 continue. worldX=cx*16+x etc. For each face check neighbor readBlock(worldX+dx,...). If 0 add face. Need face definitions for unit cube. Coordinates: block cell [wx, wx+1] etc? We can use block coordinates as min corner. Top face normal (0,1,0) vertices: (x,y+1,z), (x,y+1,z+1), (x+1,y+1,z+1), (x,y+1,z), plus second triangle? Need consistent winding for raycast normals? For lambert, double-sided? Material side FrontSide default. Need faces oriented outward so front visible. If using non-indexed triangles with correct CCW when viewed from outside. Let's define vertices arrays per face with two triangles:
+
+Top y+1 normal +Y: vertices:
+0: (x, y+1, z)
+1: (x, y+1, z+1)
+2: (x+1, y+1, z+1)
+0,2,3? Let's do quad [v0,v1,v2, v0,v2,v3] with v3=(x+1,y+1,z). Viewed from +Y looking down, coordinates x right, z? In Three coordinate system: camera looks -Z? Need orientation. For front side, triangle normal via cross(v1-v0,v2-v0). Let's compute top: v0=(0,1,0), v1=(0,1,1), v2=(1,1,1). v1-v0=(0,0,1), v2-v0=(1,0,1). Cross = (0*1 - 1*0=0, 1*1 - 0*1=1, 0*0 - 0*1=0) = +Y. Good. Second triangle v0,v2,v3: cross(v2-v0=(1,0,1), v3-v0=(1,0,0)) = (0*0-1*0=0, 1*1-1*0=1,1*0-0*1=0) +Y. Good.
+
+Bottom normal -Y: quad maybe [v0=(x,y,z), v1=(x+1,y,z), v2=(x+1,y,z+1), v0,v2,v3=(x,y,z+1)]. Cross (1,0,0)x(1,0,1)=(0,-1,0). Good.
+
+North face? Need 4 side faces: +X, -X, +Z, -Z. Let's define generic addFace with vertices arrays and normals.
+
+For +X face normal (1,0,0): vertices at x+1. Viewed from +X looking -X, need CCW. Use v0=(x+1,y,z), v1=(x+1,y,z+1), v2=(x+1,y+1,z+1), v3=(x+1,y+1,z). Quad [v0,v1,v2, v0,v2,v3]. Cross v1-v0=(0,0,1), v2-v0=(0,1,1) => ( -? cross a x b: a=(0,0,1),b=(0,1,1): y = a_z*b_x - a_x*b_z = 1*0-0*1=0; z = a_x*b_y - a_y*b_x =0*1-0*0=0; x = a_y*b_z - a_z*b_y =0*1 -1*1=-1) gives -X. Not correct. Reverse order: v0=(x+1,y,z), v1=(x+1,y+1,z), v2=(x+1,y+1,z+1). Cross (0,1,0)x(0,1,1) = (1*1-0*1=1,0*0-0*1=0,0*1-1*0=0) +X. Good. Quad [v0,v1,v2, v0,v2,v3] with v3=(x+1,y,z+1). Check second cross (0,1,1)x(0,0,1) = (1*1-1*0=1, 1*0-0*1=0,0*0-1*0=0)+X. So +X vertices: (x+1,y,z), (x+1,y+1,z), (x+1,y+1,z+1), (x+1,y,z+1).
+
+-X normal -X: vertices at x. Need cross -X. Use v0=(x,y,z), v1=(x,y,z+1), v2=(x,y+1,z+1). Cross (0,0,1)x(0,1,1)=(-1,0,0). Good. Quad [v0,v1,v2, v0,v2,v3=(x,y+1,z)].
+
++Z normal +Z: vertices at z+1. Need cross +Z. Use v0=(x,y,z+1), v1=(x+1,y,z+1), v2=(x+1,y+1,z+1). Cross (1,0,0)x(1,1,0)=(0,0,1). Good. Quad [v0,v1,v2,v3=(x,y+1,z+1)].
+
+-Z normal -Z: vertices at z. Use v0=(x,y,z), v1=(x,y+1,z), v2=(x+1,y+1,z). Cross (0,1,0)x(1,1,0)=(0,0,-1). Good. Quad [v0,v1,v2,v3=(x+1,y,z)].
+
+Alternatively can define arrays for each face and push 6 vertices. Need color per vertex with lighting factor: top 1.0, bottom .55, sides .8. For each face factor. Color from block color. Precompute colors [r,g,b] normalized? MeshLambertMaterial vertexColors expects Float32 RGB maybe linear? Three r128 default encoding? We can use THREE.Color from hex and multiply by factor. Need one shared MeshLambertMaterial({vertexColors:true}). But with lights, material color white; vertex colors. Use geometry.setAttribute('color', new THREE.BufferAttribute(colors,3)). In r128 BufferGeometry setAttribute exists. Material: new THREE.MeshLambertMaterial({ vertexColors: true }). Note in r128 vertexColors boolean (not THREE.VertexColors). Good.
+
+Colors: block color integer hex. Convert to r,g,b: ((hex>>16)&255)/255 etc. Multiply by factor. Maybe account gamma? Not necessary.
+
+Raycasting with Lambert material and fog okay.
+
+Chunk mesh at origin: geometry positions world coords, mesh.position (0,0,0). Add to scene and meshes array. If rebuild existing chunk: remove old mesh from scene and global array, dispose geometry, create new. Need avoid duplicate in array. Could maintain entry.mesh; function setMesh(chunk,cx,cz) if entry.mesh {scene.remove; indexOf? We can use Set for raycast? Spec says global array. Use array meshes = []; when rebuild: if entry.mesh { scene.remove(entry.mesh); const i=meshes.indexOf(entry.mesh); if(i>=0)meshes.splice(i,1); entry.mesh.geometry.dispose(); entry.mesh=null; } build new push.
+
+Raycast: raycaster.setFromCamera({x:0,y:0}, camera). But camera rotation order YXZ. Need update camera.position and quaternion from yaw/pitch. camera.rotation.order='YXZ'; camera.rotation.y=yaw; camera.rotation.x=pitch. Raycaster setFromCamera vector center 0,0 uses camera matrixWorld? Need camera.updateMatrixWorld() after setting position/rotation. Or raycaster.ray.origin=camera.position; raycaster.ray.direction.set(0,0,-1).applyQuaternion(camera.quaternion). Use that to avoid setFromCamera. But spec says raycast from camera center. We'll do manual: raycaster.ray.origin.copy(camera.position); raycaster.ray.direction.set(0,0,-1).applyEuler(camera.rotation) maybe. Since rotation order YXZ, direction = (sin yaw * cos pitch? Let's just apply quaternion). Need camera.updateMatrixWorld(); raycaster.ray.direction.set(0,0,-1).applyQuaternion(camera.quaternion). intersectObjects(meshes, false). Max distance 6: use raycaster.far=6? In r128 Raycaster has far property. Or filter intersects[0].distance <=6. We'll set raycaster.far = 6.
+
+Outline targeted block: black wireframe box. Need create THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1,1,1)), new THREE.LineBasicMaterial({color:0x000000})) maybe EdgesGeometry each time? Better one BoxGeometry and LineSegments; set position to block center (bx+0.5,by+0.5,bz+0.5). Need visible only if target. Could use outline.visible=false initially. Use black wireframe. But if block at y0 break not allowed? Outline still show maybe okay.
+
+Break/place calculations: intersection point p (world), face normal n. Need target = floor(p - n*0.5) per component. For a hit on top face of block at cell (bx,by,bz), p.y=by+1, n=(0,1,0). p-n*0.5 => y=by+0.5 floor by; x,z inside [bx,bx+1] maybe if near edge? If point exactly on edge could floor ambiguous but okay. place cell = floor(p+n*0.5): top face gives y=by+1.5 floor by+1. Good. For side face +X, p.x=bx+1, n=(1,0,0): target floor(bx+0.5)=bx; place floor(bx+1.5)=bx+1. Good. Need if normal from geometry maybe not exactly axis due to raycast? It should be. But could face.normal is in local coordinates and maybe not normalized? Normalize n = intersect.face.normal.clone().normalize(). Use p.x - n.x*0.5 etc. Math.floor. Need handle negative coordinates: Math.floor works.
+
+Break only while locked: left click sets target air not y0. Right click place selected if place cell air and does not overlap player. Need event listeners on mousedown? While pointer locked, document 'mousedown' button 0/2. Suppress contextmenu. Need ensure clicks don't fire when overlay open? Only if locked. Also start overlay click requests lock; but that click could also be interpreted as break? We can request pointer lock on overlay click and not process game input unless locked. For mousedown, if !pointerLocked return. For right click context menu suppressed globally.
+
+Pointer lock: document.addEventListener('pointerlockchange', ...). If locked true hide overlay, locked=true; else show overlay, locked=false. Start overlay onclick: canvas.requestPointerLock(). Need maybe after pointer lock release due to Esc overlay reappears.
+
+Mouse look: document.addEventListener('mousemove', e => if(locked){ yaw -= e.movementX*0.002; pitch -= e.movementY*0.002; clamp pitch -Math.PI/2+0.01 to Math.PI/2-0.01 }). Sign? Typically movementX right turn camera left? If yaw decreases for right? In Three, positive yaw rotates left? Let's choose yaw += -movementX*0.002? Actually camera rotation.y positive rotates counterclockwise around Y (left). Mouse moving right should look right (clockwise), so yaw -= movementX*sens. Pitch: positive x rotation tilts up? In Three, rotation.x positive looks up? Camera default looking -Z; rotating +X (pitch) tilts camera upward? Let's test mentally: Euler YXZ, vector forward = apply quaternion to (0,0,-1). If pitch positive: rotate around X: y' = -sin(pitch)*z? For small p>0, (0,0,-1) -> (0, sin p?, cos?) Actually rotation matrix Rx: [1,0,0;0,cos,-sin;0,sin,cos]. Apply to (0,0,-1): y = -sin? row2: 0*0 + cos*0 + -sin*(-1)=sin. z=cos*(-1)=-cos. So positive pitch looks up (+Y). Mouse moving down should look down => pitch -= movementY*sens? If movementY positive (down), pitch decreases -> negative looks down. Good. yaw: Ry [cos,0,sin;0,1,0;-sin,0,cos]. Apply to forward (0,0,-1): x = sin* -1 = -sin, z=cos*-1=-cos. Positive yaw makes x negative (left). Mouse right movementX positive should look right (+x), so yaw -= movementX. Good.
+
+Movement WASD relative to yaw: forward direction in XZ: (-sin yaw, 0, -cos yaw) for camera? But player move forward should align with camera horizontal. Right vector: (cos yaw,0,-sin yaw)? Let's derive: forward = (-sin yaw,0,-cos yaw). right = forward cross up? Or apply rotation to (1,0,0): Ry*(1,0,0)=(cos,0,-sin). So right=(cos,0,-sin). Move W adds forward * speed; S subtract; D adds right; A subtract. Need maybe if camera pitch no effect on horizontal. Good.
+
+Player physics: position? Use player.pos = {x:8,y:?,z:8}. Eye offset 1.62. Player box half-width .3, height 1.8. Collision AABB min x=pos.x-0.3, max=pos.x+0.3, min y=pos.y, max y=pos.y+1.8. Feet pos.y. Need spawn above terrain at x=8,z=8: find highest solid? Could use getHighestBlock or generate chunk data for spawn? At start before chunks generated maybe need ensure spawn safe. We can compute terrain height at (8,8) using heightAt function without chunk data and set y=H+1 maybe. But if caves under surface not matter. Need also generate initial chunks maybe in first frame. In init: player.x=8,z=8; player.y=terrainHeight(8,8)+1 (or +0.1). Ensure no overlap? If surface at H solid top block y=H, feet should be at H+1? Blocks occupy y..y+1. Top of surface block at H is y=H+1? Wait if block ID at y=H occupies [H,H+1]. So standing on surface feet y=H+1. Spawn above terrain: y = heightAt(8,8)+1. But collision with block at y=H? AABB min y=H+1, block max y=H+1, overlap if inclusive? Need define collision overlap if AABB intersects solid cell [bx,bx+1] etc. If feet exactly at top, min y == block maxY; should not collide if using strict < or <=? We'll implement intersectsBlock: if pxMin < bx+1 && pxMax > bx && pyMin < by+1 && pyMax > by && pzMin < bz+1 && pzMax > bz. If pyMin = by+1, condition pyMin < by+1 false -> no overlap. Good. Spawn y=H+1 safe. If tree at spawn? Could be leaves/wood above; may collide. We can scan highest solid including trees and set y=highestTop+1. But heightAt doesn't include trees. At x=8,z=8 maybe tree unlikely but could. Better after generating initial chunks? Simpler compute spawn by checking readBlock after ensure chunk data for (0,0) and neighbors? We'll generate initial chunks synchronously before loop? Could ensureChunkData for cx 0, cz 0 and mesh later. Then find highest y from 79 down readBlock(8,y,8) >0, set y=y+1. If none y=1. But if chunk data generated includes trees near x=8? local x=8,z=8 fits tree maybe; could spawn inside leaves. We can choose spawn at x=8,z=8 per spec. Could clear blocks around spawn? Not specified. Could compute highest solid and if overlap with player, move up until air? Need avoid spawning in tree. We'll implement after initial data generation: find top = -1; for y 79 down to 0 if readBlock(8,y,8) !=0 {top=y; break;} player.y = top+1; then while colliding with blocks (check AABB around spawn) player.y += 1 up to 79. But if tree at x=8, leaves might occupy y H+3.. etc; top could be leaves, set above them okay. If inside trunk? top maybe leaves too high. Good.
+
+But chunk generation per frame max 4; initial can ensure spawn chunks manually before start? We can in init call ensureChunkData for cx=-1..1,cz=-1..1? That's 9 > max but only once okay. But spec max per frame during game. We can also just let loop generate within 5 max 4, first frames may have no meshes until neighbors; player physics uses readBlock, if missing returns air -> fall before chunks generated. To avoid falling through ungenerated world at start, we should pre-generate initial chunks synchronously (within maybe 2) and spawn above terrain using heightAt. But spec says each frame generate max 4; doesn't forbid initial pre-generation? It says Each frame: generate block data for all chunks within 5... max 4 per frame. At startup, can ensure a few chunks to avoid fall? If we call ensureChunkData for many outside loop maybe violates? Could instead in first frame before physics generate up to 4? But if spawn chunk not generated? Within 5 includes spawn; but only 4 of 9 within radius. Need prioritize nearest. We'll implement generation queue sorted by distance to player, max 4. At startup, if spawn chunk missing and no data, physics may see air for y below? But we can set spawn y from heightAt (not readBlock) so above terrain; then first frame generate chunks maybe including spawn before physics? In animate order: generateChunkData(); buildMeshes(); updatePlayer(); Then at t=0, generation up to 4 nearest includes spawn and adjacent? If only spawn generated, player sees air below until mesh built next frames but collision readBlock for spawn chunk works if generated. If spawn not in first 4 due to sorting maybe it is nearest distance 0. Good. If adjacent missing, collision at edges may see air but player small likely okay. Could pre-generate spawn data synchronously in init using ensureChunkData(0,0) and maybe neighbors? It's not "each frame" but okay. To be safe, in animate first call generateChunkData with max 4; before physics, if spawn chunk missing force ensureChunkData(cx,cz) (one extra?) Might violate max but prevents fall. I think acceptable if initial setup. But spec strict? Could implement generation queue and at init pre-generate only spawn chunk (within max). Then heightAt spawn. Good.
+
+Chunk data generation function: ensureChunkData(cx,cz) returns entry; if exists return. Create Uint8Array. Fill columns for lx,lz. Need use worldX=cx*16+lx, worldZ=cz*16+lz. Compute H = columnHeight(worldX,worldZ). For y 0..HEIGHT-1: id=0; if y==0 id=STONE; else if y <= H? Need top block at y=H. But HEIGHT 80; if H>=79? Max 73. Fill:
+if y==0 id=STONE;
+else if y > H id=0;
+else if y < H-3 id=STONE;
+else if y < H: // three layers under surface: y=H-3,H-2,H-1? But condition y < H-3 stone, so y>=H-3 and y<H. If H-3 could be negative for small H. For H=5, y=2,3,4 subsurface. Good. For H=1, y<H none; surface y=1. Need if y >= Math.max(1,H-3)? But y starts 1. Use else if y < H: id = subsurface.
+else if y == H: id=surface.
+But for H=0? min 5. okay.
+Subsurface type: if H <=16 SAND; else if H >=37 STONE; else DIRT.
+Surface: if H >=46 SNOW; else if H >=37 STONE; else if H <=16 SAND; else GRASS.
+Then caves: for y=3; y<=H-2; y++ if id !=0? If fractal3(worldX*0.09, y*0.09, worldZ*0.09) > 0.67 set 0. Should we only cave in stone/dirt/sand? Yes any non-air except y0. But if H-2 <3 skip. Need ensure not remove tree base later? Trees after caves. Good.
+Then trees: if surface id==GRASS and hash3(worldX, 17, worldZ)? per-column hash <0.02 and lx>=2 && lx<14 && lz>=2 && lz<14. Need trunk fits inside chunk maybe also top within HEIGHT? H+5 <=79? H max 73 so okay. Place wood y=H+1..H+4 if data index currently air. Leaves: two 5x5 layers at y=H+3,H+4? But if trunk occupies those, only into air so leaves around trunk not overwrite wood. 3x3 at H+5, top 1 at H+6. Need maybe leaves layer at H+2 too? Minecraft oak has leaves from y=5 to 7 with 5x5 bottom two layers? Spec: 4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top. If trunk height 4, leaves likely start at top of trunk? Could be layers at H+3,H+4 (5x5), H+5 (3x3), H+6 (1). That's okay. But if 5x5 at H+3 includes center where wood y=H+3 exists; only into air so no overwrite. Need also maybe leaves at H+2? Not specified. Good.
+
+Potential issue: Tree generation uses data after caves, but if caves remove trunk base? Surface remains grass, trunk placed above. Good.
+
+Need ensure chunk data for neighbor used in meshing: buildChunkMesh(cx,cz) only if chunk exists and neighbors exist. But when generating new chunks, some existing neighbor meshes may need rebuild if border faces now have neighbor solid/air? If a new chunk is generated adjacent to an existing chunk with air face that was visible because neighbor missing returned air; once neighbor data generated (maybe solid), the old mesh has unnecessary interior faces (faces between solid blocks) and should be rebuilt. Spec: build meshes for chunks within 4 whose 4 neighbors already have data max 2 per frame. It doesn't explicitly say rebuild existing chunk when new neighbor appears, but if we only build when all neighbors data exist, an existing chunk built earlier? We won't build until neighbors data exist. But if a chunk was generated and meshed when neighbors existed, later generation of a further neighbor shouldn't affect its border faces except immediate neighbor? If immediate neighbor existed at mesh time. However if we pre-generate some chunks and then generate new adjacent chunks, existing mesh might have visible face toward missing neighbor. We can avoid by only building if all neighbors data exist. So no chunk built until all four neighbors generated. When a new chunk generated, its neighbors that already had data but maybe not meshed because lacked this neighbor? They will be considered for build if within 4 and now all neighbors have data. If they already had mesh built before? Could happen if we pre-generated spawn and neighbors then built; later generating outside doesn't affect built chunks except new chunk adjacent to built chunk? If built chunk had all neighbors generated at time, new chunk is not immediate neighbor? Wait if built chunk at cx=0 had neighbors -1,1 generated. Later generate cx=2, not adjacent to 0? adjacent to 1. No effect. If we pre-generate only spawn, no mesh built until neighbors generated; then when neighbor generated, spawn can be built. Good. If edits: rebuild target chunk and neighbor if border. Good.
+
+But generation max 4 per frame within radius 5. Build max 2 per frame within radius 4 whose neighbors have data. Need ensure enough chunks generated so meshes appear. If only 4 generated/frame but need 9 for first mesh; after 3 frames all within 1 generated, build spawn. Good.
+
+Data generation queue: For cx from playerCx-5 to +5, cz... if no chunk data and distance maybe <=5? Add to list with dist2 = (cx-pcx)^2+(cz-pcz)^2. Sort by dist2, take max 4. Could also include chunks needed for meshing neighbors within radius? If a chunk within 4 needs neighbor at cx+1 within 5 generated. Good.
+
+Mesh build queue: chunks within 4 of player (dist <=4) that have data, all four neighbors have data, and no mesh? But if a chunk has mesh and was built before maybe not rebuild unless edit. We can just consider entries with data && !mesh && neighbors data. But what about chunk outside radius 7 deleted; when player returns, entry may be deleted, regenerate. Good. What about chunk within radius but mesh missing because neighbor data missing earlier; later build. Good. What if a chunk has mesh but neighbor rebuilt due edit? edit rebuilds both. Good.
+
+Removal: For each chunk entry in chunks, compute distance in chunk units from player chunk? "chunks farther than 7" likely max(|cx-pcx|,|cz-pcz|) > 7 or Euclidean? Use max abs >7 to ensure within radius. If >7 remove mesh dispose delete entry. Need iterate over chunks keys. If many deleted okay. Could maintain list? Map iteration fine. Need not delete data if no mesh? Spec says for chunks farther than 7, remove mesh dispose geometry delete entry. So delete entire entry.
+
+Clouds: 25 flat white transparent boxes at height ~90 slowly drifting and wrapping around player. Create array cloudMeshes. Geometry maybe BoxGeometry(width,height,depth). Material MeshBasicMaterial({color:0xffffff, transparent:true, opacity:0.8}). For each cloud random? No Math.random? Spec no terrain deterministic; clouds can use deterministic hash or fixed positions. Could generate 25 using hash3(i,0,0) for positions relative to player? Need drifting and wrapping around player. Simpler: create 25 clouds with initial offsets fixed (i*some). Each frame position = player.x + offset + drift, wrap modulo range. But if no Math.random, use deterministic values from i. Use hash3(i*1000+..., ...). Need not strict? Terrain says no Math.random; overall maybe avoid random entirely. Use hash for cloud offsets. Cloud boxes: width 20-40, height 2-5, depth 20-40. Position y=90 + small variation. Drift x += speed*dt (maybe 1 m/s). Wrap around player: if cloud.x < player.x - 200 cloud.x += 400; if > player.x + 200 cloud.x -= 400; similarly z. Or store relative offsets and wrap modulo 360. Clouds at height 90, camera far 400, fog 110? If fog 40-110, clouds at 90 height may be fogged? Camera distance to cloud maybe vertical 75 plus horizontal, within fog. White transparent with fog okay. Could disable fog on cloud material? Not required. But sky background/fog matching; clouds should be visible. Fog near 40 far 110 may hide distant clouds; but height 90 near player if directly above distance ~76 >40 partially fogged. Maybe use MeshBasicMaterial with fog:false to keep clouds white. Spec says matching fog; not necessarily cloud material. We can set fog:false for clouds and water? Water plane maybe should be affected? Could leave. But if fog far 110, water plane large re-centered at height 14.3; near player visible, distant fog hides. Good.
+
+Water: one large semi-transparent blue plane at height 14.3, re-centered on player each frame. PlaneGeometry size maybe 1000x1000? MeshBasicMaterial color 0x3b82f6? semi transparent opacity .75. Rotate -Math.PI/2. position x=player.x,z=player.z,y=14.3. Since water visual only. Need ensure not block raycasting; don't include in meshes array.
+
+Lights: AmbientLight 0.65? THREE.AmbientLight(0xffffff,0.65). Directional 0.8 maybe (0xffffff,0.8) position (0.5,1,0.3)? MeshLambertMaterial with vertex colors and fake lighting already multiplies colors; additional lights will darken further. Spec says fake lighting multiply by factors plus ambient/directional. If material Lambert responds to lights, vertex color multiplied by lighting intensity. With ambient 0.65 + directional maybe top faces get more? But we also bake face shading. Need avoid too dark. MeshLambertMaterial uses light intensities; if ambient .65 and directional .8, total up to 1.45; colors may brighten. We can set material color white, lights as specified. Maybe okay. But fake lighting factors should be visible: top brighter than sides/bottom. Directional from above can enhance top. Use directional position (100,200,100). Good.
+
+Sky background 0x87ceeb and fog. scene.background = new THREE.Color(0x87ceeb); scene.fog = new THREE.Fog(0x87ceeb,40,110). MeshLambertMaterial affected by fog. Clouds basic maybe fog false.
+
+UI CSS: body margin 0 overflow hidden. canvas block? We create renderer canvas appended. Start overlay div fixed inset 0 background rgba... display flex etc. Crosshair small center black/white? Use CSS position fixed left 50% top 50% transform translate(-50%,-50%), width 2px height 2px or cross lines. Hotbar fixed bottom center flex gap. Slots 48x48 background color, number white text. Selected border white. Need pointer events none for UI? Overlay should accept click; hotbar/crosshair pointer-events none. When overlay hidden display none.
+
+Renderer: new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(window.devicePixelRatio); setSize innerWidth innerHeight; renderer.domElement appended. Resize listener.
+
+Animation loop: requestAnimationFrame, dt clamp maybe 0.05. Need time for clouds drift. If pointer locked update movement; if not maybe still generate? Could generate regardless to have world. But player physics only when locked? Spec falling below teleport etc probably always. We can update physics only when locked? If overlay open, maybe freeze player but still render. Pointer lock released should show overlay; game paused? It says UI reappears whenever pointer lock released. Likely pause input/physics while not locked. But clouds drift and chunk management could continue based on player position. We can do if (locked) updatePlayer(); always generate/build/remove/clouds/water/raycast outline? Raycast only locked maybe for target; but can compute even if not? Spec each frame raycast? "Each frame raycast ... Only while pointer is locked: left click..." Outline targeted block. Could raycast only locked to avoid UI clicks. But outline should show when locked. We'll raycast if locked. If not locked outline hidden.
+
+Potential issue: Mouse wheel selects hotbar. Should work even overlay? Maybe only game. Add wheel listener; if locked or maybe always. Spec select with keys/wheel. We can allow when locked; but before lock no matter. If wheel while not locked maybe page scroll? prevent default if locked. Use document.addEventListener('wheel', e=>{ if(!locked) return; e.preventDefault(); selected = (selected + (e.deltaY>0?1:-1)+7)%7; updateHotbar(); }, {passive:false}). Keys 1-7: if key >= '1' and <= '7' select. Also Space jump only locked. Prevent default for space? Yes to avoid page scroll. WASD keys track pressed object.
+
+Collision details: Axis-separated collision against all non-air blocks (move per axis, revert on overlap; landing sets on-ground). Need implement moveAxis(axis, delta): if delta==0 return. Compute proposed position. For each axis separately maybe update player pos then check collisions with nearby blocks. Could do:
+function collides(x,y,z){ minx=x-HALF; maxx=x+HALF; miny=y; maxy=y+HEIGHT_PLAYER; minz=z-HALF; maxz=z+HALF; for bx=floor(minx) to floor(maxx - 1e-6)? Need include blocks whose cells intersect. For each block cell [bx,bx+1]. If readBlock(bx,by,bz)!=0 return true. Loop bx=Math.floor(minx); bx<=Math.floor(maxx - epsilon); bx++. Similar by=floor(miny); by<=Math.floor(maxy - epsilon). Since if max exactly integer top, floor(max-eps) excludes block above. Use EPS=1e-6. For negative coordinates works: min=-0.3 floor -1, max=0.3 floor 0? Blocks intersect x cells -1 and 0? AABB [-0.3,0.3] intersects cell -1 [-1,0] and 0 [0,1]. Loop bx=floor(-0.3)=-1; bx<=floor(0.3-eps)=0 includes -1,0. Good. For min=0, max=0.3 floor(min)=0, floor(max-eps)=0. Good. For min exactly block boundary? If AABB min = 1, max=1.3 intersects cell 1 only; loop bx=1 to floor(1.299)=1. Good. If AABB max exactly 1, min=.7: floor(.7)=0, floor(1-eps)=0, excludes cell 1? But AABB [0.7,1] touches cell 1 at boundary; should not collide if just touching. Good. If max=1.000001 includes cell 1. Good.
+
+Move per axis:
+function tryMove(dx,dz,dy?) We can update x then check collides, revert if collision; then z; then y. Need onGround detection after vertical movement. For gravity: vy -= GRAVITY*dt. Move Y: newY = y + vy*dt; if collides(x,newY,z) { // find landing? If vy<0 set y=nearest top? Axis-separated "move per axis, revert on overlap; landing sets on-ground." Could simply revert to old y and set vy=0, onGround=true if vy<0. But if falling fast, reverting to old position may leave gap and hover? Example old y=10.05, block top at 10, delta=-0.1 -> new y=9.95 collides, revert to 10.05, onGround true but not touching; gravity next frame vy negative small maybe move -0.004 collide? It will hover slightly. Could snap to block top. Spec says revert on overlap; landing sets on-ground. Maybe enough? But to be stable, we can compute snapped position if collision: if vy<0 set y = Math.ceil(y + vy*dt)? Need robust. Axis-separated collision often: move axis, if collision revert and zero velocity. To land exactly, we can binary search or snap to nearest non-colliding position along axis. Simpler: for Y movement, if collision, find safe y between old and new. Since block boundaries integers, set y = Math.floor(newY + playerHeight?)? Let's derive. Player AABB [y,y+1.8]. If moving down collides with block top at by+1. Need feet >= by+1. If proposed minY < by+1. Safe y = by+1. Could compute from collision blocks: when colliding, we can find maximum floor? But easier: if vy<0, set y = Math.floor(y + vy*dt)?? Not exact. We can implement axis move with stepping and snapping using collides at proposed; if collision, try to place exactly at boundary by scanning candidate positions near old/new. But maybe simple revert acceptable for small dt (falling speed up to 8.5? gravity dt .016 delta .4 max after long fall ~25*? terminal not capped? Could fall from high y with vy large, delta > block; revert may hover but onGround true and jump possible? Might be okay but could get stuck above ground by gap. Better implement robust axis collision resolution.
+
+Alternative: Use swept AABB per axis? For each axis, after proposed movement, if collides, compute nearest non-colliding position along axis by checking blocks in direction.
+
+For Y down: old y, new y = old + dy (dy<0). If collides at new, find topmost solid block intersecting column that blocks. We can loop blocks overlapping AABB horizontally and vertical range between new and old. For each block cell [by,by+1], if it intersects horizontal and proposed vertical, candidate safe y = by+1. Choose max candidate (highest) because landing on highest obstacle below old? But also ceiling for jump. For upward collision, candidate safe y = by - playerHeight (feet below bottom of block). We can compute general:
+- After applying axis delta, if collides, revert and set velocity 0, but also snap to nearest boundary based on delta sign:
+For Y:
+if dy < 0: find max blockTop among blocks intersecting horizontal AABB and vertical span [newY, oldY+1.8]? Actually proposed feet newY, top newY+1.8; old feet oldY. Blocks between. For each block cell by that intersects horizontal and block range overlaps [newY, newY+1.8] (or proposed AABB), candidate = by+1. Set y = max(candidate) if > newY? But must ensure new y not colliding: check collides(x,y,z). If not, set; else maybe old y. For dy>0: blocks intersecting proposed AABB above; candidate = by - PLAYER_HEIGHT (feet just below block bottom). Set y = min(candidate) (lowest ceiling) if < oldY? Then check.
+But scanning all blocks in vertical range can be many if fall large; but height 80 okay. Could implement collidesAndSnap for Y.
+
+For X/Z horizontal collisions: moving x positive, candidate safe x = blockMinX - HALF_WIDTH? If player AABB max proposed > bx+1? For collision with block cell [bx,bx+1], safe x = bx - halfWidth (if moving positive) or bx+1 + halfWidth (moving negative). Choose nearest. Could implement simpler: move axis in small substeps? Since speeds 5.5, dt .016 delta .09 < block; simple revert likely fine. For y fall speed can be large but we can clamp vy maybe -30? Delta .48 < block if dt .016; terminal could from high spawn max 80 -> sqrt(2*25*80)=63, delta 1.0 > block. Could cap velocity to e.g. -40 or use substeps. Spec gravity 25 no cap. Could implement Y snap robust.
+
+Maybe easiest: Use continuous collision by moving in small steps for physics if |dy|>0.2? But axis-separated requirement maybe okay. Could do per-axis move with substep max 0.2 m. For each axis delta, split into steps <=0.2, apply and revert on overlap. For Y large fall, multiple steps, landing at block boundary approximately within .2 gap; then next frames gravity small? If onGround set when collision, vy=0, position may be .1 above ground but no further movement; okay maybe visually floating slight. Could snap to nearest integer top after collision. Let's implement robust enough.
+
+Simpler collision resolution:
+function collides(x,y,z) as above.
+function moveAxis(axis, delta): if delta==0 return.
+If axis==x:
+  old=player.x; player.x += delta; if collides(...) { player.x=old; // maybe snap? For horizontal, if delta>0, find nearest block left boundary? Could just revert. Speed small, won't pass through. }
+Similarly z.
+For y:
+  old=player.y; player.y += vy*dt; if collides(...){ player.y=old; if (vy<0) onGround=true; vy=0; } else onGround=false? Need detect ground separately. For landing, after vertical move no collision, check collides(x,y - epsilon,z)? If true onGround true. But if exactly standing y=top, collides false; need ground detection: if collides(x, y-0.01, z) then onGround true (assuming feet near top). But if on ceiling? okay. For jump require onGround.
+
+Hover gap issue: if collision reverted to old y above ground by delta maybe up to 1 m. Ground check y-0.01 may still not collide if gap >0.01. Then vy=0 but onGround false, next frame gravity delta small, move down .004, no collision, fall until near ground. Eventually collision when proposed within block; revert to old just above block by <=delta (small). Could hover at a few cm? Let's simulate: old y=10.05, ground top 10. vy after onGround? If collision happened earlier and vy set 0 but gap .05, next frame vy=-0.4, new 9.65 collides, revert 10.05, vy=0, ground check y-0.01=10.04 no collide if top 10? Actually collides with block [9,10]? AABB min 10.04 > block max 10 false; ground false. So stuck hovering .05 with vy reset each frame. Bad. Need snap when collision down: set y to top of block (candidate) not old.
+
+Implement Y snap:
+function moveY(delta): if delta==0 return; old=player.y; newY=old+delta; if collides(x,newY,z): if delta<0 { // find floor candidate
+   // scan blocks intersecting horizontal AABB and vertical range [newY, old+PLAYER_HEIGHT] maybe proposed top.
+   let best = -Infinity;
+   let miny=Math.floor(newY); let maxy=Math.floor(old + PLAYER_HEIGHT); // top of player at old? If falling from old to newY, blocks between feet new and top old? Actually collision could involve block intersecting proposed AABB [newY,newY+1.8]. To find top candidate, scan by from floor(newY) to floor(newY+PLAYER_HEIGHT) maybe. But if old high, proposed top may still high; scanning proposed vertical range enough. Candidate = by+1. Need choose highest candidate that is <= old? and not colliding? For falling, we want highest block top below old that blocks. If multiple, max candidate.
+   for bx... for bz... for by=Math.floor(newY); by<=Math.floor(newY+PLAYER_HEIGHT); by++ if readBlock solid { best = Math.max(best, by+1); }
+   // Also consider block top at floor(old)? If collision due to feet crossing boundary, candidate in proposed range.
+   let snapped = best; if (snapped > newY && snapped <= old + 1e-6) { player.y = snapped; if (!collides(x,player.y,z)) { vy=0; onGround=true; } else { player.y=old; vy=0; onGround=true; } } else { player.y=old; vy=0; onGround=true; }
+ } else { // delta>0 jump upward collision with ceiling
+   let best = Infinity;
+   for by=Math.floor(newY); by<=Math.floor(newY+PLAYER_HEIGHT); by++ if solid { best = Math.min(best, by - PLAYER_HEIGHT); }
+   let snapped=best; if (snapped < old && snapped >= newY) { player.y=snapped; if (!collides(...)) vy=0; else player.y=old; vy=0; } else { player.y=old; vy=0; }
+ }
+} else { // no collision, update y, onGround = collides(x,y-0.01,z) maybe }
+
+But scanning proposed vertical range may miss candidate if delta large and block top above newY but below old? Proposed AABB includes [newY,newY+1.8]; if delta >1.8, proposed AABB skips ground block entirely (tunneling). But axis-separated move with large delta can tunnel. Need avoid by substeps or cap. Could cap vy to e.g. -30 and dt max .05 -> delta 1.5 < height? Still could tunnel if delta>1.8. Cap velocity to -20? Terminal from 80 maybe 63. Could clamp vy = Math.max(vy, -30) and dt clamp .05 => 1.5 < player height 1.8, no tunneling through thin blocks? If block is 1 thick, AABB movement of feet down by 1.5: proposed AABB [y-1.5,y+0.3]. It still intersects any block in between because vertical span length 1.8 > block size; scanning proposed range catches top candidate. Good. If delta < player height, no tunneling fully. Clamp vy min -30. For horizontal speeds small. Use dt max .05. Good.
+
+For Y collision snap scanning by from floor(newY) to floor(newY+PLAYER_HEIGHT) inclusive maybe if newY negative? But falling below -20 teleport before physics? We can check after move. If y < -20 teleport spawn and vy=0. Collision with ungenerated air may fall; okay.
+
+But candidate best = max(by+1) for all solid blocks intersecting proposed AABB horizontally and vertically. Could include block above feet (e.g. head collision while falling?) For falling, if player is inside a hole, multiple blocks; choose highest top <= old? Suppose standing in column with no ground but side walls? Horizontal scan may find blocks adjacent that are not below feet? collides only if AABB intersects cell. For candidate by+1 could be above newY but maybe not actually blocking because block horizontally overlaps player volume and vertical overlaps proposed. It is blocking, landing on it okay even if side? If block occupies space where player would be, safe y=by+1 may still collide with same block? If feet at top, no. But if block also extends above? It's single cell. Good. Choose max candidate ensures not inside any solid in proposed range? Need check collides after snap; if still collides due to another block above? If choose max top among all, feet at highest top, but there might be solid blocks above that overlap head (e.g. narrow hole with ceiling). collides after snap true -> revert old. But if old was safe and collision occurred, okay.
+
+For upward jump: candidate = by - PLAYER_HEIGHT (feet below block bottom). Choose min candidate? If delta>0, proposed AABB [newY,newY+1.8]; blocks intersecting. Safe feet just below bottom of lowest ceiling? For multiple ceilings, choose lowest bottom? Suppose block at by=10 (bottom 10), player height 1.8, safe y=8.2. If also block at by=11 safe 9.2; min is 8.2, but if block at 10 blocks, safe 8.2 may collide with block at 10? feet 8.2 top 10.0 touches no. Good. If there is block at by=9 (bottom 9) safe 7.2; min lower. But proposed movement from old maybe 9.5 to 10.5 collides with block by=10; candidate 8.2 below old? Could snap down too much. Better choose max candidate < old? For upward collision, we want highest feet position that avoids ceiling blocks encountered between old and new. Candidate = by - HEIGHT for blocks intersecting proposed AABB. Choose maximum candidate that is < old? Example block bottom 10, safe 8.2; old 9.5, set y=8.2 (drops) maybe okay but could be too low if old already below bottom? Actually if jumping into ceiling, you should stop with head just below block: feet = blockBottom - HEIGHT = 8.2. If old 9.5, that's below old by 1.3; but player cannot move up, should remain at old? If old 9.5 top 11.3 already intersecting block? Old would have collided before. So old safe means top < blockBottom for ceiling blocks above, so candidate >= old? Wait if block bottom 12, safe feet 10.2, old 9.5, candidate > old but less than proposed; set y=10.2. Good. If candidate < old, old was already colliding? Maybe due to multiple blocks; choose candidate closest to old from below: max candidates that are < old? For upward, set snapped = max candidate (closest to old) if snapped >= newY and snapped <= old. Then check. For downward, set snapped = min? Let's reason:
+Downward: want highest safe position not colliding, between proposed and old. Candidate tops by+1. We want maximum candidate <= old and > proposed. So max candidate.
+Upward: want lowest safe position? Actually feet below ceiling bottom: candidate = by - HEIGHT. We want maximum candidate? Suppose block bottom 12 -> candidate 10.2; proposed 10.5, old 9.5. Candidate 10.2 > old, set to 10.2 (good). If another block bottom 11 -> candidate 9.2, but old 9.5 would collide with that? top 11.3 intersects block 11? yes if bottom 11, top 11.3, old unsafe. So not. For safe old, all candidates >= old? Choose min candidate? If proposed collides with first ceiling at bottom 12 candidate 10.2; if also lower block bottom 13 candidate 11.2, max=11.2 but that would collide with block 12? feet 11.2 top 13.0 touches block 13 no, but block 12 bottom 12? AABB [11.2,13] intersects block 12 [12,13]? yes at overlap (feet below bottom? Actually block cell y=12 occupies [12,13]; player top 13, feet 11.2, overlaps 12-13, collides. Candidate from block 12 is 10.2. Need choose minimum candidate (lowest) to avoid all ceilings in proposed range? If blocks at 12 and 13, safe below lowest bottom = 10.2. So min candidate. But if old=9.5, set y=10.2? That's above old but still collides? top 12 touches block 12 no; okay. But moving up from 9.5 to 10.2, top reaches 12 exactly safe. Good. If candidate min < old, maybe revert old. So for upward: candidates = by - HEIGHT; snapped = min candidate (lowest safe) if snapped >= newY and snapped <= old? But if snapped > old, can we set above old? It means proposed collision but there is safe position between old and proposed? Actually min candidate may be > old if no ceiling until above old; yes set to candidate. If min candidate < old, old would collide with that block? Since candidate<old implies block bottom < old+HEIGHT = top old, so old collides. So shouldn't happen unless due to proposed scan includes blocks already intersecting old? But old safe. So snapped >= old. We'll set if snapped > newY && snapped <= old? Hmm if snapped > old, condition fails; maybe allow snapped < proposed and not colliding. Simpler: after candidate compute, try snapped = minCandidate; if collides(x,snapped,z) false and snapped > newY then player.y=snapped else revert old. For upward, snapped likely between old and proposed. Good.
+
+For downward: candidate = max(by+1); if !collides(x,candidate,z) and candidate < old? Actually feet at top, candidate may be > old if collision with block below head while falling? If old safe, any blocking block top <= old? If player falling, feet old above ground; candidate top <= old. Good. Set if candidate >= newY and candidate <= old. else revert.
+
+Need scan horizontal blocks: floor(minX) to floor(maxX-EPS), minZ to maxZ-EPS. For vertical proposed range: minY = floor(newY); maxY = floor(newY + PLAYER_HEIGHT - EPS). But for downward with large delta, if ground block top candidate by+1 where by=floor(newY) maybe if newY just below top? Example old 10.1, delta -0.2 -> new 9.9, proposed AABB [9.9,11.7]. Block cell by=9 [9,10] intersects; candidate 10. Good. If new 8.9 delta -1.2, proposed [8.9,10.7], block by=9 candidate 10; good. If delta -2 (clamped maybe not), proposed [8.1,9.9], block by=9? AABB top 9.9 <10, does not intersect block [9,10]? It intersects [9,9.9], yes candidate 10 > old? old 10.1, okay. If delta -3 proposed [7.1,8.9] misses block [9,10] tunneling; but delta<1.8 due clamp. Good.
+
+For horizontal collision snap maybe not necessary but could implement similar to avoid revert gap. Horizontal speed small, dt max .05 delta .275 < half? Could tunnel through thin wall if moving 5.5*.05=.275 less than block, no full tunnel but can get stuck near wall. Revert okay; on next frame move again may collide and revert, no penetration. Good.
+
+Ground detection: after Y movement no collision, set player.y=newY; onGround = collides(player.x, player.y - 0.01, player.z) maybe if feet just above top? If standing exactly top y=10, collides(y-0.01) with block [9,10]? AABB min 9.99 max 11.79 intersects block [9,10] yes, true. If gap .05 after snap? snap should eliminate. If no collision but on ceiling? okay. If jump vy>0, onGround false.
+
+Jump: if onGround && keys Space: vy = 8.5; onGround=false. Need maybe only while locked.
+
+Player teleport below -20: set x=8,z=8,y=spawnY, vy=0.
+
+Raycast target and outline: Need compute each frame while locked. Use raycaster.far=6. intersectObjects(meshes). If hit distance <=6. Determine block coords as above. Store targetBlock = {x,y,z}. Outline.position.set(x+0.5,y+0.5,z+0.5); visible true. If no hit or y<0? outline hidden. If target y=0 break disabled but outline can show? Maybe hide if y<1? Not necessary. For place cell store too? We'll compute on click from current raycast result to avoid stale. Keep lastHit = {point, normal}. On mousedown use lastHit if locked.
+
+Break: target floor(p - n*0.5). If target.y <=0 return. If readBlock(target) !=0? set air via writeBlock. writeBlock should allow y>0. Then rebuildChunk(cx,cz); if local x==0 rebuild neighbor cx-1; if local x==15 rebuild cx+1; similarly z. Need identify chunk border: lx = target.x - cx*16. If lx==0 etc. For negative, Math.floor. writeBlock returns entry? We'll implement setBlock(x,y,z,id): if y<1||y>=HEIGHT return false; cx,cz; entry=chunks.get; if !entry return false (should exist); lx... data[idx]=id; return true. After break call rebuildAround(x,z). rebuildChunk(cx,cz) only if entry exists? If chunk deleted maybe no mesh; but edit should occur in existing generated chunks. If neighbor entry missing, rebuildChunk can ensure? Spec neighbor chunk if block sits on border: rebuild neighbor chunk (mesh) if exists. If neighbor data not generated, cannot build; okay. But if neighbor has data and mesh, rebuild. We'll call rebuildChunk(cx+dx,cz+dz) which checks entry.
+
+Place: placeCell floor(p + n*0.5). Check readBlock(place)==0. Check does not overlap player. Need AABB of block [bx,bx+1] etc and player AABB. Function overlapsPlayer(bx,by,bz): return !(player.x+HALF <= bx || player.x-HALF >= bx+1 || player.y+HEIGHT_PLAYER <= by || player.y >= by+1 || player.z+HALF <= bz || player.z-HALF >= bz+1). Strict? If block adjacent touching no overlap. Use if (player.x + HALF > bx && player.x - HALF < bx+1 && ...). If true cannot place. Also maybe prevent placing at y0. setBlock if id selected and cell air. After edit rebuild.
+
+Selected hotbar: block IDs array [1,2,3,4,5,6,7]. Colors mapping for UI. Update DOM border.
+
+Potential performance: chunk mesh geometry arrays can be large. Max faces? 16*16*80 but surface only. Use plain JS arrays push. For each face add 6 vertices * 3 = 18 floats positions, 18 normals, 18 colors. Could be many but okay. Need maybe use Float32Array after building: new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(positions,3)) etc. In r128 Float32BufferAttribute exists. Or BufferAttribute with array? Use Float32BufferAttribute.
+
+Face neighbor check: For each face, neighbor coordinate world + offset. If readBlock returns 0 add. But for water plane not block; okay. For leaves transparent? Leaves render solid opaque; fine.
+
+Need ensure material side: FrontSide. Face winding correct. If some faces inverted due to raycast normal? Not critical if visible. Need maybe use THREE.DoubleSide to avoid missing faces if winding wrong. Spec says one shared MeshLambertMaterial, doesn't specify side. Could set side: THREE.DoubleSide to be safe. But raycasting with DoubleSide still works? Raycaster intersects both sides; face.normal may point opposite for backside? Intersection.face.normal is geometry normal, not flipped? In Three, for DoubleSide, raycast checks both and face.normal maybe original. If winding wrong, could still see. But if use FrontSide and correct winding okay. To be safe with normals/fake lighting, use side: THREE.DoubleSide? But then interior faces? We cull air neighbor so no hidden internal faces; double side okay. But raycast face normal for backside? If ray hits backside of a face (shouldn't because front visible), but if winding wrong maybe normal opposite causing target/place wrong. We can ensure correct winding and use FrontSide. However for bottom faces, we oriented -Y; camera looking up sees bottom? If block above, bottom face normal down, front side visible from below? In Three, front side depends on triangle winding relative to camera. For bottom face cross gave -Y; if camera below looking up, normal points toward camera? Camera direction maybe +Z? Let's trust.
+
+Need raycaster intersect with BufferGeometry non-indexed; it computes intersections per triangle. face.normal from geometry? In r128 Raycaster for Mesh uses intersection.face = new Face(a,b,c, normal) where normal from face? It may compute normal via triangle if not provided? For BufferGeometry with normal attribute, it uses normal attribute? Let's recall r128 raycast Mesh: if geometry has groups, etc. It calls checkIntersection; for each triangle, it computes intersection and creates Face with a,b,c, normal computed from triangle vertices (not necessarily attribute). The normal may be computed by cross product of edge vectors, which follows winding. Good.
+
+Potential issue: chunk meshes positions world coords huge; raycaster with far 6 okay. But geometry bounding sphere large; intersectObjects checks all meshes within radius? It uses bounding sphere distance to ray; if bounding sphere large (chunk area) but ray origin inside? For chunks not near camera, bounding sphere may be large and test many triangles? We only keep radius ~7 chunks = 15 chunks *49=231? Actually radius 7 -> 15x15=225 chunks; each mesh maybe many faces. Raycaster intersectObjects all meshes each frame could be heavy but okay for demo? 225 meshes, bounding sphere tests cheap; triangles only if ray intersects bounding sphere. But geometry bounding sphere may encompass chunk column height 80, radius ~43; many near player maybe a few. Good. Could optimize by only raycast meshes within distance? Not necessary.
+
+Need keep global array of chunk meshes for raycasting. If many deleted, array length manageable.
+
+Potential issue: Fog and far plane: camera far 400, fog far 110. Chunk deletion radius 7 chunks = 112 blocks; with fog far 110 okay. Meshes at boundary may be fogged out. Good.
+
+Cloud wrapping: Need create clouds deterministic. Could use for i=0..24: let rx=hash3(i*7+1, 1000, i*13+5); etc. width = 18 + hash*30; depth similar; height=2+hash*4. Position relative offsets maybe (rx-0.5)*400, (rz-0.5)*400, y=88+ry*6. Store cloud.userData.offset? Drift: cloud.position.x += dt * speed; then wrap relative to player: let dx = cloud.position.x - player.x; if dx < -200 cloud.position.x += 400; if dx > 200 cloud.position.x -= 400; same z. But drift speed maybe 1, clouds move absolute; wrapping maintains around player. If player moves faster than wrap? Range 400 enough. Good. Use hash for speeds too: speed = 0.5 + hash*1.5. Cloud material fog:false to avoid disappearing. Could make opacity .75.
+
+Water plane: PlaneGeometry(1000,1000) maybe large; fog false? If fog far 110, plane distant hidden but okay. Use MeshBasicMaterial({color:0x4488ff, transparent:true, opacity:0.6, side:THREE.DoubleSide, fog:false}). Position y=14.3. It will cover land below water; if terrain above water, plane hidden by blocks? Plane at 14.3; blocks top maybe >14.3; depth test okay. It may z-fight with water surface? No actual water blocks. It covers beaches where H<=16: surface sand top y=H+1 <=17; if H=16 top 17 above water, plane below surface? Wait height formula: surface block at y=H. Top of block y=H+1. Water plane height 14.3. If H=16, surface top 17 > water, no lake visible? Spec says water appears automatically where terrain lower; height 14.3 means if terrain surface top below 14.3? That requires H+1 <14.3 => H <=13. But beach condition sand if H<=16; lakes when H<13 maybe. okay. If H=13, top 14 > water slightly above; plane at 14.3 just above top? Actually block top 14, plane 14.3 visible as shallow water. If H=14 top 15 above. Fine.
+
+Need ensure camera near plane maybe 0.1. far 400.
+
+Start overlay: Should not have pointer-events on crosshair/hotbar. Overlay click to lock. If user clicks canvas after overlay hidden, mousedown break/place. Need prevent contextmenu globally.
+
+Pointer lock request: overlay.addEventListener('click', () => { renderer.domElement.requestPointerLock(); }); Also maybe if canvas clicked while locked? no.
+
+Potential issue: In some browsers, pointerlockchange fires with document.pointerLockElement === canvas. Use that.
+
+Keys: Use e.code for KeyW etc. Prevent default for space and arrows? We'll handle.
+
+Now code structure:
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>mc.html</title>
+<style> ... </style>
+</head>
+<body>
+<div id="overlay"> <h1>mc.html</h1><div controls...><p>Click to play</p></div>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// constants
+const CHUNK=16, HEIGHT=80, AIR=0, GRASS=1,...
+const BLOCK_COLORS = [0x000000,0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff];
+const BLOCK_NAMES? not needed.
+const HOTBAR_IDS=[1,2,3,4,5,6,7];
+let selected=0;
+
+// scene renderer camera lights fog sky clouds water outline raycaster
+...
+
+// chunks Map global
+const chunks = new Map();
+const chunkMeshes = []; // global array
+
+function key(cx,cz){return cx+','+cz;}
+function getChunk(cx,cz){return chunks.get(key(cx,cz));}
+function ensureChunk(cx,cz) { let k=key; let c=chunks.get(k); if(c)return c; c={data:new Uint8Array(CHUNK*CHUNK*HEIGHT), mesh:null}; chunks.set(k,c); generateChunkData(cx,cz,c.data); return c; }
+But generation max per frame should not call ensureChunk for all? In generation queue, we can create entry and fill. For readBlock missing returns air; writeBlock missing false. For pre-spawn ensure spawn.
+
+function chunkIndex(x,y,z){return (y*CHUNK+z)*CHUNK+x;}
+
+readBlock(x,y,z): if y<0||y>=HEIGHT return 0; cx=Math.floor(x/CHUNK); cz=Math.floor(z/CHUNK); lx=x-cx*CHUNK; lz=z-cz*CHUNK; c=chunks.get(key(cx,cz)); if(!c) return 0; return c.data[chunkIndex(lx,y,lz)];
+
+setBlock(x,y,z,id): if y<1||y>=HEIGHT return false; cx... c=get; if(!c)return false; data[idx]=id; return true;
+
+Height/noise functions:
+function mod(n,m){ n%=m; return n<0?n+m:n; }
+function hash3(x,y,z){ const MOD=2147483647; let n = (mod(x,MOD)*374761393 + mod(y,MOD)*668265263 + mod(z,MOD)*1274126177) % MOD; n = (n ^ (n >>> 13)) >>> 0; n = Math.imul(n, 1274126177) & 0x7fffffff; n = (n ^ (n >>> 16)) & 0x7fffffff; return n / 0x7fffffff; }
+Need x,y,z may be float? For hash lattice integer. Ensure Math.floor before call. For negative, mod handles.
+But using mod(x,MOD) where x large float maybe okay but if x not integer? We'll call with integers. For tree hash use integers.
+
+smooth(t)=t*t*(3-2*t)
+noise2(x,z): ix=Math.floor(x), iz=Math.floor(z); fx=x-ix; fz=z-iz; sx=smooth(fx); sz=smooth(fz); v00=hash3(ix,0,iz); v10=hash3(ix+1,0,iz); v01=hash3(ix,0,iz+1); v11=hash3(ix+1,0,iz+1); a=v00+(v10-v00)*sx; b=v01+(v11-v01)*sx; return a+(b-a)*sz;
+noise3(x,y,z): ix,iy,iz floors; fx... trilinear: for y? Use lerp. Could implement:
+v000=hash3(ix,iy,iz); v100=hash3(ix+1,iy,iz); ... Need consistent axes x,y,z. Then interpolate x then z then y. Use hash3(x,y,z). Good.
+fractal2(x,z): let val=0, amp=.5? max=0; for i 0..3 { freq=1<<i; val += noise2(x*freq,z*freq)*amp; max+=amp; amp*=.5; } return val/max. If amp starts 1: .5,.25,.125 max 1.875. okay.
+fractal3 similar maybe 4 octaves. For caves use fractal3? Let's implement noise3 single or fractal3? Spec says 3D version for caves. Could implement fractal3 with 3 octaves to reduce variance? But threshold .67. Let's implement fractal3 with 4 octaves normalized; maybe too few caves? Let's test mental: noise2 smooth value from random lattice has distribution mean .5 std ~0.2? Fractal average of 4 correlated at different scales, std lower maybe .15. >.67 ~8%. Good caves sparse. Use fractal3.
+
+columnHeight(x,z): m=fractal2(x*0.004,z*0.004); h=fractal2(x*0.02,z*0.02); let H=Math.floor(5 + m*m*58 + h*10); if(H<1)H=1; if(H>HEIGHT-1)H=HEIGHT-1; return H.
+
+generateChunkData(cx,cz,data): for lx 0..15 for lz: wx=cx*16+lx; wz=cz*16+lz; H=columnHeight(wx,wz); surface/subsurface; for y 0..min(H,79): id... data[idx]=id; caves loop y=3; y<=H-2 && y<HEIGHT; if fractal3(wx*0.09,y*0.09,wz*0.09)>0.67 data[idx]=0; tree check: if H>=? surface grass condition after fill/caves: data at idx(H) maybe GRASS (caves don't remove H). But if H>78? no. if read data[H]==GRASS and hash3(wx,17,wz)<0.02 and lx>=2&&lx<14&&lz>=2&&lz<14: for y=H+1 to H+4 if y<HEIGHT set wood if data idx==AIR; leaves layers: for layer 0..1 y=H+3+layer? Actually two 5x5 at H+3,H+4. Then 3x3 at H+5, top at H+6. But if wood placed up to H+4, leaves at H+3/H+4 around. Need ensure only into air. For dx -2..2 dz -2..2: x=lx+dx,z=lz+dz; if x,z in 0..15 and y<HEIGHT and data idx==AIR set LEAVES. For 3x3 dx -1..1 at H+5. top dx=0 dz=0 at H+6. Need maybe leaves not overwrite wood: check air only, so center remains wood. Good.
+
+Potential issue: If cave noise removes some trunk/leaves? Trees after caves, so placed solid. Good.
+
+Mesh build functions:
+function buildChunkMesh(cx,cz){ const c=chunks.get(key(cx,cz)); if(!c) return; if(c.mesh) removeChunkMesh(cx,cz); const positions=[], normals=[], colors=[]; const baseX=cx*16, baseZ=cz*16; for lx... for lz... for y... id=c.data[idx]; if id==0 continue; const wx=baseX+lx, wy=y, wz=baseZ+lz; const hex=BLOCK_COLORS[id]; const r=((hex>>16)&255)/255,...; // define addFace function inside? Need performance. Could have arrays of face definitions.
+For each face:
+Top if readBlock(wx,y+1,wz)==0 addFaceTop with factor 1.
+Bottom if y==0? readBlock(wx,y-1,wz) for y=0 returns air (y<0) so bottom visible? But y0 unbreakable stone at ground; bottom face at y=-1? If player below? Usually not visible but if falling under world, could see bottom. Spec adds side if neighbor air; readBlock y-1 returns air for y=0, so bottom faces added. okay factor .55.
++X if readBlock(wx+1,y,wz)==0 factor .8; -X; +Z; -Z.
+Need addFace functions push vertices and color repeated. Could define generic:
+function addQuad(p,n,c,r,g,b,factor, v0,v1,v2,v3) but arrays of numbers. To avoid function overhead? Fine.
+Maybe implement addFace(faceIndex): switch with hardcoded pushes. Need factor and color.
+
+Pseudo:
+function pushVertex(positions,normals,colors,x,y,z,nx,ny,nz,r,g,b){ positions.push(x,y,z); normals.push(nx,ny,nz); colors.push(r*factor,g*factor,b*factor); }
+But factor in color. For each face, define vertices [x,y,z,...] and normal. Then push 6 vertices: v0,v1,v2,v0,v2,v3. Could use local arrays.
+
+Maybe create FACE_DEFS = [
+ {n:[0,1,0], v:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]], f:1}, ... relative to block min corner (x,y,z). For each face, neighbor offset n? Actually face normal offset for neighbor check same as normal. But for bottom normal [0,-1,0]. Need vertices relative:
+Top: [[0,1,0],[0,1,1],[1,1,1],[1,1,0]], f=1, offset [0,1,0]
+Bottom: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]], f=.55, offset [0,-1,0]
++X: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]], f=.8, offset [1,0,0]
+-X: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]], f=.8, offset [-1,0,0]
++Z: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]], f=.8, offset [0,0,1]
+-Z: [[0,0,0],[0,1,0],[1,1,0],[1,0,0]], f=.8, offset [0,0,-1]
+Check -Z vertices cross: v0=(0,0,0), v1=(0,1,0), v2=(1,1,0): cross (0,1,0)x(1,1,0)=(0,0,-1) good. Quad second v0,v2,v3=(1,0,0): cross (1,1,0)x(1,0,0)=(0,0,-1). Good.
+
+For each face def: neighbor = readBlock(wx+nx,y+ny,wz+nz); if neighbor==0: for quad indices [0,1,2,0,2,3] push. Need colors per vertex. Could precompute color factors? For each block id and factor maybe r*factor. Use const cr=r*f etc. Then push same.
+
+After arrays length 0: geometry = new THREE.BufferGeometry(); if positions.length>0 set attributes. Mesh = new THREE.Mesh(geometry, blockMaterial); mesh.position.set(0,0,0); mesh.frustumCulled=false? Since geometry world coords and mesh at origin, bounding sphere computed; frustum culling okay but maybe bounding sphere large; keep true default. But if mesh position 0 and geometry world coords, bounding sphere center world chunk; frustum culling works. However raycaster uses bounding sphere. Good. But when player moves, mesh remains world. If geometry positions absolute and mesh.position=0, bounding sphere computed from positions. Good.
+Add to scene, chunks.get.mesh=mesh, chunkMeshes.push(mesh).
+
+removeChunkMesh(cx,cz): c=get; if !c||!c.mesh return; scene.remove(c.mesh); const idx=chunkMeshes.indexOf(c.mesh); if idx>=0 chunkMeshes.splice(idx,1); c.mesh.geometry.dispose(); c.mesh=null;
+
+rebuildChunk(cx,cz): if chunks.has(key) buildChunkMesh. But buildChunkMesh if mesh exists removes and rebuilds. If entry missing no-op.
+
+Generation per frame:
+function generateNearbyChunks(){ const pcx=Math.floor(player.x/CHUNK), pcz=...; const list=[]; for cx=pcx-5; cx<=pcx+5; cx++ for cz... { if(!chunks.has(key)) { const dx=cx-pcx, dz=cz-pcz; const d2=dx*dx+dz*dz; if(d2 <= 25) list.push({cx,cz,d2}); } } list.sort((a,b)=>a.d2-b.d2); for i<min(4,list.length) ensureChunkData(cx,cz); }
+ensureChunkData creates entry and generate. But if list has >4, some remain missing; next frame. Good.
+
+Build per frame:
+function buildNearbyMeshes(){ const pcx..., list=[]; for cx=pcx-4..+4 for cz... { c=get; if(c && !c.mesh){ // neighbors data exist
+   if(chunks.has(key(cx-1,cz))&&chunks.has(key(cx+1,cz))&&chunks.has(key(cx,cz-1))&&chunks.has(key(cx,cz+1))) { d2=dx*dx+dz*dz; list.push({cx,cz,d2}); }
+ }} sort take 2 buildChunkMesh. }
+But what if chunk has mesh but needs rebuild due to generation of neighbor? As argued no because only built when all neighbors exist. However consider chunk at radius 4 built, then player moves, new adjacent chunk outside previous generated appears; existing mesh's face toward new chunk was not visible before because neighbor missing returned air; but chunk should not have been built if neighbor missing. If it was built earlier when neighbor existed? New chunk is newly generated, so neighbor didn't exist before; contradiction. If entry deleted due distance and regenerated, adjacent chunks within radius may have meshes that had faces toward deleted entry (air) and now entry data exists solid; need rebuild adjacent. When player moves away, entries beyond 7 deleted. Adjacent at distance 6? Suppose chunk A at distance 6 has mesh, neighbor B at distance 7? If B deleted when >7? A's face toward B may become air visible (if B was solid before) but B entry deleted; readBlock returns air, mesh already had no faces? Actually if B was solid and generated, A mesh had no face between. When B deleted, entry gone, readBlock returns air, but A mesh still lacks face, so invisible hole? But fog far maybe B beyond 7 chunks (112 blocks) not visible; okay. When player returns and regenerates B, A may need rebuild. Our buildNearbyMeshes only builds !c.mesh; if A has mesh, won't rebuild. Could cause missing faces at border when re-entering. To handle, when generating a new chunk, we could mark adjacent existing meshed chunks for rebuild. Simpler: in ensureChunkData after generation, for four neighbors if entry exists and has mesh, rebuildChunk neighbor? But generation max 4; rebuilding may be okay but could cause many rebuilds. Spec doesn't mention but necessary for correctness. However if we only delete entries farther than 7 and meshes beyond fog, not critical. But edits at borders require rebuild. For world generation returning, maybe faces missing. We can implement a pendingRebuild set or mark neighbor dirty when new chunk generated. But spec says build max 2 per frame; rebuilds count? Could include in build queue with priority. Simpler: when ensureChunkData creates a chunk, for each neighbor entry if exists and has mesh, call rebuildChunk immediately (or add to rebuild list). This may exceed max but only for new chunk neighbors. But could be many over time. Acceptable? Need adhere "max 2 per frame" for building meshes; immediate rebuild violates. Could add dirty flag and build queue includes chunks with dirty true within radius? But if outside radius? Let's design robust but not too complex.
+
+Alternative: Keep entries data forever? Spec says delete entry farther than 7. So returning issue exists. We can when generating a new chunk, mark its neighbors dirty in their entry (dirty=true). Then buildNearbyMeshes considers chunks within 4 that have data and (!mesh || dirty) and all neighbors data; sort maybe prioritize dirty; max 2. But if dirty outside radius 4? It will be rebuilt when within 4. Good. Also when a chunk is deleted, its neighbors may need rebuild because faces to missing neighbor should appear (air). If deleting entry at >7, neighbors at <=6 may have meshes with no face toward solid now missing; but area far fogged. When player returns, new generation will mark dirty. Could also mark neighbors dirty on deletion if they exist. Good.
+
+But spec says for chunks farther than 7 remove mesh dispose delete entry. It doesn't say rebuild neighbors. But to maintain correctness near border, mark dirty neighbors within maybe radius? We can mark all existing neighbors dirty (set flag). Build queue will handle when near. Good.
+
+Implement entry: {data,mesh,dirty:false}. ensureChunkData: if new, generate; set c.dirty=true? It needs mesh build anyway. For neighbors: for each neighbor entry e, e.dirty=true. removeFarChunks: if entry.mesh remove? delete entry; for neighbors set dirty=true if exists.
+
+Build queue: consider chunks within 4 of player with data and all neighbors data and (!mesh || dirty). Sort by d2 maybe dirty first? Could sort by d2. Max 2. buildChunkMesh clears dirty=false after building. But what about chunk within radius that has no mesh but neighbor missing; not built. Good. What about chunk outside radius with dirty true but no mesh; will be generated when within 5? If entry deleted, gone. If entry exists outside 7? deletion removes. If between 5 and7 maybe data exists but no mesh; when player closer build. Good.
+
+However if a chunk is built while some neighbor data missing? We require all neighbors data. But for chunks at world edge none. Good.
+
+When edit rebuildChunk: should set dirty? It directly builds. But if neighbor missing, cannot build faces correctly? If editing border and neighbor data exists, rebuild both. If neighbor missing (shouldn't if generated), readBlock returns air; mesh has face toward air. If later neighbor generated, dirty marks will rebuild. Good.
+
+Need ensure buildChunkMesh sets c.dirty=false. If c.mesh exists remove first.
+
+Potential performance of marking neighbors dirty on generation: each new chunk marks up to 4 dirty. Build max 2 per frame may lag but okay. Could cause many dirty chunks outside radius not built until near. Good.
+
+But if a chunk is generated and marked dirty, and it has all neighbors data, it might be built in same frame? Generation happens before build. If within 4 and all neighbors data (maybe), build queue can include it max2. Good.
+
+Removal loop: Need iterate chunks entries; for each compute maxAbs = Math.max(Math.abs(cx-pcx), Math.abs(cz-pcz)); if >7 remove. But key string parse? We can store cx,cz in entry to avoid parse. Entry {cx,cz,data,mesh,dirty}. key uses entry. Then removal easy. ensureChunkData stores cx,cz. readBlock still get by key. For iteration chunks.values().
+
+When removing: if entry.mesh removeChunkMesh? removeChunkMesh uses key; could directly scene.remove etc. Then for neighbors set dirty if exists. Then chunks.delete(key). Need be careful iterating Map while deleting okay in JS.
+
+Generation list sorting with max 4: If many missing within radius, prioritize nearest. Good.
+
+Initial spawn: We can call ensureChunkData(0,0) maybe and heightAt. But if we mark neighbors dirty, no issue. To avoid fall before first frame, in init after scene, set player x=8,z=8; ensureChunkData(0,0); compute y by scanning readBlock? Since only spawn chunk data, can find top in local 8,8. But tree may use leaves within same chunk; okay. Set y. Also maybe ensure adjacent chunks? Not necessary for collision if player near border x=8 far from border. Good.
+
+But generation per frame max 4 will generate nearest missing including neighbors. Good.
+
+Raycasting outline: Need create BoxGeometry(1,1,1) and EdgesGeometry. In r128 EdgesGeometry exists. LineSegments material black depthTest? Could use LineBasicMaterial({color:0x000000, depthTest:false}) so visible. But if depthTest false, outline through blocks maybe okay. Spec black wireframe box. Use depthTest:true maybe hidden behind? Target block front visible; outline at edges may z-fight. Better set material color 0x000000, linewidth not supported. Use THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1,1,1)), new THREE.LineBasicMaterial({color:0x000000})); outline.renderOrder=1; maybe depthTest:false to always visible. But could show through blocks; acceptable? Minecraft target outline usually only on targeted block visible. Use depthTest:true but offset slightly 1.002 scale? BoxGeometry(1.002,1.002,1.002) to avoid z-fight. Good.
+
+Crosshair CSS: maybe two lines: #crosshair { position:fixed; left:50%; top:50%; width:20px; height:20px; transform:translate(-50%,-50%); pointer-events:none; } use pseudo? Simpler: background: linear-gradient? Could create with ::before/::after. Or just small dot. Spec small CSS crosshair at screen center. Use #crosshair { position:fixed; left:50%; top:50%; width:2px; height:24px; background:white; transform:translate(-50%,-50%); } and ::after horizontal 24x2. Good.
+
+Hotbar DOM: create slots dynamically. Each slot div class slot, style backgroundColor = '#'+hex.toString(16).padStart(6,'0'), textContent number i+1. selected border white via class selected. CSS .slot { width:48px;height:48px;border:2px solid rgba(255,255,255,.3); ... } .slot.selected{border-color:#fff}. Bar background dark semi-transparent.
+
+Overlay controls list: include WASD, mouse, click, keys 1-7 wheel, space. Title maybe "mc.html". Click to play. Need overlay reappears pointer lock released. Use display none when locked.
+
+Potential issue: Clicking overlay requests pointer lock; but mousedown on overlay? We only add click to overlay. When pointer lock active, overlay hidden. If user presses Esc, overlay appears. Mouse look mousemove only locked. Good.
+
+Context menu suppression: document.addEventListener('contextmenu', e=>e.preventDefault()); Also prevent selection? body user-select none.
+
+Pointer lock errors: If requestPointerLock fails due not user gesture? Overlay click okay. Could add canvas click if not locked? Not necessary.
+
+Now need ensure no Math.random anywhere. Use hash for clouds. Good.
+
+Let's think about value noise determinism and negative coords. hash3 mod with MOD. For large x maybe product a*const up to 2e9*3.7e8 = 7e17 > Number.MAX_SAFE_INTEGER (9e15). Need avoid overflow. Use modular multiplication? We can use smaller constants or use Math.imul on 32-bit after reducing x to 32-bit. Since hash doesn't need true modulo for huge? Could do:
+function hash3(x,y,z){ let n = (x | 0) * 374761393 + ... overflow float but then >>>0 maybe okay? For large x >2^31, x|0 truncates to signed 32-bit. That's deterministic for integer coords within 32-bit. Player won't exceed billions likely. Use int = x & 0xffffffff? But bitwise on floats converts to 32-bit. Could implement:
+let a = x >>> 0; but negative -> large unsigned. For float maybe okay if <2^31. Use function ihash(x,y,z){ let n = (x*374761393 + y*668265263 + z*1274126177) >>> 0; n ^= n >>> 13; n = Math.imul(n, 1274126177); n ^= n >>> 16; return (n >>> 0)/4294967295; }
+This is common. For negative x, x*const negative float, >>>0 converts to uint32 after ToUint32? In JS >>> operates on 32-bit integer conversion of operand after truncating? Actually bitwise operators convert to 32-bit integer (ToInt32) then >>> zero-fill. For negative large maybe modulo 2^32. Good. Multiplication may exceed safe but ToInt32 of sum? Bitwise conversion happens before? Expression x*const is float; n = (float) >>> 0 converts float to uint32 by ToUint32 (modulo 2^32). It can handle large float? Yes truncates then modulo. Precision loss for huge but deterministic enough. Use constants maybe overflow not issue due conversion. Let's use this simpler. But if x is fractional? We pass integers. Good.
+
+function hash3(x,y,z){ let n = (x * 374761393 + y * 668265263 + z * 1274126177) >>> 0; n ^= n >>> 13; n = Math.imul(n, 1274126177) >>> 0; n ^= n >>> 16; return (n >>> 0) / 4294967295; }
+This uses xor-shift. Good.
+
+For per-column tree hash use hash3(wx, 17, wz). For cloud hash use hash3(i*1000+..., ...). Good.
+
+Noise functions with x,z scaled maybe negative. Math.floor works. hash3 receives integer possibly large. Good.
+
+Potential issue: fractal2 normalized by max amplitude; if noise values random independent? Smoothed noise at different frequencies not fully independent but okay. m,h in [0,1]. Height H deterministic.
+
+Caves fractal3: implement 4 octaves normalized. But threshold .67. Need ensure caves don't remove too much. Could adjust by using 3D noise single octave? Spec says exceeds 0.67. Let's implement fractal3 with amplitude sum but maybe multiply by 0.95? No, threshold fixed. Could use caveNoise = fractal3(...); if(caveNoise > 0.67) air. Fine.
+
+Let's test height distribution: fractal2 returns average of noise values; for m,m squared. If m ~0.5, H=5+14.5+5=24.5. Many grass plains. m high .8 => 5+37+5=47 snow. h maybe adds. Good.
+
+Tree density: hash <0.02 per column => 2% of columns, within chunk 16*16=256 -> ~5 trees/chunk. Leaves can be heavy but okay. Maybe too many; spec says some trees. 2% okay. Could reduce? Spec exact <0.02. Good.
+
+Meshing leaves: leaves adjacent to leaves no faces between, outer only. Good.
+
+Now raycast target floor with negative coords and normal offset. Need ensure if point exactly on face and n axis, floor works. For negative block cell e.g. block at x=-1 occupies [-1,0]. Hit +X face at x=0? p.x=0, n=(1,0,0), p-n*0.5=-0.5 floor -1 target correct; place p+n*0.5=0.5 floor 0 correct. Hit -X face at x=-1? p.x=-1, n=(-1,0,0), p-n*0.5=-0.5 floor -1? Wait target should -1. p +? For -X face of block -1, p.x=-1, normal -1, p - n*0.5 = -1 - (-0.5) = -0.5 floor -1 correct. place p+n*0.5 = -1.5 floor -2 correct. Good.
+
+Raycaster far: raycaster.far=6. If hit exactly distance 6 okay <=? Raycaster uses < far maybe; not critical.
+
+Place overlap player: Need if placing block in cell occupied by player. Player AABB min y pos.y, max pos.y+1.8. Block cell [by,by+1]. Overlap if pos.x+0.3 > bx && pos.x-0.3 < bx+1 etc and pos.y+1.8 > by && pos.y < by+1. Use strict >/< to allow touching. Good.
+
+Break at y0: target.y <=0 return. Also maybe prevent breaking leaves? all non-air allowed except y0. Good.
+
+Rebuild after edit: Need if block on chunk border, rebuild neighbor chunk. Determine cx,cz and lx,lz. For break target or place cell. Use function editBlock(x,y,z,id): set; rebuildChunk(cx,cz); if lx==0 rebuildChunk(cx-1,cz); if lx==15 rebuildChunk(cx+1,cz); if lz==0 rebuildChunk(cx,cz-1); if lz==15 rebuildChunk(cx,cz+1). But if target/place cell at border, neighbor chunk data may exist. Good.
+
+Potential issue: If editing a block inside chunk, only that chunk mesh changes; neighbor meshes unaffected because face visibility depends on neighbor block? For side faces of edited block, its own mesh rebuilt. Neighbor's adjacent face might need change? Suppose break block at x=5 in chunk A; neighbor block at x=6 same chunk no border; A rebuild handles both. If edit at local 15 border and place solid against neighbor chunk B: A face toward B should disappear (neighbor now solid), B face toward A should disappear (A solid). We rebuild A and B. If break border block, A face toward B may appear (if B air), B face toward A may appear (if A air) -> both. Good.
+
+Need ensure rebuildChunk doesn't create mesh if chunk dirty? It builds regardless. If neighbor missing but readBlock returns air, faces added; okay.
+
+Chunk generation queue with dirty: When ensure new chunk, mark neighbors dirty. But if neighbor has no mesh and not within radius, dirty remains. If later built, dirty cleared. Good.
+
+Removal marking dirty: If delete entry, mark neighbors dirty. But if neighbor has mesh and is near player? It might need rebuild because deleted chunk now air. However deletion only >7 chunks away; fog hides. But if player near boundary? Suppose pcx=0, entry cx=8 deleted (distance 8), neighbor cx=7 distance7 within radius maybe visible at edge? Its face toward cx=8 should become visible if solid before. Mark dirty; build queue within 4 only rebuilds cx<=4, so cx=7 not rebuilt. But cx=7 is farther than build radius 4, no mesh? Actually chunks within 4 have meshes; cx=7 may have mesh from earlier? Build only within 4, so cx=7 likely no mesh (unless built when player closer). If no mesh, no issue. If player was at cx=7 before moving to 0, cx=7 mesh built then maybe not deleted until >7? At pcx=0, cx=7 distance7 kept but no mesh? It might have mesh from previous if within 4 then; build radius 4 means when player at 3, cx=7 distance4 built. Then player moves to 0, cx=7 distance7 kept with mesh. Its neighbor cx=8 deleted (distance8) and marked dirty. But build queue only within 4, so cx=7 not rebuilt. It may have missing face toward cx=8 but at distance 112 blocks, fog far 110, maybe invisible. Okay. If want, could allow rebuild dirty chunks within 7? Spec build meshes for chunks within 4 only; removal >7. We can keep dirty but not rebuild outside 4. Fine.
+
+Need ensure chunkMeshes array doesn't contain meshes of deleted entries: removeChunkMesh before delete. Good.
+
+Potential issue: geometry.dispose() while raycaster maybe using? We remove from scene and array before dispose, okay.
+
+Memory: Uint8Array 16*16*80=20480 bytes per chunk. Radius keep ~15x15=225 => 4.6MB okay. Meshes maybe large but okay.
+
+Now let's consider exact code for meshing performance and correctness.
+
+Define blockMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+In r128, MeshLambertMaterial has side default FrontSide. Good.
+
+Face definitions as arrays of 4 vertices each [dx,dy,dz]. Need neighbor offset maybe normal. We'll create const FACES = [ {normal:[0,1,0], factor:1.0, verts:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]}, ...]. For each face, nx=normal[0], etc. Check neighbor readBlock(wx+nx,y+ny,wz+nz). But for face +X normal [1,0,0], neighbor at wx+1; yes. For -X neighbor wx-1. For bottom y-1. Good.
+
+Push function:
+function addFace(positions,normals,colors, wx,wy,wz, face, r,g,b){ const f=face.factor; const cr=r*f,cg=g*f,cb=b*f; const v=face.verts; const n=face.normal; // indices [0,1,2,0,2,3]
+ for (let i=0;i<6;i++){ const idx = i===0?0:i===1?1:i===2?2:i===3?0:i===4?2:3; const vv=v[idx]; positions.push(wx+vv[0], wy+vv[1], wz+vv[2]); normals.push(n[0],n[1],n[2]); colors.push(cr,cg,cb); } }
+Could unroll for speed but okay.
+
+Need be careful variable name z conflicts? Use worldZ.
+
+After building geometry: if positions.length===0 { c.mesh=null; c.dirty=false; return; } geometry = new THREE.BufferGeometry(); geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3)); etc. In r128, Float32BufferAttribute constructor accepts array. Good. Compute bounding sphere? setAttributes triggers computeBoundingSphere when needed. Raycaster may call geometry.computeBoundingSphere if null; okay. Could call geometry.computeBoundingSphere() for performance.
+
+Potential issue: MeshLambertMaterial with vertexColors and lights: vertex colors are multiplied by light intensities. If ambient .65 and directional .8, top faces maybe 1.8*color >1 causing clipping? Three Lambert diffuse = color * (ambient + NdotL*dir). If top normal aligns with directional intensity .8 plus ambient .65 =1.45; colors near white may exceed 1 and clamp. Could make too bright. Maybe set material emissive? No. To preserve fake lighting, we could use MeshBasicMaterial? But spec says MeshLambertMaterial and lights. It also says fake lighting multiply by factors. With Lambert, lights further modulate. We can set directional light intensity 0? Spec requires ambient .65 directional .8. Could compensate by reducing vertex colors? Or set material color lower? Maybe use MeshLambertMaterial with color = new THREE.Color(0x777777)? But vertexColors multiply material color? In Three, vertexColor * diffuse color. If material color 0x777777, lights ambient .65 etc result maybe okay. But spec says one shared MeshLambertMaterial, not color specified. Could set color: 0xffffff and accept brightness. Minecraft-like colors may look washed but fine. To keep fake lighting dominant, we can set directional light intensity 0? No must add. Could use lights with low intensities? Spec exact. Maybe use MeshLambertMaterial and set renderer.outputEncoding? Not necessary.
+
+Actually MeshLambertMaterial in r128: diffuse = color * vertexColor; irradiance = ambient + directional*NdotL. If ambient .65, dir .8, top NdotL maybe 1 if light direction aligned with normal. Directional light position not direction? THREE.DirectionalLight color intensity; its direction from position to target (0,0,0). If position (100,200,100), normalized dot with top normal .667; irradiance top=0.65+0.8*.667=1.184. Sides maybe 0.65+... less. Colors * factor baked then multiplied >1. Could clamp. Maybe set directional position (0,1,0) so top gets .8, sides .65, bottom .65; top factor 1*1.45=1.45 clipped. Could reduce block colors? Hmm.
+
+Could use MeshLambertMaterial with color: new THREE.Color(0x707070) to counteract. But then fake factors relative still. If material color 0x666666, top irradiance 1.45*0.4=0.58; sides maybe .65*0.4=0.26; bottom .55*.65*.4=.14. Too dark. Maybe material color 0xaaaaaa. Not specified. Better to set lights as spec but use renderer gamma? Hmm.
+
+Maybe MeshLambertMaterial's vertex colors already include lighting and material should be MeshBasic? But spec explicitly says ONE shared MeshLambertMaterial. It may expect using Lambert with lights but fake factors still. We can set ambient intensity 0.65 and directional 0.8, but also set material.emissive? MeshLambertMaterial has emissive. Could set emissive = new THREE.Color(0x333333)? No.
+
+Alternative: Use MeshLambertMaterial but disable lights effect by setting material.color = white and lights intensity low? Can't violate spec? It says Ambient light 0.65 plus one directional light 0.8. We'll add them. To avoid overbright, set renderer.physicallyCorrect? no. Could set scene.background/fog and colors already not full saturation. Overbright okay maybe.
+
+But fake lighting factors: bottom faces factor .55 but Lambert ambient still lights bottom .65, so bottom appears brighter than intended relative to sides? Top gets directional bonus. It's okay.
+
+Maybe use directional light intensity 0.8 but set material.side DoubleSide and normal attribute; no issue.
+
+Clouds/water basic not affected by lights/fog if fog false. Good.
+
+Now potential raycast issue with MeshLambertMaterial and fog: Raycaster doesn't care.
+
+Let's think about pointer lock and mouse events. document.addEventListener('mousedown', function(e){ if(!pointerLocked) return; if(e.button===0) break; else if(e.button===2) place; }); But when overlay visible, pointer not locked. If user clicks canvas without pointer lock? overlay covers. Good.
+
+Keys: Use keydown/keyup. For number selection maybe e.key. Prevent default for space to avoid scroll. Also if not locked, ignore movement but still maybe keys update hotbar? Could allow always. But if overlay open and typing? no. We'll allow hotbar selection regardless; movement only locked.
+
+Wheel: If pointerLocked false, don't preventDefault (allow page scroll? body overflow hidden no). If true preventDefault and select. Could also allow when not locked but no need.
+
+Animation dt: let last=performance.now(); function animate(){ const now=performance.now(); let dt=(now-last)/1000; last=now; if(dt>0.05)dt=0.05; if(pointerLocked) updatePlayer(dt); updateWorld(dt); renderer.render(scene,camera); requestAnimationFrame(animate); }
+updateWorld: generateNearbyChunks, buildNearbyMeshes, removeFarChunks, updateClouds(dt), water.position, raycastOutline? Raycast maybe after camera updated. If pointerLocked false, camera still at last position; outline hidden.
+
+Order: updatePlayer before generation/build so player position current for chunk management. If not locked, still generate around player. Good.
+
+UpdateCamera: camera.position.set(player.x, player.y+1.62, player.z); camera.rotation.set(pitch,yaw,0)? rotation.order YXZ. In Three, camera.rotation.set(x,y,z). So camera.rotation.x=pitch; camera.rotation.y=yaw; camera.rotation.z=0. camera.updateMatrixWorld(); Then raycast.
+
+UpdatePlayer physics: Need apply input only locked? We'll call if locked. But maybe keys pressed while not locked? ignore.
+
+Input state object keys = {KeyW:false,...}. In keydown if code in keys set true. For Space jump, could handle on keydown if locked and onGround. Or store space pressed. Use e.code==='Space' && pointerLocked && onGround => vy=8.5; onGround=false. Prevent default.
+
+Movement velocity: const move = new THREE.Vector3? Could compute dx,dz. let forwardX=-Math.sin(yaw), forwardZ=-Math.cos(yaw); rightX=Math.cos(yaw), rightZ=-Math.sin(yaw). let mx=0,mz=0; if KeyW mx+=forwardX,mz+=forwardZ; KeyS subtract; KeyD add right; KeyA subtract. Normalize? If diagonal speed sqrt2*5.5; Minecraft usually same speed normalized? Spec WASD at 5.5 m/s relative to yaw. Could normalize horizontal vector to 5.5 to avoid diagonal faster. Do if mx||mz: len=Math.hypot(mx,mz); if(len>0){ mx=mx/len*5.5; mz=mz/len*5.5; } Then moveAxis x/mx*dt, z/mz*dt. Good.
+
+Gravity: vy -= 25*dt; if(vy < -30) vy=-30; moveY(vy*dt). If onGround and no jump, vy maybe set 0 after collision; but gravity each frame makes small negative, moveY down may collide and snap. Good.
+
+moveY implementation details:
+const PLAYER_HEIGHT=1.8, HALF=0.3, EYE=1.62, EPS=1e-5.
+function collidesAt(x,y,z){ const minX=x-HALF, maxX=x+HALF, minY=y, maxY=y+PLAYER_HEIGHT, minZ=z-HALF, maxZ=z+HALF; const x0=Math.floor(minX), x1=Math.floor(maxX - EPS); const y0=Math.floor(minY), y1=Math.floor(maxY - EPS); const z0=Math.floor(minZ), z1=Math.floor(maxZ - EPS); for(let bx=x0;bx<=x1;bx++) for(let bz=z0;bz<=z1;bz++) for(let by=y0;by<=y1;by++) if(readBlock(bx,by,bz)!==0) return true; return false; }
+Need loops order maybe by outer? fine. If y0 > y1 (height <1? no). For negative maxY-EPS works: max= -0.2 floor -1; okay.
+
+moveAxisX(delta): if delta==0 return; const old=player.x; player.x += delta; if(collidesAt(player.x,player.y,player.z)){ // snap optional
+   // If moving positive, find nearest block left boundary? Could try candidate positions: for blocks intersecting proposed AABB horizontally and vertically, candidate = bx - HALF for delta>0 or bx+1+HALF for delta<0. Choose closest to old? But revert okay. Maybe implement simple snap to avoid sticking:
+   let best = delta>0 ? Infinity : -Infinity;
+   const y0=Math.floor(player.y), y1=Math.floor(player.y+PLAYER_HEIGHT-EPS); const z0=Math.floor(player.z-HALF), z1=Math.floor(player.z+HALF-EPS);
+   // scan blocks that intersect proposed x range? proposed minX/maxX. For each block, if horizontal overlap and vertical overlap: candidate = delta>0 ? bx - HALF : bx+1+HALF; choose max/min closest to old? For positive, want smallest candidate >= old? Actually if moving right and collides with block cell bx (player proposed maxX > bx+1), safe x = bx - HALF. If multiple blocks, choose minimum safe? Suppose wall at bx=0, old x=-0.2 half .3 max .1 no collide; move +0.2 new x=0 max .3 intersects block 0; safe x=-0.3 (bx-HALF). That's less than old? old -0.2, safe -0.3 too far left; better revert old -0.2. But if old not touching wall? Revert okay. If moving right from x=0.2 (touching block 0? max .5 intersects block0 already unsafe) impossible. For positive collision, safe candidate may be < old; revert. So no snap needed. For negative, candidate > old. Revert okay. Horizontal speed small; can't tunnel. }
+   else player.x = player.x; }
+
+But if collides, revert old. If delta large and old not colliding but proposed passes through block? Speeds small. Good.
+
+moveY with snap:
+function moveY(delta){ const oldY=player.y; const newY=oldY+delta; if(collidesAt(player.x,newY,player.z)){ if(delta<0){ let best=-Infinity; const x0=Math.floor(player.x-HALF), x1=Math.floor(player.x+HALF-EPS); const z0=Math.floor(player.z-HALF), z1=Math.floor(player.z+HALF-EPS); const y0=Math.floor(newY), y1=Math.floor(newY+PLAYER_HEIGHT-EPS); for bx... for bz... for by=y0;by<=y1;by++ if(readBlock(bx,by,bz)!==0){ const cand=by+1; if(cand>best) best=cand; } let snapped=best; if(snapped>newY && snapped<=oldY+EPS && !collidesAt(player.x,snapped,player.z)){ player.y=snapped; vy=0; onGround=true; } else { player.y=oldY; vy=0; onGround=true; } } else { let best=Infinity; ... if solid { cand=by-PLAYER_HEIGHT; if(cand<best) best=cand; } let snapped=best; if(snapped<newY && snapped>=oldY-EPS && !collidesAt(player.x,snapped,player.z)){ player.y=snapped; vy=0; } else { player.y=oldY; vy=0; } } } else { player.y=newY; // ground check
+   if(collidesAt(player.x, player.y - 0.01, player.z)) onGround=true; else onGround=false;
+ }}
+But for downward collision, scanning proposed AABB may include blocks that are not below feet but side walls intersecting proposed volume. Candidate top could be high and snap to side wall top, maybe okay if it prevents falling through? Example in narrow 1-wide hole with side walls, player AABB half .3 fits, side walls don't intersect because hole width >0.6. If hole exactly 1 block wide, player half .3 fits centered; side blocks at x=0 and x=-1? AABB [-0.3,0.3] intersects cell -1? max .3 > -1+1=0? condition maxX > bx? For bx=-1, bx+1=0, max .3 >0 true, minX -.3 <0 true -> collides with side wall! Wait if hole is empty block at x=0 only [-0,1], player centered x=0.5? If spawn x=8 local 8, half .3 intersects blocks x=7 and x=9 if they are solid; that's normal collision with walls. If falling in a column of air surrounded by solid side blocks, collidesAt returns true due to side blocks even though feet not on ground. Then moveY collision scanning proposed AABB will find side blocks candidate top = by+1 for each side block at same y as feet? Suppose side wall block cell [9,10] adjacent horizontally and vertical overlaps player volume; candidate 10. If player feet old 10.5 falling to 9.5 inside air column but side blocks at by=9? AABB intersects side blocks, collidesAt true even before reaching ground? Actually if side blocks occupy adjacent cells, player AABB intersects them if within horizontal distance <0.3 from block boundary. In a 1-block-wide hole centered, player half .3 touches walls? Hole air cell x=0 [0,1], solid at x=-1 [-1,0] and x=1 [1,2]. Player center x=0.5, AABB [0.2,0.8], does not intersect solid cells: for bx=-1, bx+1=0, max .8 >0 true? Wait condition minX < bx+1 (0.2<0 true) and maxX > bx (0.8 > -1 true) -> intersects cell [-1,0]? But AABB [0.2,0.8] and block [-1,0] do not intersect; my loop range x0=floor(minX)=0, x1=floor(maxX-EPS)=0, so bx=0 only, not -1. Good. For center 0.5, minX .2 floor0, maxX .8 floor0, no side blocks. If player near wall, collides. So scanning proposed AABB for falling may include side blocks only if player horizontally overlapping them; then candidate top might be wall top, could snap onto wall instead of ground? But if player is overlapping wall, it's already colliding horizontally; moveY collision due to wall vertical overlap even if feet above ground. It may set onGround true incorrectly and stop falling while stuck against side. However horizontal collisions should prevent being inside wall. If player adjacent but not colliding, loop range excludes. If partially overlapping, horizontal move would have reverted, so not. Good.
+
+But collidesAt for y movement includes all blocks in vertical range including above feet; if player is under a ceiling block (e.g. jumping) delta negative? falling from under ceiling? It may scan ceiling block candidate top = by+1 which could be above old and set onGround true incorrectly. Example player falling below a block at by=10, feet 9.5 top 11.3? If top intersects block [10,11]? That means head colliding with bottom of block, but if falling from higher maybe already colliding? For downward delta, collidesAt could be true due to ceiling block intersecting head, not floor. Candidate top by+1=11 > old? If old feet 9.5, top 11.3 intersects block 10; candidate 11 > old, condition snapped<=old fails, revert old and set onGround true incorrectly (head collision). But if head colliding while falling, player is inside a ceiling? Should not happen if old safe? Old safe means no overlap with block [10,11]? Feet 9.5 top 11.3 overlaps block 10, so old unsafe. So not.
+
+If delta large causing proposed AABB intersects floor but also side blocks above candidate >old? choose max candidate maybe >old and fail revert. okay.
+
+Ground check collidesAt(y-0.01) could detect side walls if player horizontally overlapping? If standing next to wall but not overlapping, no. Good.
+
+Teleport: if(player.y < -20){ player.x=8; player.z=8; player.y=spawnY; vy=0; onGround=false; } Need spawnY maybe recompute? If chunks around spawn generated, can find top. But if teleport to spawnY from init may be inside ungenerated? spawn chunk likely exists. Could compute getSpawnY() function scanning readBlock 79 down at x8,z8 and ensure chunk data. Use in init and teleport. function findSpawnY(){ ensureChunkData(0,0); let top=-1; for y=79;y>=0;y-- if(readBlock(8,y,8)!==0){top=y;break;} let y=top+1; if(y<1)y=1; // avoid collision with trees by moving up
+ while(y<HEIGHT && collidesAt(8,y,8)) y++; return Math.min(y, HEIGHT-1); } But collidesAt uses readBlock; if tree at spawn, top leaves maybe high. Good. If no solid top=-1 y=1. If y inside cave? okay.
+
+But ensureChunkData(0,0) might generate and mark neighbors dirty. Fine.
+
+Initial player.y = findSpawnY(); vy=0.
+
+Potential issue: If chunk data generation uses fractal noise expensive per column; 256 columns * fractal2 twice + fractal3 for caves many blocks. Caves loop y up to H maybe ~25 average, fractal3 4 octaves each -> heavy but okay? 256*25*4*8 hash = 200k hash per chunk; generating max 4/frame could be heavy but manageable in JS? Maybe too slow. Need optimize. Could use single noise3 for caves not fractal3 to reduce. Spec says 3D version maybe single. Let's implement caveNoise = noise3(wx*0.09,y*0.09,wz*0.09); if >0.67. That is 1 octave, much faster. It may create larger caves but okay. To reduce variance, maybe use noise3 with threshold .67. Let's estimate smoothed value distribution: lattice values uniform [0,1], bilinear smoothstep interpolation yields mean .5, std maybe .25? >.67 maybe 25%. Caves large. Fractal3 normalized reduces to ~10% but 4x cost. Could use 2 octaves for caves? Spec says plus a 3D version; not necessarily fractal. Maybe implement noise3 single but apply threshold .67. Playability: If 25% of underground air, mountains may have holes but surface intact (caves up to H-2). Could be okay. But too many caves might make walking unstable? Surface blocks remain solid except y<=H-2, so ground stable. Caves under surface. Fine. Use single noise3 for performance. But spec "4 octaves combined into fractal noise, plus a 3D version for caves" could mean implement noise3 similar (not necessarily fractal). We'll implement noise3 and use it directly. Good.
+
+Height generation: fractal2 4 octaves per column. 256*2*4*4 hash ~8192 hash per chunk, fine.
+
+Tree leaves: Could generate many leaves; meshing okay.
+
+Potential optimization: Precompute color arrays for each block id and factor? Not necessary.
+
+Now need ensure no modules. Script tag before main script. Use strict? optional.
+
+Let's consider if THREE.Fog with scene.background works in r128. Yes.
+
+Cloud creation deterministic without Math.random:
+for(let i=0;i<25;i++){ const a=hash3(i*17+3, 999, i*31+7); const b=hash3(i*23+5, 777, i*13+11); const c=hash3(i*29+1, 555, i*37+13); const w=20+a*30; const d=20+b*30; const h=2+c*4; const geo=new THREE.BoxGeometry(w,h,d); const mat=cloudMaterial; const mesh=new THREE.Mesh(geo, mat); mesh.position.set((a-0.5)*400 + player.x? maybe initial relative 0, 90+c*8, (b-0.5)*400); cloud.userData.speed = 0.5 + c*1.5; scene.add(mesh); clouds.push(mesh); }
+Update: cloud.position.x += cloud.userData.speed*dt; cloud.position.z += ... maybe z speed from hash. Then wrap relative to player:
+let dx=cloud.position.x - player.x; if(dx < -200) cloud.position.x += 400; else if(dx > 200) cloud.position.x -= 400; same z. If drift only x, z static but wraps when player moves. Could add z drift small: speedZ = 0.2+... Use hash. Good.
+
+Cloud material: new THREE.MeshBasicMaterial({color:0xffffff, transparent:true, opacity:0.75, fog:false}); Maybe depthWrite:false? Transparent boxes can overlap; okay. Use side DoubleSide? not necessary.
+
+Water plane: const waterGeo = new THREE.PlaneGeometry(1000,1000); const waterMat = new THREE.MeshBasicMaterial({color:0x4488ff, transparent:true, opacity:0.65, side:THREE.DoubleSide, fog:false}); waterMesh = new THREE.Mesh(waterGeo, waterMat); scene.add. Update position x=player.x,z=player.z,y=14.3. If camera below water? Plane visible from both sides. Good.
+
+Now potential issue with file:// and pointer lock: Pointer lock requires user gesture; okay. Three.js from CDN may require internet; file:// can load script if online. Spec says load via script tag. Good.
+
+Need final output one code block. Ensure no placeholders. Let's write full code carefully.
+
+Let's draft code in analysis then final.
+
+Detailed JS:
+
+const CHUNK_SIZE = 16;
+const WORLD_HEIGHT = 80;
+const AIR=0, GRASS=1, DIRT=2, STONE=3, SAND=4, WOOD=5, LEAVES=6, SNOW=7;
+const BLOCK_COLORS = [0x000000,0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff];
+const HOTBAR = [GRASS,DIRT,STONE,SAND,WOOD,LEAVES,SNOW];
+
+let scene,camera,renderer,raycaster,outline,water,clouds=[],chunkMaterial;
+const chunks=new Map(); const chunkMeshes=[];
+const player={x:8,y:0,z:8}; let vy=0, onGround=false, yaw=0,pitch=0;
+const keys={KeyW:false,KeyA:false,KeyS:false,KeyD:false};
+let pointerLocked=false, selected=0;
+
+Initialize:
+function init(){ scene=new THREE.Scene(); scene.background=new THREE.Color(0x87ceeb); scene.fog=new THREE.Fog(0x87ceeb,40,110); camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,0.1,400); camera.rotation.order='YXZ'; renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2)); renderer.setSize(innerWidth,innerHeight); document.body.appendChild(renderer.domElement);
+ scene.add(new THREE.AmbientLight(0xffffff,0.65)); const dir=new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(100,200,100); scene.add(dir);
+ chunkMaterial = new THREE.MeshLambertMaterial({vertexColors:true});
+ raycaster=new THREE.Raycaster(); raycaster.far=6;
+ const outlineGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002,1.002,1.002)); outline = new THREE.LineSegments(outlineGeo,new THREE.LineBasicMaterial({color:0x000000})); outline.visible=false; scene.add(outline);
+ createClouds(); createWater();
+ player.y=findSpawnY();
+ updateHotbar();
+ window.addEventListener('resize',onResize);
+ document.addEventListener('pointerlockchange',onPointerLockChange);
+ document.addEventListener('mousemove',onMouseMove);
+ document.addEventListener('mousedown',onMouseDown);
+ document.addEventListener('contextmenu',e=>e.preventDefault());
+ document.addEventListener('keydown',onKeyDown);
+ document.addEventListener('keyup',onKeyUp);
+ document.addEventListener('wheel',onWheel,{passive:false});
+ document.getElementById('overlay').addEventListener('click',()=>{ renderer.domElement.requestPointerLock(); });
+ requestAnimationFrame(animate);
+}
+
+findSpawnY uses ensureChunkData? But ensureChunkData defined later. Need function order okay if called after definitions? In JS functions hoisted if function declarations. We'll define all function declarations before init call at bottom. ensureChunkData uses generateChunkData etc. Good.
+
+ensureChunkData(cx,cz): const k=key; let c=chunks.get(k); if(c)return c; c={cx,cz,data:new Uint8Array(CHUNK_SIZE*CHUNK_SIZE*WORLD_HEIGHT),mesh:null,dirty:true}; chunks.set(k,c); generateChunkData(cx,cz,c.data); // mark neighbors dirty
+ for each neighbor if exists e.dirty=true; return c;
+But marking neighbors dirty before data? okay.
+
+generateChunkData uses columnHeight and noise. Need avoid using readBlock for tree placement? We can use data index directly because within chunk. For leaves only into air in current chunk. Good.
+
+function idx(lx,y,lz){return (y*CHUNK_SIZE+lz)*CHUNK_SIZE+lx;}
+
+readBlock: if y<0||y>=WORLD_HEIGHT return 0; const cx=Math.floor(x/CHUNK_SIZE); ... lx=x-cx*CHUNK_SIZE. Since x may be float? We call with integers mostly, but raycast target floor ints. For collision loops bx int. If x float? Not in readBlock except maybe? Use Math.floor. Good.
+
+setBlock: if y<1||y>=WORLD_HEIGHT return false; c=get; if !c return false; data[idx]=id; return true.
+
+Column height clamp: if(H<0)H=0? But min 5. If H>79 H=79. Surface at y=H; if H=79 top block occupies [79,80], within HEIGHT (y index max 79). Good.
+
+Generate fill:
+for lx... for lz... { const wx=..., wz=...; const H=columnHeight(wx,wz); let surfaceId, subsurfaceId; if(H>=46) surfaceId=SNOW; else if(H>=37) surfaceId=STONE; else if(H<=16) surfaceId=SAND; else surfaceId=GRASS; if(H<=16) subsurfaceId=SAND; else if(H>=37) subsurfaceId=STONE; else subsurfaceId=DIRT; const maxSolid=Math.min(H,WORLD_HEIGHT-1); for y=0;y<=maxSolid;y++){ let id=0; if(y===0) id=STONE; else if(y < H-3) id=STONE; else if(y < H) id=subsurfaceId; else id=surfaceId; data[idx(lx,y,lz)]=id; } // caves
+ for y=3; y<=H-2 && y<WORLD_HEIGHT; y++){ const id=data[idx]; if(id!==0){ if(noise3(wx*0.09, y*0.09, wz*0.09) > 0.67) data[idx]=AIR; } }
+ // tree
+ if(H>=1 && H<=WORLD_HEIGHT-7? maybe H+6 < HEIGHT){ const surface = (H<WORLD_HEIGHT?data[idx(lx,H,lz)]:AIR); if(surface===GRASS && hash3(wx,17,wz)<0.02 && lx>=2 && lx<14 && lz>=2 && lz<14){ for(let ty=H+1; ty<=H+4 && ty<WORLD_HEIGHT; ty++){ const ii=idx(lx,ty,lz); if(data[ii]===AIR) data[ii]=WOOD; } for(let layer=0; layer<2; layer++){ const ty=H+3+layer; if(ty>=WORLD_HEIGHT) continue; for(dx=-2;dx<=2;dx++) for(dz=-2;dz<=2;dz++){ const x=lx+dx,z=lz+dz; if(x<0||x>=16||z<0||z>=16) continue; const ii=idx(x,ty,z); if(data[ii]===AIR) data[ii]=LEAVES; } } let ty=H+5; if(ty<WORLD_HEIGHT){ for dx -1..1... if air set LEAVES } ty=H+6; if(ty<WORLD_HEIGHT && idx(lx,ty,lz)===AIR) data=LEAVES; }}
+Need ensure tree trunk fits inside chunk: lx 2..13 inclusive (lx<14). Leaves within same chunk. Good.
+
+Potential issue: If H=79, maxSolid 79, caves y<=77, tree H+1 out of bounds skip due ty<WORLD_HEIGHT false for all? H+1=80 >=80 skip. Good.
+
+Noise functions:
+function smooth(t){return t*t*(3-2*t);}
+function noise2(x,z){ const ix=Math.floor(x), iz=Math.floor(z); const fx=x-ix, fz=z-iz; const sx=smooth(fx), sz=smooth(fz); const v00=hash3(ix,0,iz), v10=hash3(ix+1,0,iz), v01=hash3(ix,0,iz+1), v11=hash3(ix+1,0,iz+1); const a=v00+(v10-v00)*sx; const b=v01+(v11-v01)*sx; return a+(b-a)*sz; }
+function fractal2(x,z){ let val=0, amp=1, max=0; for(let i=0;i<4;i++){ val += noise2(x*(1<<i), z*(1<<i))*amp; max += amp; amp *= 0.5; } return val/max; }
+function columnHeight(x,z){ const m=fractal2(x*0.004,z*0.004); const h=fractal2(x*0.02,z*0.02); let H=Math.floor(5 + m*m*58 + h*10); if(H<1)H=1; if(H>WORLD_HEIGHT-1)H=WORLD_HEIGHT-1; return H; }
+noise3:
+function noise3(x,y,z){ const ix=Math.floor(x), iy=Math.floor(y), iz=Math.floor(z); const fx=x-ix, fy=y-iy, fz=z-iz; const sx=smooth(fx), sy=smooth(fy), sz=smooth(fz); // trilinear
+const v000=hash3(ix,iy,iz), v100=hash3(ix+1,iy,iz), v010=hash3(ix,iy+1,iz), v110=hash3(ix+1,iy+1,iz); const v001=hash3(ix,iy,iz+1), v101=hash3(ix+1,iy,iz+1), v011=hash3(ix,iy+1,iz+1), v111=hash3(ix+1,iy+1,iz+1);
+const x00=v000+(v100-v000)*sx; const x10=v010+(v110-v010)*sx; const x01=v001+(v101-v001)*sx; const x11=v011+(v111-v011)*sx; const y0=x00+(x10-x00)*sy; const y1=x01+(x11-x01)*sy; return y0+(y1-y0)*sz; }
+Need naming consistent: x interpolation for ix, y for iy, z for sz. Good.
+
+hash3 with bitwise: function hash3(x,y,z){ let n = (x * 374761393 + y * 668265263 + z * 1274126177) >>> 0; n ^= n >>> 13; n = Math.imul(n, 1274126177) >>> 0; n ^= n >>> 16; return (n >>> 0) / 4294967295; }
+For negative x, multiplication negative float, >>>0 works. Good.
+
+Mesh build:
+const FACES = [ ... ]; Need define after constants.
+function buildChunkMesh(cx,cz){ const k=key(cx,cz); const c=chunks.get(k); if(!c) return; if(c.mesh){ removeChunkMesh(cx,cz); } const positions=[],normals=[],colors=[]; const baseX=cx*CHUNK_SIZE, baseZ=cz*CHUNK_SIZE; for(let lx=0;lx<CHUNK_SIZE;lx++){ for(let lz=0;lz<CHUNK_SIZE;lz++){ for(let y=0;y<WORLD_HEIGHT;y++){ const id=c.data[idx(lx,y,lz)]; if(id===AIR) continue; const hex=BLOCK_COLORS[id]; const r=((hex>>16)&255)/255, g=((hex>>8)&255)/255, b=(hex&255)/255; const wx=baseX+lx, wz=baseZ+lz; for(let fi=0;fi<6;fi++){ const face=FACES[fi]; const nx=face.normal[0], ny=face.normal[1], nz=face.normal[2]; if(readBlock(wx+nx,y+ny,wz+nz)!==AIR) continue; addFace(positions,normals,colors,wx,y,wz,face,r,g,b); } } } } c.dirty=false; if(positions.length===0){ c.mesh=null; return; } const geometry=new THREE.BufferGeometry(); geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3)); geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals,3)); geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors,3)); geometry.computeBoundingSphere(); const mesh=new THREE.Mesh(geometry, chunkMaterial); scene.add(mesh); c.mesh=mesh; chunkMeshes.push(mesh); }
+
+removeChunkMesh(cx,cz): const k=key(cx,cz); const c=chunks.get(k); if(!c||!c.mesh)return; scene.remove(c.mesh); const i=chunkMeshes.indexOf(c.mesh); if(i>=0) chunkMeshes.splice(i,1); c.mesh.geometry.dispose(); c.mesh=null;
+
+rebuildChunk(cx,cz): buildChunkMesh(cx,cz); // but if chunk missing no-op.
+
+addFace: function addFace(positions,normals,colors,wx,wy,wz,face,r,g,b){ const f=face.factor; const cr=r*f,cg=g*f,cb=b*f; const v=face.verts; const n=face.normal; const order=[0,1,2,0,2,3]; for(let i=0;i<6;i++){ const p=v[order[i]]; positions.push(wx+p[0], wy+p[1], wz+p[2]); normals.push(n[0],n[1],n[2]); colors.push(cr,cg,cb); } }
+Creating order array each face call overhead; define static FACE_ORDER = [0,1,2,0,2,3]. Use.
+
+Chunk management:
+function generateNearbyChunks(){ const pcx=Math.floor(player.x/CHUNK_SIZE), pcz=...; const list=[]; for(let cx=pcx-5;cx<=pcx+5;cx++){ for(let cz=pcz-5;cz<=pcz+5;cz++){ if(!chunks.has(key(cx,cz))){ const dx=cx-pcx,dz=cz-pcz; const d2=dx*dx+dz*dz; if(d2<=25) list.push({cx,cz,d2}); } } } list.sort((a,b)=>a.d2-b.d2); const count=Math.min(4,list.length); for(let i=0;i<count;i++) ensureChunkData(list[i].cx,list[i].cz); }
+
+function buildNearbyMeshes(){ const pcx..., list=[]; for cx=pcx-4..pcx+4 ... { const c=chunks.get(key(cx,cz)); if(!c) continue; if(c.mesh && !c.dirty) continue; if(!(chunks.has(key(cx-1,cz)) && chunks.has(key(cx+1,cz)) && chunks.has(key(cx,cz-1)) && chunks.has(key(cx,cz+1)))) continue; const dx=cx-pcx,dz=cz-pcz; list.push({cx,cz,d2:dx*dx+dz*dz, dirty:c.dirty}); } list.sort((a,b)=> (b.dirty?1:0)-(a.dirty?1:0) || a.d2-b.d2); const count=Math.min(2,list.length); for i buildChunkMesh; }
+But if c.mesh exists and dirty false skip. If c.mesh null but no neighbors data skip. If c.mesh exists and dirty true, rebuild. Good.
+
+removeFarChunks(){ const pcx..., pcz...; const toDelete=[]; for(const c of chunks.values()){ const dx=c.cx-pcx,dz=c.cz-pcz; if(Math.max(Math.abs(dx),Math.abs(dz))>7){ if(c.mesh) removeChunkMesh(c.cx,c.cz); // mark neighbors dirty
+ for neighbors e=chunks.get(key(...)); if(e) e.dirty=true; chunks.delete(key(c.cx,c.cz)); } } }
+Need removeChunkMesh uses c? It gets entry from map; if we delete after okay. But removeChunkMesh will look up map and get c; if called before delete fine. Then mark neighbors. Good.
+
+Potential issue: In removeFarChunks, iterating chunks.values() while deleting entries is allowed but modifying Map during iteration can be tricky but generally safe for deletions. To be safe collect keys to delete. Use const del=[]; for(const [k,c] of chunks){ if(... ) del.push([c.cx,c.cz]); } for each key remove/delete. Good.
+
+Edit rebuild: function editBlock(x,y,z,id){ const cx=Math.floor(x/CHUNK_SIZE), cz=Math.floor(z/CHUNK_SIZE); const lx=x-cx*CHUNK_SIZE, lz=z-cz*CHUNK_SIZE; if(!setBlock(x,y,z,id)) return false; rebuildChunk(cx,cz); if(lx===0) rebuildChunk(cx-1,cz); if(lx===CHUNK_SIZE-1) rebuildChunk(cx+1,cz); if(lz===0) rebuildChunk(cx,cz-1); if(lz===CHUNK_SIZE-1) rebuildChunk(cx,cz+1); return true; }
+But if setBlock y=0 false. For break id AIR at target.y>0. For place id selected >0.
+
+Raycast and outline:
+let lastHit=null; function updateRaycast(){ if(!pointerLocked){ outline.visible=false; lastHit=null; return;} camera.updateMatrixWorld(); raycaster.ray.origin.copy(camera.position); raycaster.ray.direction.set(0,0,-1).applyQuaternion(camera.quaternion); const hits=raycaster.intersectObjects(chunkMeshes,false); let hit=null; for(const h of hits){ if(h.distance <= 6){ hit=h; break; } } if(hit && hit.face){ lastHit=hit; const n=hit.face.normal.clone().normalize(); const p=hit.point; const bx=Math.floor(p.x - n.x*0.5); const by=Math.floor(p.y - n.y*0.5); const bz=Math.floor(p.z - n.z*0.5); if(by>=0){ outline.visible=true; outline.position.set(bx+0.5,by+0.5,bz+0.5); } else { outline.visible=false; lastHit=null; } } else { outline.visible=false; lastHit=null; } }
+Need raycaster.far already 6 but filter. If hit.face normal maybe not normalized? clone normalize. In r128 face.normal is Vector3. Good.
+
+Break/place handlers:
+function onMouseDown(e){ if(!pointerLocked) return; if(!lastHit) return; const n=lastHit.face.normal.clone().normalize(); const p=lastHit.point; if(e.button===0){ const bx=Math.floor(p.x - n.x*0.5); const by=Math.floor(p.y - n.y*0.5); const bz=Math.floor(p.z - n.z*0.5); if(by<=0) return; editBlock(bx,by,bz,AIR); } else if(e.button===2){ const bx=Math.floor(p.x + n.x*0.5); const by=Math.floor(p.y + n.y*0.5); const bz=Math.floor(p.z + n.z*0.5); if(by<1 || by>=WORLD_HEIGHT) return; if(readBlock(bx,by,bz)!==AIR) return; if(overlapsPlayer(bx,by,bz)) return; editBlock(bx,by,bz,HOTBAR[selected]); } }
+Need if lastHit stale after chunk rebuild? We recompute each frame. Good.
+
+overlapsPlayer(bx,by,bz): return (player.x + HALF > bx && player.x - HALF < bx+1 && player.y + PLAYER_HEIGHT > by && player.y < by+1 && player.z + HALF > bz && player.z - HALF < bz+1);
+
+Pointer lock change: function onPointerLockChange(){ pointerLocked = document.pointerLockElement === renderer.domElement; const overlay=document.getElementById('overlay'); overlay.style.display = pointerLocked ? 'none' : 'flex'; }
+If locked, maybe reset keys? not necessary.
+
+Mouse move: if(!pointerLocked)return; yaw -= e.movementX*0.002; pitch -= e.movementY*0.002; const limit=Math.PI/2-0.01; if(pitch>limit)pitch=limit; if(pitch<-limit)pitch=-limit;
+
+Keys: function onKeyDown(e){ if(e.code==='Space'){ if(pointerLocked && onGround){ vy=8.5; onGround=false; } e.preventDefault(); } else if(e.code in keys) { keys[e.code]=true; } else if(e.key>='1' && e.key<='7'){ selected=parseInt(e.key,10)-1; updateHotbar(); } }
+Need e.code in keys: KeyW etc. Also maybe KeyD? yes. If not locked still set keys? Could set but movement only locked. For space prevent default always to avoid page scroll. But if overlay open, space might request? okay.
+keyup sets false.
+
+Wheel: function onWheel(e){ if(!pointerLocked) return; e.preventDefault(); if(e.deltaY>0) selected=(selected+1)%7; else selected=(selected-1+7)%7; updateHotbar(); }
+
+updateHotbar: const slots=document.querySelectorAll('#hotbar .slot'); slots[selected].classList.add('selected') etc. Need create hotbar in init or before? We can create DOM after body? Since script at end, DOM exists. In init call buildHotbar.
+
+createClouds: Need cloudMaterial. Use hash3 for deterministic. But hash3 returns 0..1. Let's define speeds arrays. For i 0..24:
+const a=hash3(i*17+3, 1000, i*31+7); const b=hash3(i*23+5, 2000, i*13+11); const c=hash3(i*29+1, 3000, i*37+13); const d=hash3(i*41+2, 4000, i*53+19); const w=25+a*35; const h=2+c*4; const dep=25+b*35; const geo=new THREE.BoxGeometry(w,h,dep); const mesh=new THREE.Mesh(geo, cloudMaterial); mesh.position.set(player.x + (a-0.5)*360, 90 + c*8, player.z + (b-0.5)*360); mesh.userData.speedX = 0.4 + d*1.2; mesh.userData.speedZ = 0.1 + a*0.6; scene.add(mesh); clouds.push(mesh);
+Update: for cloud of clouds: cloud.position.x += cloud.userData.speedX*dt; cloud.position.z += cloud.userData.speedZ*dt; wrap if dx<-180? Range maybe 360. Use WRAP=360. if(dx < -WRAP/2) pos += WRAP; if > WRAP/2 pos -= WRAP. Good. Clouds at y ~90. If player high mountain H up to 73, camera eye ~74, cloud distance ~16, visible. Good.
+
+createWater: water = new THREE.Mesh(new THREE.PlaneGeometry(1000,1000), new THREE.MeshBasicMaterial({color:0x4488ff, transparent:true, opacity:0.65, side:THREE.DoubleSide, fog:false})); water.rotation.x=-Math.PI/2; scene.add(water); update position in animate.
+
+Update world: function updateWorld(dt){ generateNearbyChunks(); buildNearbyMeshes(); removeFarChunks(); updateClouds(dt); water.position.set(player.x,14.3,player.z); updateRaycast(); }
+Maybe order raycast after camera updated; camera updated in updatePlayer or before render. If not locked, camera still set? In animate: if(pointerLocked) updatePlayer(dt); updateCamera(); updateWorld(dt); render. updateCamera should always set camera position/rotation based on player/yaw/pitch. Do that.
+
+updateCamera(){ camera.position.set(player.x, player.y+1.62, player.z); camera.rotation.x=pitch; camera.rotation.y=yaw; camera.rotation.z=0; camera.updateMatrixWorld(); }
+
+updatePlayer(dt): input movement and physics. Need apply horizontal before vertical? Axis separated: move X then Z then Y. But gravity should happen regardless. Let's do:
+if(pointerLocked){ // horizontal velocity from keys
+ let mx=0,mz=0; ... if(mx||mz) normalize; moveAxisX(mx*dt); moveAxisZ(mz*dt); }
+vy -= 25*dt; if(vy<-30)vy=-30; moveY(vy*dt); if(player.y<-20) respawn(); updateCamera? maybe after.
+But if not locked, still gravity? Spec falling below teleport etc; but overlay pause? Could apply gravity always to avoid weird? If not locked, player might fall while menu open; better freeze physics when not locked. But generate chunks based on player. Spec "Falling below y -20 teleports" likely during play. We can update physics only locked. If pointer lock released, player stays. Good. But if not locked and world generated around static position okay.
+
+However initial before first lock, player.y spawn; no fall. Good.
+
+updatePlayer called only if locked. In animate: if(pointerLocked) updatePlayer(dt); updateCamera(); ...
+
+But moveY ground detection sets onGround. If not locked, keys maybe true but not used. Good.
+
+moveAxisX/Z revert implementation:
+function moveAxisX(delta){ if(delta===0)return; const old=player.x; player.x += delta; if(collidesAt(player.x,player.y,player.z)){ player.x=old; } }
+moveAxisZ similar. Could if collision and delta sign try snap? Not needed.
+
+moveY as above. Need use vy variable global. For moveY, after no collision, onGround = collidesAt(player.x, player.y - 0.01, player.z); But if player jumped upward with vy>0, collidesAt below might true if feet just left ground? At jump start y=10, vy=8.5, delta .14 new y=10.14, collidesAt(y-0.01=10.13) with block [9,10]? min 10.13 >10 false, ground false. Good. If falling and landed snap to top y=10, no collision, ground check 9.99 intersects block [9,10] true. Good.
+
+moveY collision scanning: Need use proposed AABB vertical range. For downward candidate max by+1. But if collidesAt true due to horizontal wall (player overlapping wall) while moving down? Shouldn't. If it does, candidate may set onGround incorrectly. Could refine scan only blocks whose top is below old feet and intersects proposed feet volume? For landing, we care about blocks intersecting the player's feet region between newY and oldY? But collidesAt may be true due to head collision with ceiling if delta negative? Not likely. To be safer for downward, find candidate block tops that intersect horizontal AABB and vertical span [newY, oldY] (feet path), not full proposed height. Because landing occurs when feet cross block top. Candidate = by+1 if block cell intersects horizontal and block bottom < oldY and block top > newY? Specifically solid block cell [by,by+1] blocks feet if proposed minY < by+1 && old minY >= by? Hmm. We can scan by from floor(newY) to floor(oldY) maybe. Candidate = by+1. This avoids side walls above feet? Side wall cells at same by as feet still candidate but if horizontally overlapping, player would collide horizontally; okay. For ceiling blocks above head not scanned. For downward:
+const y0=Math.floor(newY), y1=Math.floor(oldY); // feet path from new to old (old >= new). But if oldY=10.1, newY=9.9, y0=9,y1=10; block by=9 candidate 10; good. If oldY=10.1, newY=8.9 delta -1.2, y0=8,y1=10; block by=9 candidate10; block by=8? top9 maybe lower; max candidate 10. Good. If oldY=10.1, newY=8.1 delta -2 (clamped maybe), y0=8,y1=10, catches by=9. If block at by=10? top11 >old, not floor. Not scanned because y1=floor(old)=10 includes by=10? Candidate 11 > old fail. Good.
+For upward: scan feet path from old to new? Ceiling collision involves player head crossing block bottom. Candidate = by - PLAYER_HEIGHT. Need scan blocks intersecting horizontal and vertical span [oldY+PLAYER_HEIGHT, newY+PLAYER_HEIGHT] (head path). Simpler scan proposed AABB full but for candidate choose min and require snapped>=old? Could be okay. To avoid head issues, for upward scan by from Math.floor(oldY+PLAYER_HEIGHT) to Math.floor(newY+PLAYER_HEIGHT). Candidate=by-PLAYER_HEIGHT. If block bottom by intersects head path. Example old feet 9.5 top 11.3, new feet 10.5 top 12.3, ceiling block by=12 [12,13] intersects head path? head path top from 11.3 to12.3, block bottom12; scan y0=floor(oldTop)=11,y1=floor(newTop)=12 includes by=12 candidate 10.2. Good. If block by=11 [11,12] old top 11.3 already collides? old unsafe. Not. Good.
+
+Let's implement moveY with path scanning:
+function moveY(delta){ const oldY=player.y; const newY=oldY+delta; if(collidesAt(player.x,newY,player.z)){ if(delta<0){ let best=-Infinity; const x0=Math.floor(player.x-HALF), x1=Math.floor(player.x+HALF-EPS); const z0=Math.floor(player.z-HALF), z1=Math.floor(player.z+HALF-EPS); const y0=Math.floor(newY), y1=Math.floor(oldY); for bx... for bz... for by=y0; by<=y1; by++ { if(readBlock(bx,by,bz)!==0){ const cand=by+1; if(cand>best) best=cand; } } let snapped=best; if(snapped>newY && snapped<=oldY+EPS && !collidesAt(player.x,snapped,player.z)){ player.y=snapped; vy=0; onGround=true; } else { player.y=oldY; vy=0; onGround=true; } } else { let best=Infinity; const x0..., z0...; const y0=Math.floor(oldY+PLAYER_HEIGHT), y1=Math.floor(newY+PLAYER_HEIGHT); for bx... for bz... for by=y0; by<=y1; by++ { if(readBlock(bx,by,bz)!==0){ const cand=by-PLAYER_HEIGHT; if(cand<best) best=cand; } } let snapped=best; if(snapped<newY && snapped>=oldY-EPS && !collidesAt(player.x,snapped,player.z)){ player.y=snapped; vy=0; } else { player.y=oldY; vy=0; } } } else { player.y=newY; onGround = collidesAt(player.x, player.y - 0.01, player.z); }
+}
+Need if y0>y1 loops skip. For downward oldY maybe 10.1 newY9.9 y0=9 y1=10 includes by=10? candidate 11 >old fail. Good. But block by=9 candidate10. If there is block by=10 (above feet) candidate11 >old fail, max best maybe10. Good.
+For upward y0=floor(oldTop), y1=floor(newTop). If oldTop=11.3 y0=11; newTop=12.3 y1=12. Includes by=12 candidate 10.2. If block by=11? oldTop intersects already unsafe, but if not (oldTop exactly11? floor 11 includes by=11 candidate9.2 <old; maybe skip due snapped>=old fail). Good.
+
+collidesAt uses loops y0=floor(minY), y1=floor(maxY-EPS). For standing on top y=10, maxY=11.8, y1=11; includes blocks by 10,11? Wait block at feet ground by=9 [9,10] not included because minY=10 floor10. collides false. Good. Ground check y-0.01 minY9.99 floor9 includes by9 true. Good.
+
+Horizontal collision loops: x0=floor(minX), x1=floor(maxX-EPS). If player x=0.5 half .3 minX .2 maxX .8 x0=0 x1=0; checks block cell 0. If block at 0 solid, collides (inside air? Actually if block cell 0 solid and player center in it, yes). If player adjacent to block 0 with x=1.0 half .3 minX .7 maxX1.3 x0=0? floor .7=0, x1=floor1.299=1; checks block 0 and1. Block 0 [0,1] intersects AABB [.7,1.3]? yes overlap .7-1, so collides if block0 solid. Player center at 1.0 is exactly on boundary between cell0 and1; half extends into both. If cell0 solid, collision. To stand next to wall with player center x=1.3 (cell1 air), minX1.0 maxX1.6 x0=1 x1=1; doesn't check block0? floor(minX)=1, so no touch boundary? AABB [1,1.6] touches block0 max 1 at point, should not collide. Good.
+
+Now potential issue: readBlock for collision loops calls get chunk for every block; many chunks maybe missing returns air. If adjacent ungenerated, player may fall through? But generation ensures nearby data. Good.
+
+Now hotbar DOM creation:
+function buildHotbar(){ const bar=document.getElementById('hotbar'); for(let i=0;i<7;i++){ const slot=document.createElement('div'); slot.className='slot'; const id=HOTBAR[i]; const hex=BLOCK_COLORS[id]; slot.style.backgroundColor='#'+hex.toString(16).padStart(6,'0'); slot.textContent=String(i+1); bar.appendChild(slot); } updateHotbar(); }
+updateHotbar: const slots=document.querySelectorAll('#hotbar .slot'); for i slots[i].classList.toggle('selected', i===selected);
+
+CSS:
+html,body{margin:0;padding:0;overflow:hidden;background:#000;} canvas{display:block;}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:monospace;z-index:10;} #overlay h1{margin:0 0 12px;letter-spacing:2px} #overlay p{margin:4px 0} .controls{...}
+#crosshair{position:fixed;left:50%;top:50%;width:22px;height:22px;transform:translate(-50%,-50%);pointer-events:none;z-index:5;} #crosshair::before,#crosshair::after{content:'';position:absolute;background:#fff;} #crosshair::before{left:50%;top:0;width:2px;height:22px;transform:translateX(-50%);} #crosshair::after{top:50%;left:0;height:2px;width:22px;transform:translateY(-50%);}
+#hotbar{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);display:flex;gap:6px;padding:8px;background:rgba(0,0,0,.55);border-radius:8px;z-index:5;} .slot{width:48px;height:48px;display:flex;align-items:center;justify-content:center;color:#fff;font-family:monospace;font-weight:bold;text-shadow:0 1px 2px #000;border:2px solid rgba(255,255,255,.35);box-sizing:border-box;} .slot.selected{border-color:#fff;}
+
+Overlay controls list maybe:
+<div class="controls">WASD move · Space jump · Mouse look · Left click break · Right click place · 1-7 / wheel select</div>
+<p>Click to play</p>
+
+Need ensure overlay click doesn't trigger mousedown game because pointer not locked. Good.
+
+Potential issue: document.addEventListener('mousedown') fires for overlay click too, but pointerLocked false, returns. Good.
+
+Pointer lock request on canvas: In Chrome, requestPointerLock may return promise; ignore. If user clicks overlay after already locked? overlay hidden. Good.
+
+Now let's consider exact spec "Each frame: generate block data for all chunks within 5 chunks of the player (max 4 per frame); build meshes for chunks within 4 chunks whose 4 neighbors already have data (max 2 per frame); for chunks farther than 7, remove the mesh, dispose its geometry and delete the entry." Our build queue only builds if !mesh or dirty. If a chunk within 4 has mesh but dirty false skip; okay. If a chunk within 4 missing mesh and neighbors data but list max2. Good. Generation max4. Removal >7. Good.
+
+But our ensureChunkData marks neighbors dirty, which could cause build queue to rebuild existing meshes. Does this violate "build meshes for chunks within 4 whose 4 neighbors already have data (max 2 per frame)"? It builds only within 4, max2. Good. It also may mark dirty outside but not build until within4. Good.
+
+Potential issue: ensureChunkData marks neighbor dirty even if neighbor outside radius and has mesh; build queue won't rebuild until near. okay.
+
+Now check raycasting with chunkMeshes array after geometry dispose: removeChunkMesh splices. If rebuildChunk called on existing, buildChunkMesh first removeChunkMesh then push new. Good.
+
+Potential issue: If buildChunkMesh called for c.dirty true but c.mesh exists, removeChunkMesh uses key and gets c; then c.mesh null. Then if positions empty, c.mesh=null dirty false. Good.
+
+Potential issue: In removeFarChunks, after collecting del keys, removeChunkMesh looks up entry; then mark neighbors dirty; delete. If neighbor is also in del list? It may be deleted later; marking dirty okay but entry maybe deleted. If neighbor already removed from map? We check if e. Good.
+
+Now let's test mentally a simple scenario:
+Init ensure spawn chunk (0,0). player y find top at x8,z8. Suppose H=24 grass. top data[24]=GRASS, tree maybe if hash<.02; findSpawnY scans readBlock 79 down: could see leaves if tree at local 8. If tree leaves at y=H+3.. etc, top maybe leaves, spawn above. Good.
+animate first frame locked? Initially overlay visible pointerLocked false. updateWorld generates nearby chunks (max4) even before lock. It will generate nearest missing: spawn exists, neighbors maybe distances1 four generated. buildNearbyMeshes: spawn has all 4 neighbors data, dirty true -> list; also neighbor chunks may have neighbors? Some missing outside radius1; only spawn built max2. So first frame mesh appears. Good. If overlay open, player not fall. After click lock, updatePlayer physics. Good.
+
+If player walks to negative coords: Math.floor(-1/16) = -1, local = -1 - (-1*16)=15. readBlock key -1,0 data index 15. Generation pcx floor(player.x/16). For player x=-1, pcx=-1. loops cx -6..4? okay. Negative keys string "-1,0". Good.
+
+Meshing negative: baseX=cx*16 = -16; lx=15 -> wx=-1. Face neighbor readBlock(wx+1) = 0 maybe chunk 0. Good. Geometry positions negative. Raycast floor works.
+
+Now possible bug: In generateChunkData, for caves loop y<=H-2 but if H-2 > WORLD_HEIGHT-1? clamp. Use y<WORLD_HEIGHT. If H=79, y<=77. Good. If H<3 skip because y=3; condition y<=H-2 false. Good.
+
+Tree surface check: const surface = (H < WORLD_HEIGHT ? data[idx(lx,H,lz)] : AIR); But if H clamped 79, surface at index 79. If tree would out of bounds skip due ty<WORLD_HEIGHT. Good. If caves removed surface? caves up to H-2 so not. If H=0? min1.
+
+Tree leaves 5x5 layer twice at H+3,H+4. If trunk wood placed H+1..H+4. Leaves center remains wood. 3x3 at H+5. Top at H+6. Good. But if H+4 >= WORLD_HEIGHT skip wood partially? ty<WORLD_HEIGHT. For H=78, wood y79 only; leaves ty80 skip. Fine.
+
+Now noise hash quality: hash3 returns same for swapped coords due linear sum maybe collisions but okay. Could add mix constants different. Good.
+
+Potential issue: value noise using hash3(ix,0,iz) for 2D: For negative ix, hash3 bitwise works. Good.
+
+Performance of readBlock in meshing: For each face calls readBlock, which does floor division and Map lookup. Many faces maybe okay. Could optimize by caching neighbor chunk data? Not needed but could be heavy. Let's estimate chunk surface faces ~16*16 top 256 plus sides perimeter maybe 4*16*H avg24=1536, total <2000 faces per chunk. readBlock 6*blocks? Blocks solid ~16*16*25=6400, each checks 6 neighbors -> 38k readBlock per chunk. Build max2/frame; generation maybe 4/frame. 76k readBlock/frame okay. Map lookups with string key maybe okay but could be slow. Could optimize key as integer? Spec says global Map key "cx,cz". We can use string. Fine for demo.
+
+But meshing loops all y 0..79 for each column, even air above H; 256*80=20480 blocks per chunk, checking id==0 skip. Okay.
+
+Potential issue: chunkMeshes raycast includes clouds/water? No. Outline LineSegments not in chunkMeshes. Good.
+
+Potential issue: Raycaster intersectObjects(chunkMeshes) when geometry positions world coords and mesh.position 0. Raycaster uses object.matrixWorld; identity. Good.
+
+Potential issue: Face normals from raycast: For non-indexed geometry, intersection.face.normal maybe computed from triangle vertices using THREE.Face3 normal? In r128, Face3 constructor has normal property; if geometry has normal attribute, raycaster may use it? Let's recall r128 Mesh.raycast: it gets positionAttribute and index. It calls checkIntersection with material.side. In intersectTriangle, it creates intersection.face = new Face3(a,b,c, intersectionPoint, faceNormal?) Actually Face3 has a,b,c,normal. It computes normal via triangle if not provided? In BufferGeometry raycast, for each triangle, it uses geometry.attributes.normal to get face normal? I think it does: if (geometry.groups) ... else { const positionAttribute = geometry.attributes.position; ... for i... const intersectionPoint = ...; if (intersectionPoint) { ... intersection.face = new Face3(a,b,c, intersectionPoint, normal); intersection.faceIndex=... } } Where normal maybe from geometry.attributes.normal? It may compute via triangle. Either way our normal attribute matches winding. Good.
+
+But face.normal may be not normalized if computed? Cross product of unit edges gives length 1? Our triangles have edge lengths 1 and sqrt2, cross length 1? For quad triangles, cross length = area*2? For top triangle v0,v1,v2: a=(0,0,1), b=(1,0,1), cross=(0,1,0) length1. Good. Side +X: a=(0,1,0), b=(0,1,1) cross=(1,0,0) length1. Good.
+
+Potential issue: If ray hits exactly on block edge, face.normal could be from one of adjacent faces; target/place maybe okay. If point at corner and normal ambiguous, floor offset may choose adjacent cell? Not critical.
+
+Now let's consider water plane raycast? Not in chunkMeshes, so ray passes through water to blocks. Good.
+
+Clouds not raycast. Good.
+
+Now final code length long but okay. Need ensure no syntax errors. Let's write code carefully.
+
+Potential JS issue: `e.code in keys` works if keys has property KeyW etc. Yes. But `KeyD` etc. For keydown numbers, e.key maybe '1'. If e.code==='Digit1' but e.key '1'. Good.
+
+Potential JS issue: `document.getElementById('overlay').addEventListener('click', () => { renderer.domElement.requestPointerLock(); });` In Firefox requestPointerLock returns undefined; okay. Some browsers require element in DOM and user gesture; overlay click okay. If pointer lock fails, overlay remains. Could add canvas click to retry? Maybe if overlay hidden but not locked due failure? Not needed.
+
+Potential issue: Pointer lock change on Esc: overlay display flex. But mousedown events while overlay visible ignored. Good.
+
+Potential issue: When pointer lock lost, keys may remain pressed; if relock, movement continues. Could clear keys on pointerlockchange release. Do that: if(!pointerLocked){ for k in keys keys[k]=false; }
+
+Potential issue: Wheel event passive false; if not locked return before preventDefault. Good.
+
+Potential issue: In updatePlayer, horizontal move uses keys even if no lock? We call only locked. Good.
+
+Potential issue: In animate, if dt large due tab inactive, clamp .05. Good.
+
+Potential issue: If player falls below -20 and respawn, need ensure spawn chunk exists; findSpawnY calls ensureChunkData(0,0). But if player far away, chunk 0,0 may have been deleted; ensure regenerates. Good. It also marks neighbors dirty. Could be heavy but okay.
+
+Potential issue: findSpawnY uses collidesAt before all nearby chunks generated? It only needs spawn chunk and maybe adjacent if player half crosses local border? x=8,z=8 half .3 within same chunk, so only spawn chunk data. Good. If tree leaves extend to local 6..10, still spawn chunk. Good.
+
+Potential issue: generateChunkData tree hash uses hash3(wx,17,wz). For negative wx, hash works. Good.
+
+Let's think about deterministic clouds using hash3 with large i constants; hash3 uses Math.imul after >>>0; okay.
+
+Now maybe we should set renderer.setClearColor? scene.background enough. Fog color same. Good.
+
+Potential issue: MeshLambertMaterial with vertexColors in r128 requires `vertexColors: true` not THREE.VertexColors. Good.
+
+Potential issue: `THREE.Float32BufferAttribute` exists in r128. Yes.
+
+Potential issue: `geometry.setAttribute('color', ...)` expects itemSize 3. Good.
+
+Potential issue: `new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002,1.002,1.002))` EdgesGeometry threshold angle default; for box returns edges. Good.
+
+Potential issue: Outline position at block center with scale 1.002; if block coordinates large, outline visible. Good.
+
+Now let's consider if chunk mesh geometry positions world coords but bounding sphere huge may cause raycaster to test many triangles for ray that doesn't intersect chunk? Raycaster first checks bounding sphere intersection with ray. For a chunk mesh far away but bounding sphere radius maybe ~50, ray from camera forward might not intersect sphere if outside view; cheap. For chunks behind player maybe sphere intersects ray opposite direction? Raycaster only tests distance along ray positive; bounding sphere check uses ray direction and origin, returns false if sphere behind? It checks closest point distance to ray, then intersection with line segment [0, far]. If sphere behind origin but radius large could intersect segment? If chunk behind player within 50 blocks, ray forward won't hit sphere unless sphere extends in front. Could test some behind chunks whose bounding sphere crosses ray due large height? Maybe okay.
+
+Potential optimization: Remove meshes farther than 7 but keep data; build only within4. Good.
+
+Now let's review spec details for block fill: "below H−3 stone; the 3 layers under the surface dirt (sand if H ≤ 16, stone if H ≥ 37); surface = snow if H ≥ 46, stone if H ≥ 37, sand if H ≤ 16, otherwise grass." Our fill uses y < H-3 stone, y<H subsurface, y==H surface. For H=16: y<13 stone, y=13,14,15 sand, y=16 sand. Good. For H=37: y<34 stone, y=34,35,36 stone, y=37 stone (surface). For H=46: y<43 stone, y=43,44,45 stone, y=46 snow. Good. For H=5: y<2 stone (y1), y=2,3,4 dirt, y=5 grass. Good.
+
+Caves: "for y between 3 and H−2" inclusive? Our loop y=3; y<=H-2. Good. If H=5, y=3..3 one layer cave possible under surface (y3). It could remove subsurface but surface intact. Good.
+
+Trees: "on grass, when a per-column hash < 0.02 and the trunk fits inside the chunk: 4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)." Our trunk fits local 2..13. Good. But "trunk fits inside chunk" could mean trunk x,z within 0..15 not necessarily leaves; but we require margin for leaves. Fine.
+
+Now potential bug: In generateChunkData, after caves, tree surface check uses data[idx(lx,H,lz)] but if H>=WORLD_HEIGHT? clamped. Good. If caves removed a block under surface making subsurface air, trunk placed above still okay. If cave removes y=H-1, leaves? okay.
+
+Potential bug: If tree generated in chunk near border but we restrict lx 2..13 so all leaves inside; neighbor chunks won't have tree parts crossing. Good. But if player stands at x=15 and tree at x=13 leaves extend to x=15 within same chunk. okay. If tree at x=14 not generated due margin, no cross-chunk trees. World has some missing near borders but okay.
+
+Potential bug: readBlock for meshing neighbor across chunks uses data if exists; if neighbor chunk missing returns air. But build only when all neighbors exist, so no missing. For edit rebuild neighbor maybe neighbor missing; faces added toward air. Good.
+
+Potential issue: `removeChunkMesh` called in buildChunkMesh before c.dirty false? It removes old geometry. If c.mesh null no-op. Good.
+
+Potential issue: In removeFarChunks, if entry has no mesh but dirty true, we delete entry and mark neighbors dirty. Good.
+
+Potential issue: In generation list, we sort by d2 but ensureChunkData marks neighbors dirty. If many new chunks generated same frame, build queue may rebuild them. Good.
+
+Now let's think about memory disposal: When chunk deleted, geometry disposed. But if same geometry referenced elsewhere? No. Material shared not disposed. Good.
+
+Now maybe need to handle WebGL context loss? Not necessary.
+
+Potential issue: `renderer.domElement.requestPointerLock()` in Firefox returns promise; okay. But overlay click might be on div covering canvas; request lock on canvas. Good.
+
+Potential issue: If pointer lock is active and user clicks, mousedown event target may be canvas; we handle document. Good.
+
+Potential issue: Right click place while pointer locked: contextmenu suppressed. Good.
+
+Potential issue: Mouse wheel selection while pointer locked: In some browsers wheel event may not fire? It should. Good.
+
+Potential issue: Keys 1-7 while pointer locked: keydown fires; if e.key '1'. But if keyboard layout, okay. We also prevent default for space only. Could prevent default for Tab? not needed.
+
+Now let's consider if camera far 400 but fog 110; clouds at height 90 and range 360 may be beyond fog but material fog false so visible. Good. Water plane size 1000 but fog false? If fog false, distant water visible to horizon maybe okay. Could set fog false to avoid disappearing. Spec says matching fog; not necessarily water. If water fog false, it extends far; might look odd but okay. Could leave fog true for water to match sky. But water plane at height 14.3, if fog true, distant water blends into sky. That's nice. But if fog false, infinite blue plane visible horizon maybe unrealistic. Maybe set water material fog:true (default) to blend. Clouds fog:false to keep visible. Water can be fogged. Let's set waterMat without fog:false? MeshBasicMaterial default fog true. Good. But if fog far 110, water beyond 110 fades; plane re-centered size 1000, near visible. Good. Clouds fog false. Use `fog: false` only clouds. Good.
+
+Potential issue: MeshBasicMaterial transparent with fog true may still okay.
+
+Now let's consider if scene.fog affects LineSegments outline? LineBasicMaterial default fog true; outline black at distance maybe fogged to sky color? Target within 6, near no fog. Good.
+
+Potential issue: MeshLambertMaterial chunk meshes affected by fog; far chunks fade. Good.
+
+Now code final. Need ensure one code block only. But before final, let's maybe run mental syntax check.
+
+Full code skeleton:
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mc.html</title>
+<style>...</style>
+</head>
+<body>
+<div id="overlay">...</div>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<script src="...three.min.js"></script>
+<script>
+(function(){ 'use strict'; ... init(); })();
+</script>
+</body>
+</html>
+
+Use IIFE to avoid globals? Spec says global read/write helpers? It says write global read/write block helpers. Could mean global functions, not necessarily window. If inside IIFE, not global. Spec: "Write global read/write block helpers" and "Keep all chunk meshes in a global array". To satisfy, avoid IIFE or define functions in global scope. Use plain script no IIFE. But variables can be global. We'll not wrap in IIFE? It's okay. But to prevent polluting? Not necessary. Use `var`? Functions declared at top-level are global. We'll write top-level.
+
+Need ensure THREE loaded before script; yes.
+
+Potential issue: If using `const` at top-level, not window properties but global bindings. "global Map" maybe just accessible in scope. Fine.
+
+Now let's write code with function declarations.
+
+Detailed functions order:
+- constants
+- scene variables declared with let
+- helper key, idx, readBlock, setBlock
+- hash/noise
+- ensureChunkData, generateChunkData
+- face definitions, addFace, buildChunkMesh, removeChunkMesh, rebuildChunk
+- chunk management
+- player collision/move
+- UI handlers etc.
+But some functions use variables declared later? Function declarations hoisted, but const variables not initialized until execution. init called at end after all definitions, so okay. FACES const defined before buildChunkMesh call; if function declaration uses FACES at runtime after defined. Good.
+
+Let's define `const CHUNK_SIZE = 16;` etc. `let scene, camera, renderer, raycaster, outline, water, chunkMaterial;` `const clouds = [];`.
+
+Potential issue: `chunks.has(key(cx,cz))` calls key string many times. Could inline? okay.
+
+Let's write key function: `function chunkKey(cx, cz) { return cx + "," + cz; }`
+
+readBlock:
+```
+function readBlock(x, y, z) {
+ if (y < 0 || y >= WORLD_HEIGHT) return AIR;
+ const cx = Math.floor(x / CHUNK_SIZE);
+ const cz = Math.floor(z / CHUNK_SIZE);
+ const lx = x - cx * CHUNK_SIZE;
+ const lz = z - cz * CHUNK_SIZE;
+ const c = chunks.get(chunkKey(cx, cz));
+ if (!c) return AIR;
+ return c.data[(y * CHUNK_SIZE + lz) * CHUNK_SIZE + lx];
+}
+```
+If x,z not integer? In collision loops x int. Meshing world coords ints. Good.
+
+setBlock similar with `if (y < 1 || y >= WORLD_HEIGHT) return false;` But for generation we directly write data. For edit, okay. If placing at y=0 prevented. If breaking target y=0 prevented in handler. Good.
+
+ensureChunkData:
+```
+function ensureChunkData(cx, cz) {
+ const k = chunkKey(cx,cz);
+ let c = chunks.get(k);
+ if (c) return c;
+ c = { cx, cz, data: new Uint8Array(CHUNK_SIZE*CHUNK_SIZE*WORLD_HEIGHT), mesh: null, dirty: true };
+ chunks.set(k,c);
+ generateChunkData(cx,cz,c.data);
+ const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+ for(...) { const n=chunks.get(chunkKey(cx+dx,cz+dz)); if(n) n.dirty=true; }
+ return c;
+}
+```
+If ensure called for existing, maybe should mark dirty? If already exists but no mesh and neighbors generated later, build queue handles because !mesh. If neighbor generation marks it dirty. If edit rebuild uses direct. Good.
+
+generateChunkData uses `const maxSolid = Math.min(H, WORLD_HEIGHT - 1);` Fill y 0..maxSolid inclusive. If H maybe 79. For y < H-3 etc with H maybe >max? H clamped. Good.
+Subsurface/surface types: use if H <=16 etc. But for H=79, surface snow (>=46), subsurface stone. Good.
+
+Caves: `for (let y = 3; y <= H - 2 && y < WORLD_HEIGHT; y++) { const ii=blockIndex(lx,y,lz); if(c.data[ii] !== AIR) { if (noise3(wx*0.09, y*0.09, wz*0.09) > 0.67) c.data[ii]=AIR; } }` Need c? generateChunkData parameter data. Use data.
+
+Tree: Need `if (H < WORLD_HEIGHT && H >= 1)`. But if H=79, H<WORLD_HEIGHT false? 79<80 true; tree out of bounds skip due ty<WORLD_HEIGHT. okay. Check surface: `const surf = data[blockIndex(lx,H,lz)];` if H<WORLD_HEIGHT. Good.
+
+Tree placement function inside generateChunkData:
+```
+if (H < WORLD_HEIGHT && data[blockIndex(lx,H,lz)] === GRASS && hash3(wx,17,wz) < 0.02 && lx >= 2 && lx <= CHUNK_SIZE-3 && lz >= 2 && lz <= CHUNK_SIZE-3) {
+ for (let ty=H+1; ty<=H+4; ty++) { if(ty>=WORLD_HEIGHT) break; const ii=...; if(data[ii]===AIR) data[ii]=WOOD; }
+ for(let layer=0; layer<2; layer++){ const ty=H+3+layer; if(ty>=WORLD_HEIGHT) continue; for dx... }
+ const ty=H+5; if(ty<WORLD_HEIGHT){...}
+ const ty=H+6; if(ty<WORLD_HEIGHT && data[blockIndex(lx,ty,lz)]===AIR) data[...] = LEAVES;
+}
+```
+`lx <= CHUNK_SIZE-3` equals 13. Good.
+
+FACES const:
+```
+const FACES = [
+ { normal:[0,1,0], factor:1.0, verts:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]] },
+ { normal:[0,-1,0], factor:0.55, verts:[[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
+ { normal:[1,0,0], factor:0.8, verts:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]] },
+ { normal:[-1,0,0], factor:0.8, verts:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]] },
+ { normal:[0,0,1], factor:0.8, verts:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+ { normal:[0,0,-1], factor:0.8, verts:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]] }
+];
+const FACE_ORDER = [0,1,2,0,2,3];
+```
+Check -X vertices: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]]. Cross v0->v1 (0,0,1), v0->v2 (0,1,1) cross = (-1,0,0) good. -Z vertices: [[0,0,0],[0,1,0],[1,1,0],[1,0,0]] cross v1-v0=(0,1,0), v2-v0=(1,1,0): cross = (0*0-0*1=0, 0*1-0*0=0, 0*1-1*1=-1) good. +Z vertices: v1-v0=(1,0,0), v2-v0=(1,1,0): cross=(0,0,1). Good.
+
+addFace uses `const order = FACE_ORDER;` good.
+
+buildChunkMesh: Need if c.mesh remove before building. But removeChunkMesh will set dirty? no. After build set dirty=false. If positions empty and old mesh removed, c.mesh null. Good.
+
+Potential issue: In buildChunkMesh, for each face neighbor readBlock(wx+nx,y+ny,wz+nz). For bottom y=0, readBlock y=-1 returns AIR so bottom faces generated. This creates geometry below world; okay. Could cause raycast from below if player falls; but falling teleports. Good.
+
+Chunk management functions use `Math.floor(player.x / CHUNK_SIZE)`. Player x float. Good.
+
+removeFarChunks:
+```
+function removeFarChunks() {
+ const pcx = Math.floor(player.x / CHUNK_SIZE);
+ const pcz = ...;
+ const toDelete = [];
+ for (const c of chunks.values()) {
+   if (Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz)) > 7) toDelete.push(c);
+ }
+ for (const c of toDelete) {
+   removeChunkMesh(c.cx,c.cz);
+   const dirs=...;
+   for(...) { const n=chunks.get(chunkKey(c.cx+dx,c.cz+dz)); if(n) n.dirty=true; }
+   chunks.delete(chunkKey(c.cx,c.cz));
+ }
+}
+```
+But `removeChunkMesh` looks up chunk from map; after collecting toDelete but before delete okay. If removeChunkMesh uses c.mesh and then sets c.mesh null. Good.
+
+buildNearbyMeshes: Need if c.mesh exists but dirty false skip; if c.mesh exists dirty true build; if c.mesh null build. But if c.mesh null and dirty false (maybe just generated? ensure sets dirty true; if generation not? okay). If c.mesh null but neighbors data, list. Sort with dirty priority. Use `list.sort((a,b)=>{ if(a.dirty !== b.dirty) return a.dirty ? -1 : 1; return a.d2 - b.d2; });`
+Count max2.
+
+Potential issue: If a chunk within4 has dirty true but neighbors data missing, skip. If later neighbors generated, generation marks dirty maybe already true. Good.
+
+Player collision functions use `const EPS = 1e-6;` Need define. collidesAt loops could be heavy if chunk missing? readBlock returns air. Good.
+
+moveY scanning horizontal uses same x0,x1,z0,z1. But for downward path y0=floor(newY), y1=floor(oldY). If oldY<newY? delta negative so oldY>newY. If oldY= -19, newY=-19.4 y0=-20,y1=-19; loops okay. If no blocks, best -Infinity -> revert old and onGround true? If falling in air but collidesAt true? collidesAt true only if some block in proposed AABB. If no blocks false. Good.
+
+If collidesAt true but scan path doesn't find candidate due to collision with ceiling while moving down? Could happen if player is inside a block? Shouldn't. If best remains -Infinity, revert old and set onGround true. Might freeze. But old safe and proposed collides due to head hitting floor above? Not likely. Could improve by falling back to full proposed AABB scan. But okay.
+
+Let's refine moveY downward candidate scanning: Use both feet path and proposed AABB maybe. To avoid missing candidate if collision with side wall, we can scan proposed vertical range and choose candidates <= old. For ceiling candidates >old fail; floor candidates found. Use y0=Math.floor(newY), y1=Math.floor(newY + PLAYER_HEIGHT - EPS); but candidate max could be ceiling top >old; condition snapped<=old fails, maybe best remains lower floor? If max chooses ceiling top >old, we would fail even if there is floor candidate <=old. Example falling with head in a hole under ceiling? old safe? Could proposed AABB intersect ceiling block above and floor block below; max candidate ceiling top >old, snapped>old fail, revert and onGround true incorrectly. To avoid, choose best among candidates <= old. For downward:
+```
+let best=-Infinity;
+for by... if solid { const cand=by+1; if(cand<=oldY+EPS && cand>best) best=cand; }
+```
+Then if best found snap else revert. This ignores ceiling candidates >old. Good. Use proposed vertical range or feet path. Let's use proposed AABB y0=floor(newY), y1=floor(newY+PLAYER_HEIGHT-EPS) and candidate<=old. This catches floor blocks whose top <= old. Good. If delta large, floor block by=9 top10 <=old10.1 found. If ceiling by=11 top12 >old ignored. Good.
+
+For upward, choose candidates >= old? For ceiling blocks bottom by, candidate=by-PLAYER_HEIGHT. We want candidate >= oldY (safe feet not below old) and < newY. If multiple, choose minimum? Suppose candidates 10.2 and 11.2, both >=old9.5; min 10.2 safe for lower ceiling. Use if cand>=oldY-EPS && cand<best? Actually best initialized Infinity, choose min candidate that >= old. Then snapped=best. If snapped < newY and !collides snap else revert. Good. Scan head path or proposed AABB. Use proposed AABB y0=floor(newY), y1=floor(newY+PLAYER_HEIGHT-EPS); candidates cand=by-PLAYER_HEIGHT; require cand>=oldY-EPS. For block by=12 candidate10.2; good. For side wall blocks by maybe 9 candidate7.2 <old ignored. Good.
+
+Let's implement moveY with proposed AABB and filters:
+```
+if (collidesAt(player.x, newY, player.z)) {
+ const x0=..., z0=...;
+ const y0=Math.floor(newY), y1=Math.floor(newY + PLAYER_HEIGHT - EPS);
+ if (delta < 0) { let best=-Infinity; for by=y0..y1 if solid { const cand=by+1; if(cand <= oldY + EPS && cand > best) best=cand; } ... }
+ else { let best=Infinity; for by=y0..y1 if solid { const cand=by - PLAYER_HEIGHT; if(cand >= oldY - EPS && cand < best) best=cand; } ... }
+}
+```
+For downward, if best remains -Infinity but collidesAt true due to block with top >old (ceiling) or block bottom? Could revert and set onGround true maybe wrong. But if no floor candidate, maybe collision with wall/ceiling; set vy=0 but not onGround? Could set onGround=false for downward if no candidate? But if falling stuck against ceiling? Let's set `onGround = (best !== -Infinity);` for downward fallback revert. If no candidate, vy=0, onGround=false. But then gravity continues and may repeatedly collide? If stuck inside block due to bug, might jitter. But old safe, collision proposed likely floor candidate exists. Good.
+For upward fallback, onGround remains false (unless ground check?). Set vy=0.
+
+After no collision, ground check. Good.
+
+Horizontal move could also benefit from snap but okay.
+
+respawn function:
+```
+function respawnPlayer() { player.x=8; player.z=8; player.y=findSpawnY(); vy=0; onGround=false; }
+```
+findSpawnY calls ensureChunkData(0,0). But if called during removeFar? no.
+
+updateWorld generation may call ensureChunkData which marks neighbors dirty. If respawn far away, chunk 0,0 maybe deleted and regenerated, marking neighbors dirty outside current player radius (far) but not built. okay.
+
+Potential issue: `findSpawnY` uses collidesAt which uses readBlock; if spawn chunk data just generated but neighbor chunks missing, player at x8,z8 half within chunk so okay. If tree leaves extend beyond local? margin prevents. Good.
+
+Now let's consider if initial overlay click pointer lock while animate already running; good.
+
+Potential issue: If renderer.domElement requestPointerLock returns Promise and throws due user gesture? Not handle. Could add `try { ... } catch(e) {}` but not needed. Maybe Chrome requires element.requestPointerLock() called from user gesture; overlay click is gesture. Good.
+
+Now final code. Need no comments? Comments okay. But output just code block. Could include comments for clarity. Long answer expected. Ensure complete.
+
+Let's maybe mentally simulate a build:
+- `generateNearbyChunks`: list missing chunks within radius5. If spawn exists, neighbors four generated first frame (max4). It sorts by d2; four distance1. Good. ensure marks spawn dirty (already dirty) and neighbors dirty.
+- `buildNearbyMeshes`: pcx=0. For cx0,cz0 c.mesh null dirty true neighbors all data -> list. For cx1,cz0 neighbors? needs cx2,cz0 missing -> skip. cx0,cz1 skip etc. Build spawn mesh max2. Good.
+Second frame: build adjacent chunks whose neighbors generated? For cx1,cz0 needs cx2,cz0 missing, so no. Generation next four maybe distance2? It will generate remaining within radius? There are 25 within radius5; after first 4, next frame generates nearest 4 distance sqrt2? Actually corners distance2? It prioritizes. Need several frames to build all adjacent. Meshes appear gradually. Good.
+
+Potential issue: Build only if all four neighbors have data. For a 3x3 area, after generating spawn + four cardinal (5 chunks), cardinal chunks lack outer neighbor, so only spawn mesh. To make cardinal meshes, need generate their outer neighbors (distance2). Generation max4 next frame maybe generates diagonal? It sorts distance: cardinal already generated; remaining within radius: diagonals distance2 and outer cardinals distance4? Actually pcx0, missing list after first: all except spawn/cardinal. Sorted by d2: diagonals d2=2 (4 chunks) then outer cardinals d2=4 (4) etc. It generates diagonals second frame. Now cardinal chunk e.g. cx1,cz0 neighbors: cx2? distance2 from player? cx2,cz0 not generated (d2=4) but diagonal cx1,cz1 generated; missing cx2,cz0, so still skip. Need outer cardinal generated third frame. So first ring meshes after 3 frames. Acceptable. Could prioritize generation to ensure neighbors for build by generating chunks needed for meshing? Spec says all within5 max4 sorted arbitrary. We sort nearest; okay.
+
+Maybe build queue could build chunk if neighbors data OR neighbor missing but outside fog? Spec requires neighbors data. Good.
+
+Potential issue: If player moves fast, generation may lag and collision sees air in ungenerated chunks ahead. But max speed 5.5, dt .05 move .275; generation 4 chunks/frame ~ maybe enough. Could pre-generate ahead? Not required.
+
+Now let's think about fog near/far: `new THREE.Fog(0x87ceeb, 40, 110)`. Good.
+
+Now possible bug with `THREE.Fog` and MeshBasicMaterial clouds fog false: In r128, MeshBasicMaterial has `fog` property. Good.
+
+Potential bug: `renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));` okay.
+
+Potential bug: `window.innerWidth` in camera aspect; use `window.innerWidth / window.innerHeight`. Good.
+
+Now let's consider if `document.addEventListener('keydown', onKeyDown);` and overlay input? no inputs. Space prevent default may block pointer lock? no.
+
+Potential issue: If user clicks overlay, then pointer lock request might be denied because click target is overlay not canvas? Pointer lock can be requested on any element in DOM from user gesture; okay. Some browsers require element to be in fullscreen? No, pointer lock works without fullscreen generally (Chrome maybe requires user gesture and document). Good.
+
+Now final answer must be exactly one code block. Ensure no text before/after. Use ```html ... ```.
+
+Double-check all variables defined:
+- `selected` used in onMouseDown, updateHotbar.
+- `HOTBAR` defined.
+- `BLOCK_COLORS` defined.
+- `clouds` array.
+- `cloudMaterial` maybe local in createClouds. Define const cloudMaterial inside function or global. Use local.
+- `waterMat` local.
+- `lastHit` let.
+- `pointerLocked`, `yaw`, `pitch`, `vy`, `onGround`, `keys`.
+
+Function order: If init calls functions declared later? Function declarations hoisted, so okay. But `const FACES` not hoisted; buildChunkMesh called after init? init at end after FACES defined. Good. `init()` call at very bottom after all function definitions. Good.
+
+Potential issue: `keys[e.code] = true` for e.code 'KeyW' etc. `if (e.code in keys)` works because keys object has properties. But if e.code 'Space', not in keys. Good.
+
+Potential issue: In onKeyDown, `else if (e.key >= '1' && e.key <= '7')` string comparison works for single digits. Good. But if e.key 'Digit1'? no. Could use `if (/^[1-7]$/.test(e.key))`. Simpler string compare okay.
+
+Potential issue: `updateHotbar` called before hotbar built? init calls buildHotbar then update? In buildHotbar call updateHotbar at end. Good.
+
+Potential issue: `document.querySelectorAll('#hotbar .slot')` returns NodeList; updateHotbar loops length. Good.
+
+Potential issue: `overlay.style.display = pointerLocked ? 'none' : 'flex';` overlay initial display flex. Good.
+
+Potential issue: `renderer.domElement` appended after hotbar? Body order overlay, crosshair, hotbar, script appends canvas. Canvas may cover UI if z-index not set. CSS overlay z-index 10, crosshair/hotbar 5, canvas default z-index auto but DOM order after UI; without position fixed on canvas, it may paint over UI because later in DOM? Actually canvas is static positioned, UI fixed with z-index; fixed elements with z-index above canvas even if canvas later. Canvas no z-index but fixed has stacking context due z-index? Fixed creates stacking context? z-index applies to positioned elements. Canvas not positioned, z-index ignored but painting order: positioned elements with z-index >0 paint after non-positioned canvas? Yes. Good. Could set canvas position absolute top0 left0. But body no margins, renderer canvas block. Fine.
+
+Potential issue: `body overflow hidden` but canvas appended; good.
+
+Potential issue: `#overlay` click also triggers mousedown document before pointer lock false; returns. Good.
+
+Potential issue: If pointer lock active and user clicks, mousedown button 2 also triggers contextmenu? suppressed. Good.
+
+Now let's think about raycast after edit: lastHit from previous frame may point to block just removed; if click break then place in same mousedown? No, each event uses current lastHit updated each frame. If multiple clicks between frames, lastHit stale but okay; could recompute raycast in handler for accuracy. Maybe better: In onMouseDown, perform a fresh raycast rather than use lastHit? Spec says Each frame raycast; only while locked click sets target. Could use lastHit. If user clicks quickly before next frame, stale may break wrong block if player moved? Mouse look changes camera but no movement; lastHit okay. But if left click breaks and right click same frame? lastHit still original; place cell based on original face maybe adjacent to broken block, could place into air where broken was? If right click after break without new raycast, could place in broken target? Actually right click uses place cell = floor(p+n*0.5), not target; if original hit top of block, place above, okay. If original hit side, place adjacent. Fine. If left then right same frame, no issue. If camera moved via mouse between frames, lastHit updated next frame. Good.
+
+Potential issue: If raycast hits water plane? Not in chunkMeshes. Good.
+
+Potential issue: If raycast hits cloud? Not. Outline not. Good.
+
+Potential issue: If raycaster.far=6 and intersectObjects returns hits sorted by distance? It does sort. We filter distance <=6. Good.
+
+Potential issue: `raycaster.ray.direction.set(0,0,-1).applyQuaternion(camera.quaternion);` Need camera.quaternion updated from rotation. camera.updateMatrixWorld() updates quaternion? In Three, Object3D.quaternion is set by rotation via Euler when updateMatrixWorld? `camera.rotation` is Euler; `camera.quaternion` updated automatically when rotation changed? In r128, Object3D.rotation has onChange callback that sets quaternion? I think yes: Euler onChange calls quaternion.setFromEuler. But to be safe, `camera.updateMatrixWorld()` will compose matrix from position/quaternion/scale; if quaternion not updated? Object3D.matrixAutoUpdate true; updateMatrixWorld calls quaternion.setFromEuler? Actually Object3D.updateMatrix() does `quaternion.setFromEuler(rotation)`. updateMatrixWorld calls updateMatrix if matrixAutoUpdate. So okay. Could also `camera.quaternion.setFromEuler(camera.rotation);` but not necessary. We'll call camera.updateMatrixWorld().
+
+Potential issue: camera.rotation.order set 'YXZ'; when setting rotation.x/y/z, quaternion uses order. Good.
+
+Potential issue: In updateCamera, setting camera.rotation.x/pitch and y/yaw each frame. Good.
+
+Potential issue: In mouse move, pitch clamp limit `Math.PI / 2 - 0.01`. Good.
+
+Potential issue: In movement forward vector, if yaw=0, forward = (-sin0=0, -cos0=-1) => moves negative Z (camera looks -Z). Good. Right = (cos0=1, -sin0=0) => +X. Mouse look right yaw negative; forward becomes? yaw=-0.1: forward x=-sin(-0.1)=+0.099 (right), z=-cos=-0.995. Good.
+
+Potential issue: If player walks into wall, horizontal revert may prevent sliding along axis-separated? Move X then Z separately allows sliding. Good.
+
+Potential issue: Jump while onGround false due hover gap? moveY snap should set ground true when collision candidate found. If standing exactly top, no collision, ground check true. Good.
+
+Let's test moveY standing: player.y=10, vy=-25*dt=-0.4, newY=9.6. collidesAt(x,9.6,z): AABB [9.6,11.4], y0=floor9.6=9, y1=floor11.4-eps=11. Checks block by=9 ground solid -> true. delta<0 scan proposed y0=9,y1=11, candidates: by9 top10 <=old10 best10; by10? maybe air; by11? air. snapped10 !collidesAt(x,10,z) false (AABB [10,11.8] y0=10 excludes ground) true. player.y=10 vy=0 onGround true. Good. Next frame same snap to 10. Stable.
+
+Jump: onGround true vy set 8.5, moveY delta .14 newY10.14 collidesAt? AABB [10.14,11.94], y0=10, excludes ground by9; if no ceiling false. player.y=10.14, ground check collidesAt(10.13) y0=10 excludes ground false. onGround false. Good.
+
+Fall from high: vy clamped -30, dt .05 delta -1.5. old 20, new18.5, proposed AABB [18.5,20.3]. Ground at by19 top20 candidate <=old20 best20 snap to20. Good. If old 20.4, new18.9 proposed [18.9,20.7], candidates by19 top20 <=old20.4 best20; snap to20. Good. If ground at by18 top19 but no block at19? candidate19 <=old, best maybe19 if proposed AABB intersects [18,19]? proposed minY18.9 <19, yes. Snap 19. Good.
+
+Ceiling jump: old feet 10, top11.8, vy8.5 delta .14 new10.14 top11.94, ceiling block by12? proposed AABB [10.14,11.94], y0=10,y1=11; does not include by12 because max 11.94 floor - eps =11. So collidesAt false, player moves to10.14. Next frame top12.08, proposed [10.28,12.08], y0=10,y1=12 includes by12, candidate 10.2 >=old10.14? yes best10.2 <new10.28 snap to10.2. Good.
+
+Now collidesAt for ceiling block by12 at proposed top11.94? max=11.94, y1=floor(11.94-eps)=11, excludes by12 because AABB max <12, no collision. Good.
+
+Now horizontal collision with wall: player x=0.5 (cell0 air), wall block cell -1? Actually if wall at cell0 solid and player center 1.3 adjacent minX1.0 maxX1.6 x0=1 x1=1, checks cell1 only; no collide. If move left delta -.275 new x=1.025 minX .725 maxX1.325 x0=0 x1=1; checks cell0 solid -> collide revert old1.3. Good. Sliding along wall: if moving diagonal, X reverted, Z moves. Good.
+
+Now possible issue: collidesAt loops x0=floor(minX), x1=floor(maxX-EPS). For minX exactly integer boundary 1.0, floor=1; if maxX 1.6, x1=1; checks cell1 only. AABB touches cell0 at boundary but not overlap. Good. For minX -0.3, floor -1, maxX .3, x1=0; checks -1 and0. If block -1 solid, player half overlaps? AABB [-.3,.3] intersects block [-1,0]? yes from -.3 to0. Good. If block -1 solid at wall left of air cell0, player center0.5? minX .2 floor0, no wall. Good.
+
+Now let's think about readBlock for negative x in collision loops: x=-0.3 -> cx=floor(-0.3/16)=-1, lx=-0.3 - (-16)=15.7? Wait x in collidesAt loop bx integer from floor(minX) to floor(maxX-EPS). For minX=-0.3, bx=-1. readBlock(-1,...): cx=floor(-1/16)=-1, lx=-1 - (-16)=15. Good. If bx=0, cx=0 lx0. Good.
+
+Now potential bug: In generateChunkData, local index for tree leaves uses `data[blockIndex(x, ty, z)]` where x,z local. Good.
+
+Potential bug: In buildChunkMesh, `readBlock(wx + nx, y + ny, wz + nz)` for neighbor across chunk border; if neighbor chunk data missing returns air. But build only if neighbors exist. For edit rebuild maybe neighbor missing. okay.
+
+Potential bug: `chunkMeshes` global array may contain meshes whose geometry disposed but not removed? removeChunkMesh removes. If buildChunkMesh called on c with mesh, remove then push new. Good.
+
+Potential bug: If `removeFarChunks` deletes entry with no mesh but dirty true, mark neighbors dirty. Good.
+
+Potential bug: If chunk data generation list includes chunks already deleted but within radius; ensure regenerates. Good.
+
+Potential bug: If player teleports to spawn far from current, removeFarChunks may delete many entries over frames. okay.
+
+Potential bug: If `ensureChunkData` called for spawn in findSpawnY before scene initialized? init calls after renderer/scene? findSpawnY only uses chunks/readBlock/noise; no scene. okay. But it may mark neighbors dirty; build later. Good.
+
+Potential bug: `init` calls `player.y = findSpawnY();` before `buildHotbar` maybe order doesn't matter. Good.
+
+Potential bug: `window.addEventListener('resize', onResize);` onResize defined. Good.
+
+Potential bug: `renderer.setSize(window.innerWidth, window.innerHeight);` on resize. Good.
+
+Potential bug: If THREE not loaded (offline), script errors; spec requires CDN. okay.
+
+Now let's consider if using `const` at top-level and functions referencing them before initialization due hoisting? Function declarations hoisted but executed after init call at bottom, so all const initialized. Good.
+
+Potential issue: In `generateNearbyChunks`, sorting list of objects each frame could allocate; okay. Could limit to 4 by selection sort to reduce allocation but fine.
+
+Potential issue: In `buildNearbyMeshes`, checking neighbors via chunks.has for every chunk within radius (81) each frame, string keys. okay.
+
+Potential issue: In meshing, `readBlock` for neighbor uses Map get string; if neighbor exists but dirty true not meshed, data solid; faces culled correctly. Good.
+
+Now let's maybe consider using integer key instead of string to improve and satisfy "key 'cx,cz'"? Spec says key "cx,cz" likely string. We'll use string.
+
+Potential issue: In `removeFarChunks`, `for (const c of chunks.values())` while later deleting; we collect toDelete first, safe. Good.
+
+Potential issue: In `ensureChunkData`, marking neighbors dirty for each new chunk could mark a neighbor that is in process of deletion? Not concurrent. Good.
+
+Now let's think about exact final code indentation and no syntax errors. I'll write carefully.
+
+One more consideration: The spec says "Store them in a global Map (key "cx,cz", value: a Uint8Array of block IDs plus its mesh)." Our value object includes data/mesh/dirty. Good.
+
+"Write global read/write block helpers using chunk = floor(world/16) and local = world − chunk*16, so negative coordinates work." We do.
+
+"Reading a missing chunk or y outside 0–79 returns air." We do.
+
+"Each frame: generate block data for all chunks within 5 chunks of the player (max 4 per frame); build meshes for chunks within 4 chunks whose 4 neighbors already have data (max 2 per frame); for chunks farther than 7, remove the mesh, dispose its geometry and delete the entry." We do. Note "all chunks within 5" but max4 per frame; we queue. Good.
+
+"Keep all chunk meshes in a global array for raycasting, and write a rebuild function for a chunk." `chunkMeshes` and `rebuildChunk`. Good.
+
+"Use world coordinates for vertices and keep the mesh at the origin." We do.
+
+"Never one mesh per block." Good.
+
+"Fake lighting: multiply block color by 1 top, 0.8 sides, 0.55 bottoms." We bake factors. Good.
+
+"Ambient light 0.65 plus one directional light 0.8." We add.
+
+"Around 25 flat white transparent boxes as clouds at height ~90, slowly drifting and wrapping around the player." We do 25 boxes, y 90-98, drift/wrap.
+
+"Water: one large semi-transparent blue plane at height 14.3, re-centered on the player each frame." We do.
+
+"A small CSS crosshair at screen center." We do.
+
+"Outline targeted block with black wireframe box." We do.
+
+"Only while pointer locked: left click sets target to air (not at y 0); right click places selected if cell air and does not overlap player." We do.
+
+"After an edit rebuild the chunk, and also neighbor chunk if block sits on chunk border." We do.
+
+"Suppress browser context menu." We do.
+
+"Hotbar fixed bottom center: 7 slots colors numbers dark semi-transparent bar selected white border." We do.
+
+"Select with keys 1–7 or mouse wheel (wraps)." We do.
+
+"Start overlay reappears whenever pointer lock released." We do.
+
+Potential issue: In `onKeyDown`, number selection works even if pointer not locked; okay. If user presses space while overlay open, prevent default but no jump. Good.
+
+Potential issue: In `onWheel`, if pointer not locked, we don't preventDefault; but body overflow hidden, maybe page doesn't scroll. Fine.
+
+Potential issue: In `onMouseDown`, if pointer locked but lastHit null due raycast not yet run (first frame after lock), no edit. Next frame raycast. Good.
+
+Potential issue: If user clicks immediately on overlay to lock, the same click's mousedown event fires before pointerlockchange? document mousedown sees pointerLocked false, returns. Good.
+
+Potential issue: If pointer lock change occurs and overlay display none, but mousedown from same click? No.
+
+Now let's consider if `document.pointerLockElement === renderer.domElement` works in Firefox? Yes.
+
+Potential issue: Some browsers require `renderer.domElement.requestPointerLock()` but canvas not focusable? It is element; okay.
+
+Potential issue: If pointer lock fails due insecure context? file:// maybe Chrome allows pointer lock? Pointer Lock API works on file? I think yes? Maybe requires secure context? Actually Pointer Lock requires user gesture and document in fullscreen? No, Pointer Lock API available without fullscreen but may require secure context? In Chrome, pointer lock works on file://? I believe yes. If not, game unplayable but spec expects. Could fallback to mouse drag look when not locked? Not required. But to be robust, maybe if pointer lock not supported, still allow movement with mouse? Spec says mouse look only while locked. We'll follow.
+
+Potential issue: `renderer.domElement.requestPointerLock` may return a promise that rejects; no catch. Could cause unhandled rejection. Add try/catch? In Chrome returns undefined or Promise. To be safe:
+```
+const req = renderer.domElement.requestPointerLock();
+if (req && req.catch) req.catch(()=>{});
+```
+Good.
+
+Potential issue: In Firefox, `requestPointerLock` may throw if not user gesture; overlay click okay. Add try.
+
+Now let's maybe include a small instruction in overlay controls. Good.
+
+One more subtle issue: `THREE.MeshLambertMaterial({ vertexColors: true })` with fog and lights. If geometry has normals, Lambert uses normal attribute for lighting. Our fake factors already baked; but Lambert will also use normals to modulate directional light. This could make side faces darker/brighter depending direction. That's okay. But if directional light direction not aligned, top faces may get less than sides? Directional position (100,200,100) normalized dot with +Y = 200/sqrt(10000+40000+10000)=200/244.9=.816; top gets .65+.653=1.303. Sides +X dot .408 -> .976, -X .65, etc. Bottom .65. Top still brighter. Good.
+
+Potential issue: MeshLambertMaterial with vertexColors and lights can make colors >1 and banding; okay.
+
+Potential issue: If chunk geometry has no normals? We set. Good.
+
+Potential issue: `geometry.computeBoundingSphere()` after attributes. Good.
+
+Potential issue: If positions length huge, Float32BufferAttribute from JS array copies; okay.
+
+Now let's think about caves using noise3 single octave at scale 0.09. For y integer, noise3 lattice scale .09 means period ~11 blocks, large blobs. Threshold .67 may carve big caverns. Could be okay. If too many caves, surface still solid but subsurface may have holes causing floating grass? Surface block remains solid at H; underneath cave air from y3..H-2. If H=24, cave could remove y3..22 leaving a shell of grass/dirt at top? Actually fill: y<21 stone, y21-23 dirt, y24 grass. Caves y3..22 can remove stone and dirt layer 21,22 but not y23? H-2=22, so y23 remains dirt under surface. So ground stable with at least one dirt layer under surface? For H=24, y23 dirt remains. For H=16, y15 sand remains. Good. For H=37, y36 stone remains. So no floating surfaces; there is a 1-block crust below surface (y=H-1) not cave because caves up to H-2. Good.
+
+Tree trunk placed above surface, leaves may overhang. Good.
+
+Potential issue: If cave noise removes y=H-1? It doesn't. Good.
+
+Potential issue: If H<=3, caves skip; fill okay. Min H5.
+
+Now let's consider if block IDs in Uint8Array default 0 air. Good.
+
+Potential issue: In `generateChunkData`, for y loop 0..maxSolid inclusive, if H=79 maxSolid79; for y<H-3 etc. Good. If H=1? not possible but if clamped? min5. Good.
+
+Potential issue: In `columnHeight`, `m*m*58` if m negative? fractal returns positive because noise returns hash values 0..1 and weights positive. Good.
+
+Potential issue: `hash3` division by 4294967295 returns [0,1]. If n=0, okay.
+
+Potential issue: `Math.imul(n, 1274126177) >>> 0` where n is uint32; good.
+
+Potential issue: In noise functions, hash3 arguments can be negative large from Math.floor of scaled negative coordinates. Bitwise conversion works. Good.
+
+Now let's maybe consider adding `camera.rotation.z = 0` in updateCamera. Good.
+
+Potential issue: In `onResize`, camera.aspect updated and projectionMatrix. Good.
+
+Potential issue: If window size zero? not.
+
+Now final code. Need ensure no accidental use of `window.devicePixelRatio` before defined? okay.
+
+Let's write final with comments maybe. Ensure code block starts ```html and ends ```.
+
+Double-check `THREE.LineBasicMaterial` color black; outline maybe affected by fog but near. Good.
+
+Potential issue: `outline.position.set(bx + 0.5, by + 0.5, bz + 0.5);` If target block y=0 and visible? We hide if by<0? We set if by>=0. If by=0 outline shows unbreakable block; okay. Could hide if by<1 but not necessary.
+
+Potential issue: In `updateRaycast`, if hit.face is undefined for LineSegments? We only intersect chunkMeshes. Good.
+
+Potential issue: If raycaster hits backside of a face due DoubleSide? chunkMaterial FrontSide default, so only front faces. Good. If some winding wrong, face may be culled and not hit; but we think correct.
+
+Let's verify top face winding with Three coordinate handedness. Three uses right-handed? Cross product as standard. Front side determined by counter-clockwise when viewed from camera looking along -Z? In Three, default front side is counter-clockwise in object space? The normal computed by cross(v2-v1, v3-v1)? Actually triangle face normal in Three raycast maybe computed using `p1.crossVectors(p2 - p1, p3 - p1)`? We used cross(v1-v0,v2-v0). If Three uses different order, normals might be opposite. But material side FrontSide culls backfaces based on winding after projection, not normal attribute. Need ensure winding produces front faces for outward normals in Three's coordinate system. Let's test top face: vertices (x,y+1,z), (x,y+1,z+1), (x+1,y+1,z+1). In world, camera looking from above down (-Y). Project onto screen? Hard. Standard OpenGL front-facing if vertices counter-clockwise when viewed from outside. For top face viewed from +Y looking down (-Y), the x-z plane orientation: Looking along -Y, x axis right? z axis? In Three, camera default looks -Z; but for viewing top from +Y, camera would look -Y with up maybe +Z or -Z? The CCW convention depends on coordinate system. Our cross gave normal +Y. In a right-handed system, if normal points outward and triangle winding is CCW when looking along normal direction (from outside), then front side visible. We computed cross(v1-v0, v2-v0) = +Y. If camera looks from +Y toward origin (direction -Y), the normal points toward camera? Camera at +Y looking down sees face if normal +Y. The projected vertices: Need determine orientation. Let's set block top at y=1, v0=(0,1,0), v1=(0,1,1), v2=(1,1,1). Camera above at (0,5,0) looking down. Project onto screen x horizontal, z vertical maybe? If camera up vector +Z? For a top-down camera rotation X=-90, screen right = +X, screen up = +Z? v0 projects (0,0), v1 (0,1), v2 (1,1). Order v0->v1->v2 is CCW? Coordinates: (0,0)->(0,1)->(1,1): cross positive z? (0*1-1*1=-1?) Let's compute screen 2D cross (x,y): (v1-v0)=(0,1), (v2-v0)=(1,1), cross z=0*1-1*1=-1 (clockwise). Hmm maybe front side wrong? But camera up may be -Z. If top-down camera with up -Z, screen up = -Z, v1 projects (0,-1), v2(1,-1): order (0,0)->(0,-1)->(1,-1): cross z=0*(-1)-(-1*1)=1 CCW. So depends. Three's default front side is determined by winding in world coordinates? It uses `material.side` and triangle normal computed from geometry vertices; if normal attribute opposite to winding, culling may still use winding? Actually WebGL culls based on projected vertex order, not normal. Three sets front face based on winding convention: In Three.js, front faces are counter-clockwise when viewed from camera? It uses `renderer.setFaceCulling`? Default `side = FrontSide` culls triangles whose winding is clockwise in screen space. The geometry normals should match outward for lighting. If our top face projected orientation depends on camera orientation but if normal outward, standard convention should be okay. Let's verify with known BoxGeometry faces. BoxGeometry in Three creates front/back etc with certain vertex order. For a cube at origin, top face normal +Y vertices? BoxGeometry source: buildPlane('x','z','y', 1, -1, ...) maybe. Hard. But common voxel tutorials use top face vertices (0,1,0),(1,1,0),(1,1,1),(0,1,1) maybe different order. Let's ensure our winding matches normal using cross product. WebGL front-facing if triangle vertex order is counter-clockwise in screen space; the normal computed by right-hand rule from vertex order (cross(v1-v0,v2-v0)) points toward viewer for CCW in world? In a right-handed coordinate system, if vertices are CCW when viewed from the direction of the normal, cross gives normal toward viewer. For top face, viewer direction is +Y looking down? The viewer's eye vector from triangle to camera is +Y. The vertices should be CCW when viewed from +Y. We need project onto plane perpendicular to +Y with a right-handed 2D coordinate system. If looking along -Y (from +Y), the screen coordinates could be x right, z left? Let's derive: Camera at +Y looking toward origin has forward vector (0,-1,0). A camera up vector maybe (0,0,-1) to maintain right-handed? In Three top-down camera rotation X=-90: camera local axes: right = +X, up = -Z, forward = -Y. So screen x=+X, y=+up=-Z. v0=(0,0), v1=(0,-1), v2=(1,-1). Order v0->v1->v2: cross z = (0*-1 - -1*1)=1 CCW. Good. Our order is correct for camera with up -Z. For arbitrary camera, front side culling uses projection; if normal outward and winding consistent, okay.
+
+Bottom face normal -Y, viewed from below (camera at -Y looking up +Y). Camera rotation X=90: right = +X? up = +Z? forward=+Y. Screen x=+X,y=+Z. Bottom vertices v0=(0,0,0), v1=(1,0,0), v2=(1,0,1): screen (0,0),(1,0),(1,1) cross z=1*1-0*1=1 CCW. Good.
+
+Side +X normal +X, viewed from +X looking -X. Camera rotation Y=-90? forward=(-1,0,0), up=(0,1,0), right? For camera looking -X, screen x maybe -Z? Let's not. Our cross gave +X, likely okay.
+
+Thus fine.
+
+Potential issue: `MeshLambertMaterial` with normals attribute but if side FrontSide and some faces normals opposite due winding mismatch? We think correct.
+
+Now let's consider if raycast face.normal from geometry normal attribute could be opposite of material front? If winding correct, same. Good.
+
+One more subtle bug: In `buildChunkMesh`, when checking neighbor for bottom face y=0, readBlock returns air for y=-1, so bottom faces added. But these faces have vertices at y=0 and normals -Y. They are front side visible from below (inside bedrock). If player cannot go below y0? Could fall below if no chunks? Teleport at -20. Maybe see them when falling. okay.
+
+Potential issue: If chunk data missing, readBlock returns air; for a generated chunk adjacent to ungenerated, build skipped until neighbor exists. But edit rebuild of border chunk with neighbor missing will add faces toward missing neighbor (air). If neighbor later generated, dirty marks rebuild. Good.
+
+Potential issue: In `ensureChunkData`, marking neighbors dirty could cause a neighbor outside radius with mesh to be dirty but not rebuilt; when player approaches and it becomes within4, build queue rebuilds. Good. But if neighbor outside4 has no mesh and dirty true, when within4 and all neighbors data, builds. Good.
+
+Potential issue: In `buildNearbyMeshes`, if a chunk has mesh null but dirty false because maybe generated by ensure? ensure sets dirty true. If it was built then deleted? mesh removed but entry not deleted? removeChunkMesh sets c.mesh=null but entry remains (only called in build rebuild or removeFar). If removeChunkMesh called in build, dirty later set false after new build. If removeChunkMesh called in removeFar then entry deleted. If some other reason mesh null dirty false? Could happen if positions empty after build; then c.mesh=null dirty=false. If later a block edit adds solid to that chunk? rebuildChunk directly builds. If later neighbor generation should add faces? If chunk had no mesh because all blocks air, and new neighboring chunk generated with solid adjacent, faces of this chunk? This chunk has no solid blocks, no faces needed. If new solid in this chunk? edit rebuild. Good.
+
+Potential issue: If chunk data has solid but all faces culled (fully enclosed by neighbors), positions empty, mesh null dirty false. If later neighbor chunk deleted/regenerated? Could need faces. Generation marks dirty; build queue sees c.mesh null dirty true and builds if neighbors data. But if chunk fully enclosed by existing neighbors, positions still empty. okay. If neighbor deleted but entry remains? removeFar deletes and marks neighbors dirty; when player returns generation new neighbor marks dirty; rebuild may add faces if neighbor now air? Actually if neighbor entry deleted, readBlock air; but build only if all neighbors data. If neighbor missing, skip until regenerated. When regenerated solid, faces culled. If regenerated air (possible? chunk always has terrain solid), no issue.
+
+Now let's consider if terrain generation for each column computes fractal2 twice with x*0.004 and x*0.02. For large coordinates, noise lattice floor of scaled coords; okay.
+
+Potential issue: `hash3` for 2D noise uses y=0 constant; for negative ix+1 maybe. Good.
+
+Potential issue: `fractal2` amplitude max sum 1+0.5+0.25+0.125=1.875. Good.
+
+Potential issue: `noise3` for caves single octave uses hash3 with y integer scaled .09; okay.
+
+Potential issue: If threshold .67 and noise3 returns exactly 0.67 no air. Good.
+
+Now final code. Let's ensure all braces closed. I'll write in final. But before final, maybe consider if there is any requirement "Load only Three.js r128 via a script tag ... No modules". We use script tag. Good.
+
+Potential issue: If using `const` top-level and then `init()` at end, but functions like `buildHotbar` use DOM elements defined before script. Good.
+
+Potential issue: If user opens file in Firefox, pointer lock may require `document.body.requestPointerLock`? Element works. Good.
+
+Potential issue: If overlay click requests pointer lock, but overlay is display flex and after lock hidden; if user presses Esc, overlay display flex. Good.
+
+Potential issue: If pointer lock request fails, overlay remains; no error. Good.
+
+Potential issue: If `renderer.domElement` not created before overlay listener? init creates renderer then adds listener. Good.
+
+Potential issue: In `onPointerLockChange`, if pointerLocked false, clear keys. Good.
+
+Potential issue: In `animate`, if `dt` NaN on first frame? last initialized performance.now before requestAnimationFrame; okay.
+
+Potential issue: If requestAnimationFrame passes timestamp not matching performance.now? We use performance.now. okay.
+
+Potential issue: If tab inactive long, dt clamp .05; world generation may lag but okay.
+
+Now maybe include `if (!THREE) return;`? Not needed.
+
+Let's produce final code. Ensure no text outside code block. Use oververbosity? code long. final only code.
