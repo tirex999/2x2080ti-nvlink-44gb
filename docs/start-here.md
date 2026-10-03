@@ -348,7 +348,7 @@ SpecDecoding metrics: Mean acceptance length: 3.76, Drafted throughput: 94.78 to
 ## Если модель больше карт
 
 Qwen3.8-Flash-Next (125B MoE, 512 экспертов) в 44 ГБ карт не помещается. Её эксперты считает процессор, а карты берут
-всё остальное. Быстрее всего это у нас работает на своём движке DACAN: 56–68 т/с на двух 2080 Ti и двух сокетах Ice Lake
+всё остальное. Быстрее всего это у нас работает на своём движке DACAN: 72–80 т/с на коде и 47–60 на прозе на двух 2080 Ti и двух сокетах Ice Lake
 с AVX-512 — [flash-next](flash-next.html), код — [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN), веса — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN).
 <!-- /dacan-2809 -->
 ## Куда смотреть дальше
