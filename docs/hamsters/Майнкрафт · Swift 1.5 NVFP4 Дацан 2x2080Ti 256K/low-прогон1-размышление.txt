@@ -1,0 +1,312 @@
+Let me build a complete Minecraft-style voxel game in a single HTML file. This is a complex task that requires careful implementation of:
+
+1. Three.js setup with a single MeshLambertMaterial using vertex colors
+2. Procedural terrain generation with value noise (no Math.random)
+3. Chunk-based world management with proper meshing
+4. First-person controls with pointer lock
+5. Physics with AABB collision
+6. Block breaking and placing with raycasting
+7. Hotbar UI
+8. Sky, clouds, water plane
+
+Let me think through the architecture:
+
+**Noise System:**
+- Integer hash function using prime multipliers and xor-shifts
+- 2D value noise with bilinear interpolation + smoothstep
+- 4-octave fractal noise (2D)
+- 3D value noise for caves
+
+**Terrain Generation:**
+- Column height: m = fractal(x*0.004, z*0.004), h = fractal(x*0.02, z*0.02), H = floor(5 + m*m*58 + h*10)
+- Fill rules based on height
+- Caves: 3D noise at pos*0.09 > 0.67
+- Trees: hash < 0.02 on grass
+
+**Chunk System:**
+- 16x16 columns, 80 blocks high
+- Map with key "cx,cz"
+- readBlock/writeBlock helpers
+- Generation queue (max 4/frame), mesh building queue (max 2/frame)
+- Cleanup beyond 7 chunks
+
+**Meshing:**
+- Per chunk: loop all non-air blocks, check 6 neighbors, add face if neighbor is air
+- Use world coordinates for vertices
+- Vertex colors with fake lighting (1.0 top, 0.8 sides, 0.55 bottom)
+- BufferGeometry with position, normal, color attributes
+
+**Player:**
+- AABB collision (half-width 0.3, height 1.8, eye 1.62)
+- Gravity 25/s², jump velocity 8.5
+- WASD movement at 5.5 m/s
+- Axis-separated collision resolution
+
+**Raycasting:**
+- From camera center, max distance 6
+- Against chunk meshes (stored in global array)
+- Break: floor(p - n*0.5), Place: floor(p + n*0.5)
+
+**UI:**
+- Crosshair (CSS)
+- Hotbar (7 slots)
+- Start overlay
+- Outline box for targeted block
+
+Let me write this carefully, making sure all the pieces fit together.
+
+For the hash function, I'll use something like:
+```javascript
+function hash(x, y) {
+    let n = x * 374761393 + y * 668265263;
+    n = (n ^ (n >> 13)) * 1274126177;
+    n = n ^ (n >> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For 3D hash:
+```javascript
+function hash3(x, y, z) {
+    let n = x * 374761393 + y * 668265263 + z * 1274126177;
+    n = (n ^ (n >> 13)) * 1274126177;
+    n = n ^ (n >> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For smoothstep: `t * t * (3 - 2 * t)`
+
+For 2D value noise:
+- Get integer coords, fractional parts
+- Hash at 4 corners
+- Smoothstep interpolation
+
+For fractal noise with 4 octaves:
+- Sum of noise at freq*1, freq*2, freq*4, freq*8 with amplitudes 1, 0.5, 0.25, 0.125
+
+For the mesh building, I need to be careful about face directions and normals:
+- +Y (top): normal (0,1,0), light 1.0
+- -Y (bottom): normal (0,-1,0), light 0.55
+- +X, -X, +Z, -Z (sides): light 0.8
+
+Each face is 2 triangles = 6 vertices.
+
+Let me define the face vertex offsets for each direction. For a block at (bx, by, bz):
+
+Top face (+Y): vertices at (bx, by+1, bz), (bx+1, by+1, bz), (bx+1, by+1, bz+1), (bx, by+1, bz+1)
+- Triangle 1: 0,1,2
+- Triangle 2: 0,2,3
+
+Bottom face (-Y): vertices at (bx, by, bz), (bx+1, by, bz), (bx+1, by, bz+1), (bx, by, bz+1)
+- Triangle 1: 0,2,1
+- Triangle 2: 0,3,2
+
++X face: (bx+1, by, bz), (bx+1, by, bz+1), (bx+1, by+1, bz+1), (bx+1, by+1, bz)
+-X face: (bx, by, bz), (bx, by, bz+1), (bx, by+1, bz+1), (bx, by+1, bz)
++Z face: (bx, by, bz+1), (bx+1, by, bz+1), (bx+1, by+1, bz+1), (bx, by+1, bz+1)
+-Z face: (bx, by, bz), (bx+1, by, bz), (bx+1, by+1, bz), (bx, by+1, bz)
+
+Let me make sure the winding is correct (counter-clockwise when viewed from outside).
+
+Top (+Y): Looking down from above, CCW:
+(0,1,0), (1,1,0), (1,1,1), (0,1,1)
+Triangle 1: (0,1,0), (1,1,1), (1,1,0) - wait, let me think more carefully.
+
+Standard CCW winding when viewed from +Y direction (looking down):
+Vertices in order: (0,1,0), (0,1,1), (1,1,1), (1,1,0)
+Tri 1: (0,1,0), (0,1,1), (1,1,1)
+Tri 2: (0,1,0), (1,1,1), (1,1,0)
+
+Actually let me use a standard approach. For each face, I'll define 4 vertices and 6 indices (as 2 triangles with CCW winding from outside).
+
+Let me use a simpler approach - define vertices for each face:
+
+```
+const faces = [
+    // +X
+    { dir: [1,0,0], verts: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]], light: 0.8 },
+    // -X
+    { dir: [-1,0,0], verts: [[0,0,1],[0,1,1],[0,1,0],[0,0,0]], light: 0.8 },
+    // +Y
+    { dir: [0,1,0], verts: [[0,1,0],[0,1,1],[1,1,1],[1,1,0]], light: 1.0 },
+    // -Y
+    { dir: [0,-1,0], verts: [[0,0,1],[0,0,0],[1,0,0],[1,0,1]], light: 0.55 },
+    // +Z
+    { dir: [0,0,1], verts: [[1,0,1],[1,1,1],[0,1,1],[0,0,1]], light: 0.8 },
+    // -Z
+    { dir: [0,0,-1], verts: [[0,0,0],[0,1,0],[1,1,0],[1,0,0]], light: 0.8 },
+];
+```
+
+For each face, the two triangles are: verts[0], verts[1], verts[2] and verts[0], verts[2], verts[3].
+
+Let me verify +X face winding. Looking from +X direction (looking in -X direction):
+The face is at x=1. Vertices: (1,0,0), (1,1,0), (1,1,1), (1,0,1)
+Looking from +X, we see the YZ plane. CCW from this view means going counterclockwise.
+(1,0,0) → (1,1,0) → (1,1,1): in YZ, that's (0,0)→(1,0)→(1,1) which is CCW. ✓
+
+Let me verify +Y face. Looking from +Y (looking down at -Y):
+The face is at y=1. Vertices: (0,1,0), (0,1,1), (1,1,1), (1,1,0)
+Looking from above, XZ plane. (0,0)→(0,1)→(1,1): in XZ that's CCW. ✓
+
+OK good.
+
+Now for the raycasting - I'll use THREE.Raycaster with the chunk meshes array.
+
+For the outline, I'll create a wireframe box (BoxGeometry with EdgesGeometry and LineBasicMaterial).
+
+Let me now write the complete file. This will be long but complete.
+
+One thing to be careful about: the spec says "Use world coordinates for vertices and keep the mesh at the origin." So the mesh position is (0,0,0) and vertices are in world space. This means I don't set mesh.position.
+
+For the hotbar, I need 7 slots with colors matching block types 1-7.
+
+Block colors:
+1 grass: 0x4caf50
+2 dirt: 0x795548
+3 stone: 0x9e9e9e
+4 sand: 0xe7d9a8
+5 wood: 0x8d6e63
+6 leaves: 0x2e7d32
+7 snow: 0xffffff
+
+Let me write the complete implementation now.
+
+For trees, I need to be careful about placing them. The spec says "when a per-column hash < 0.02 and the trunk fits inside the chunk". So I check if x is in [cx*16+2, cx*16+13] and z is in [cz*16+2, cz*16+13] (to ensure leaves fit within the chunk).
+
+Actually re-reading: "the trunk fits inside the chunk" - I'll ensure x >= cx*16+2 and x <= cx*16+13 (same for z) so the 5x5 leaf pattern fits.
+
+Tree structure:
+- 4 wood blocks up from surface
+- Leaves as 5x5 layer at y = surface+3 and y = surface+4
+- Then 3x3 at y = surface+5
+- Then 1 on top at y = surface+6
+
+Wait, let me re-read: "4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top"
+
+So trunk is 4 blocks (y=H+1 to H+4), then:
+- 5x5 leaves at y=H+3 and y=H+4 (overlapping with top of trunk? No, "twice" means two layers)
+- Actually I think: trunk goes from H+1 to H+4 (4 blocks), then leaves start. Let me interpret as:
+  - Trunk: y = H+1, H+2, H+3, H+4 (4 wood blocks)
+  - 5x5 leaves at y = H+3 and H+4 (these replace the top trunk blocks? No, "only into air")
+  - 5x5 leaves at y = H+5 and H+6? 
+
+Let me re-read: "4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)"
+
+I think it means:
+- 4 wood blocks: y = H+1 to H+4
+- 5x5 leaves at y = H+3 and y = H+4 (two layers of 5x5)
+- 3x3 leaves at y = H+5
+- 1 leaf on top at y = H+6
+
+The "only into air" means we only place blocks where there's currently air.
+
+Actually, a more natural tree:
+- Trunk: 4 blocks from surface (y = H+1 to H+4)
+- Canopy starts at y = H+3 (overlapping top of trunk):
+  - 5x5 at y=H+3, H+4
+  - 3x3 at y=H+5
+  - 1 at y=H+6
+
+This makes a nice tree shape. The "only into air" constraint means we don't overwrite the trunk with leaves.
+
+Let me code this up. I'll place wood first, then leaves (which only go into air cells).
+
+Now let me think about the generation function:
+
+```javascript
+function generateChunk(cx, cz) {
+    const data = new Uint8Array(16 * 80 * 16);
+    for (let lx = 0; lx < 16; lx++) {
+        for (let lz = 0; lz < 16; lz++) {
+            const wx = cx * 16 + lx;
+            const wz = cz * 16 + lz;
+            const H = getHeight(wx, wz);
+            for (let y = 0; y < 80; y++) {
+                let block = 0;
+                if (y === 0) block = 3; // unbreakable stone
+                else if (y < H - 3) block = 3; // stone
+                else if (y < H) {
+                    // 3 layers under surface
+                    if (H <= 16) block = 4; // sand
+                    else if (H >= 37) block = 3; // stone
+                    else block = 2; // dirt
+                } else if (y === H) {
+                    // surface
+                    if (H >= 46) block = 7; // snow
+                    else if (H >= 37) block = 3; // stone
+                    else if (H <= 16) block = 4; // sand
+                    else block = 1; // grass
+                }
+                // Caves
+                if (y > 0 && y < H - 2 && y >= 3) {
+                    if (noise3D(wx * 0.09, y * 0.09, wz * 0.09) > 0.67) {
+                        block = 0;
+                    }
+                }
+                data[lx * 80 * 16 + y * 16 + lz] = block;
+            }
+        }
+    }
+    // Trees
+    for (let lx = 2; lx < 14; lx++) {
+        for (let lz = 2; lz < 14; lz++) {
+            const wx = cx * 16 + lx;
+            const wz = cz * 16 + lz;
+            const H = getHeight(wx, wz);
+            if (H > 16 && H < 37) { // grass terrain
+                const surfaceBlock = data[lx * 80 * 16 + H * 16 + lz];
+                if (surfaceBlock === 1 && hash2(wx, wz) < 0.02) {
+                    placeTree(data, lx, H, lz);
+                }
+            }
+        }
+    }
+    return data;
+}
+```
+
+For the index into the data array, I'll use: `index = lx * 80 * 16 + y * 16 + lz`
+
+The readBlock helper:
+```javascript
+function getBlock(wx, wy, wz) {
+    if (wy < 0 || wy >= 80) return 0;
+    const cx = Math.floor(wx / 16);
+    const cz = Math.floor(wz / 16);
+    const chunk = chunks.get(cx + "," + cz);
+    if (!chunk) return 0;
+    const lx = wx - cx * 16;
+    const lz = wz - cz * 16;
+    return chunk.data[lx * 80 * 16 + wy * 16 + lz];
+}
+```
+
+For negative coordinates: Math.floor(-1/16) = -1, and lx = -1 - (-1)*16 = -1 + 16 = 15. ✓
+
+Now for the mesh building, I need to iterate all blocks in a chunk and for each non-air block, check all 6 neighbors using getBlock (which uses world coordinates). This is important because it correctly handles chunk boundaries.
+
+Let me also think about performance. For a 16x80x16 chunk, that's 20480 blocks to check, times 6 neighbors = ~120K lookups per chunk. The getBlock function does a Map lookup each time. This should be fine for a few chunks per frame.
+
+For the raycaster, I'll use THREE.Raycaster with the array of all chunk meshes.
+
+Let me also handle the edge case where the player is at negative coordinates properly.
+
+OK, I think I have a good mental model. Let me write the complete file now.
+
+One more consideration: the spec says "max 4 per frame" for generation and "max 2 per frame" for mesh building. I'll use queues/sets to track what needs to be done.
+
+For clouds: ~25 flat white transparent boxes at height ~90, drifting slowly. I'll create them as BoxGeometry meshes with MeshLambertMaterial (white, transparent, opacity ~0.8). They drift in one direction and wrap around the player.
+
+Let me finalize my approach for the outline box: a LineSegments mesh using EdgesGeometry of a BoxGeometry(1,1,1), positioned at the center of the targeted block.
+
+Now writing the complete code...
+
+Actually, I realize I need to be more careful about the tree placement. The spec says "the trunk fits inside the chunk" - I'll check that lx >= 2 and lx <= 13 (so the 5x5 leaf pattern at lx-2 to lx+2 stays within 0-15). Same for lz.
+
+Let me also make sure the tree placement function writes into the data array correctly.
+
+For the hotbar, I'll use div elements with background colors matching the block colors.
+
+Let me write this now - it's going to be a long file.

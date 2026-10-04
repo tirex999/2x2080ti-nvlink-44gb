@@ -1,0 +1,676 @@
+Let me build this Minecraft clone step by step, making sure every requirement is met:
+
+1. Single HTML file with Three.js r128 from CDN
+2. Voxel world with chunks (16x16x80)
+3. Value noise for terrain generation
+4. Block types: air, grass, dirt, stone, sand, wood, leaves, snow
+5. First-person controls with pointer lock
+6. Raycasting for break/place
+7. Hotbar UI
+8. Sky, clouds, water
+9. Start overlay
+
+Let me think through the critical parts:
+
+**Value Noise:**
+- Integer hash: mix coordinates with primes, xor-shift to get 0-1
+- 2D noise: bilinear interpolation with smoothstep
+- Fractal: 4 octaves
+- 3D noise for caves
+
+**Chunk Management:**
+- Map with key "cx,cz"
+- Uint8Array of size 16*80*16 = 20480 bytes per chunk
+- Global read/write helpers with floor division for negative coords
+
+**Meshing:**
+- One BufferGeometry per chunk
+- Loop all blocks, check 6 neighbors
+- If neighbor is air, add face
+- Flat position/normal/color arrays
+- World coordinates for vertices
+
+**Terrain Generation:**
+- Column height: m = fractal(x*0.004, z*0.004), h = fractal(x*0.02, z*0.02), H = floor(5 + m*m*58 + h*10)
+- Fill: y=0 stone, below H-3 stone, 3 layers under surface dirt (sand if H<=16, stone if H>=37), surface based on H
+- Caves: 3D noise > 0.67 for y between 3 and H-2
+- Trees: hash < 0.02, trunk fits in chunk
+
+**Player Physics:**
+- AABB collision, axis-separated
+- Gravity, jump, WASD movement
+
+**Raycasting:**
+- Raycaster from camera center, max distance 6
+- Hit point + normal offset for break/place
+
+Let me write this carefully:
+
+For the hash function, I need deterministic integer hashing:
+```javascript
+function hash2(x, z) {
+    let n = x * 374761393 + z * 668265263;
+    n = (n ^ (n >> 13)) * 1274126177;
+    n = n ^ (n >> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+Wait, I need to be careful with negative numbers in JavaScript. Let me use a different approach:
+
+```javascript
+function hash2(x, z) {
+    let n = x * 374761393 + z * 668265263;
+    n = (n ^ (n >>> 13)) * 1274126177;
+    n = n ^ (n >>> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+Actually, with JavaScript's 32-bit integers and overflow, I should use `Math.imul` or just let it wrap. Let me use a simpler approach that works well:
+
+```javascript
+function hash2(x, z) {
+    let n = x * 374761393 + z * 668265263;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    n = n ^ (n >>> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For 3D:
+```javascript
+function hash3(x, y, z) {
+    let n = x * 374761393 + y * 668265263 + z * 2147483647;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    n = n ^ (n >>> 16);
+    return (n & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+Smoothstep: `t * t * (3 - 2 * t)`
+
+2D noise:
+```javascript
+function noise2(x, z) {
+    const xi = Math.floor(x), zi = Math.floor(z);
+    const xf = x - xi, zf = z - zi;
+    const u = smoothstep(xf), v = smoothstep(zf);
+    const a = hash2(xi, zi);
+    const b = hash2(xi + 1, zi);
+    const c = hash2(xi, zi + 1);
+    const d = hash2(xi + 1, zi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+```
+
+Fractal (4 octaves):
+```javascript
+function fractal2(x, z) {
+    let val = 0, amp = 1, freq = 1, max = 0;
+    for (let i = 0; i < 4; i++) {
+        val += noise2(x * freq, z * freq) * amp;
+        max += amp;
+        amp *= 0.5;
+        freq *= 2;
+    }
+    return val / max;
+}
+```
+
+3D noise similar but with 8 corners.
+
+Now for the chunk system:
+
+```javascript
+const CHUNK_SIZE = 16;
+const CHUNK_HEIGHT = 80;
+const chunks = new Map();
+const chunkMeshes = [];
+
+function chunkKey(cx, cz) { return cx + ',' + cz; }
+
+function getBlock(wx, wy, wz) {
+    if (wy < 0 || wy >= CHUNK_HEIGHT) return 0;
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const chunk = chunks.get(chunkKey(cx, cz));
+    if (!chunk) return 0;
+    const lx = wx - cx * CHUNK_SIZE;
+    const lz = wz - cz * CHUNK_SIZE;
+    return chunk.data[wy * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx];
+}
+
+function setBlock(wx, wy, wz, id) {
+    if (wy < 0 || wy >= CHUNK_HEIGHT) return;
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const chunk = chunks.get(chunkKey(cx, cz));
+    if (!chunk) return;
+    const lx = wx - cx * CHUNK_SIZE;
+    const lz = wz - cz * CHUNK_SIZE;
+    chunk.data[wy * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx] = id;
+}
+```
+
+For meshing, I need to define the 6 faces with their normals, vertex offsets, and brightness:
+
+Top face (y+): normal (0,1,0), brightness 1.0
+Bottom face (y-): normal (0,-1,0), brightness 0.55
+North face (z-): normal (0,0,-1), brightness 0.8
+South face (z+): normal (0,0,1), brightness 0.8
+West face (x-): normal (-1,0,0), brightness 0.8
+East face (x+): normal (1,0,0), brightness 0.8
+
+Each face has 4 vertices forming 2 triangles.
+
+Let me define faces as:
+```javascript
+const FACES = [
+    { // top (+y)
+        dir: [0, 1, 0],
+        corners: [[0,1,1],[1,1,1],[1,1,0],[0,1,0]],
+        brightness: 1.0
+    },
+    { // bottom (-y)
+        dir: [0, -1, 0],
+        corners: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]],
+        brightness: 0.55
+    },
+    { // north (-z)
+        dir: [0, 0, -1],
+        corners: [[0,0,0],[1,0,0],[1,1,0],[0,1,0]],
+        brightness: 0.8
+    },
+    { // south (+z)
+        dir: [0, 0, 1],
+        corners: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]],
+        brightness: 0.8
+    },
+    { // west (-x)
+        dir: [-1, 0, 0],
+        corners: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]],
+        brightness: 0.8
+    },
+    { // east (+x)
+        dir: [1, 0, 0],
+        corners: [[1,0,0],[1,0,1],[1,1,1],[1,1,0]],
+        brightness: 0.8
+    }
+];
+```
+
+Wait, I need to make sure the winding order is correct for each face so that the normal points outward. Let me think about this more carefully.
+
+For a face to be visible, the vertices should be in counter-clockwise order when viewed from outside.
+
+Top face (+y), looking down from above:
+- Should go CCW when viewed from above
+- Corners: (0,1,0), (1,1,0), (1,1,1), (0,1,1) - CCW from above? 
+  Actually let me think... if I'm looking from +y down, x goes right, z goes "into screen" (or towards viewer depending on convention).
+  
+  In Three.js, the default is right-handed, Y-up. Looking from +y down at the XZ plane:
+  - x increases to the right
+  - z increases towards the viewer (south)
+  
+  CCW from above: (0,1,0) -> (1,1,0) -> (1,1,1) -> (0,1,1)
+  Triangles: (0,1,0),(1,1,0),(1,1,1) and (0,1,0),(1,1,1),(0,1,1)
+  
+  Normal = cross(v1-v0, v2-v0) = cross((1,0,0),(1,0,1)) = (0*1-0*0, 0*1-1*1, 1*0-0*1) = (0,-1,0)
+  That's pointing down! So I need to reverse: (0,1,0) -> (0,1,1) -> (1,1,1) -> (1,1,0)
+  
+  Triangles: (0,1,0),(0,1,1),(1,1,1) and (0,1,0),(1,1,1),(1,1,0)
+  Normal = cross((0,0,1),(1,0,1)) = (0*1-1*0, 1*1-0*1, 0*0-0*1) = (0,1,0) ✓
+
+Let me redo all faces properly:
+
+**Top (+y):** Looking from above, CCW
+- (0,1,0), (0,1,1), (1,1,1), (1,1,0)
+- Triangles: (0,1,0)-(0,1,1)-(1,1,1), (0,1,0)-(1,1,1)-(1,1,0)
+
+**Bottom (-y):** Looking from below, CCW
+- (0,0,0), (1,0,0), (1,0,1), (0,0,1)
+- Triangles: (0,0,0)-(1,0,0)-(1,0,1), (0,0,0)-(1,0,1)-(0,0,1)
+- Normal check: cross((1,0,0),(1,0,1)) = (0*1-0*0, 0*1-1*1, 1*0-0*1) = (0,-1,0) ✓
+
+**North (-z):** Looking from -z towards +z, CCW
+- (0,0,0), (1,0,0), (1,1,0), (0,1,0)
+- Triangles: (0,0,0)-(1,0,0)-(1,1,0), (0,0,0)-(1,1,0)-(0,1,0)
+- Normal: cross((1,0,0),(1,1,0)) = (0*0-0*1, 0*1-1*0, 1*1-0*1) = (0,0,1)
+  That's +z, but we want -z! So reverse:
+- (0,0,0), (0,1,0), (1,1,0), (1,0,0)
+- Triangles: (0,0,0)-(0,1,0)-(1,1,0), (0,0,0)-(1,1,0)-(1,0,0)
+- Normal: cross((0,1,0),(1,1,0)) = (1*0-0*1, 0*1-0*0, 0*1-1*1) = (0,0,-1) ✓
+
+**South (+z):** Looking from +z towards -z, CCW
+- (0,0,1), (1,0,1), (1,1,1), (0,1,1)
+- Triangles: (0,0,1)-(1,0,1)-(1,1,1), (0,0,1)-(1,1,1)-(0,1,1)
+- Normal: cross((1,0,0),(1,1,0)) = (0*0-0*1, 0*1-1*0, 1*1-0*1) = (0,0,1) ✓
+
+**West (-x):** Looking from -x towards +x, CCW
+- (0,0,0), (0,1,0), (0,1,1), (0,0,1)
+- Triangles: (0,0,0)-(0,1,0)-(0,1,1), (0,0,0)-(0,1,1)-(0,0,1)
+- Normal: cross((0,1,0),(0,1,1)) = (1*1-0*1, 0*0-0*1, 0*1-1*0) = (1,0,0)
+  That's +x, but we want -x! Reverse:
+- (0,0,0), (0,0,1), (0,1,1), (0,1,0)
+- Triangles: (0,0,0)-(0,0,1)-(0,1,1), (0,0,0)-(0,1,1)-(0,1,0)
+- Normal: cross((0,0,1),(0,1,1)) = (0*1-1*1, 1*0-0*1, 0*1-0*0) = (-1,0,0) ✓
+
+**East (+x):** Looking from +x towards -x, CCW
+- (1,0,0), (1,1,0), (1,1,1), (1,0,1)
+- Triangles: (1,0,0)-(1,1,0)-(1,1,1), (1,0,0)-(1,1,1)-(1,0,1)
+- Normal: cross((0,1,0),(0,1,1)) = (1*1-0*1, 0*0-0*1, 0*1-1*0) = (1,0,0) ✓
+
+Great, now I have all faces correct.
+
+For the tree generation, I need to check that the trunk fits inside the chunk. The trunk is 4 blocks high starting from the surface. So if the surface is at height H, the trunk goes from H to H+3. The leaves go up to H+3+2 = H+5 (the 5x5 layer is at H+3 and H+4, then 3x3 at H+5, then 1 at H+6). Wait, let me re-read the spec:
+
+"4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top"
+
+So:
+- Trunk: H, H+1, H+2, H+3 (4 blocks of wood)
+- Leaves 5x5 at H+3 (replacing the top wood? No, "4 wood blocks up" means the trunk is 4 tall)
+- Actually, I think the leaves start at the top of the trunk. Let me interpret:
+  - Wood at H, H+1, H+2, H+3
+  - 5x5 leaves at H+3 and H+4 (two layers)
+  - 3x3 leaves at H+5
+  - 1 leaf at H+6
+
+Wait, but the top wood block would be covered by leaves. Let me re-read: "4 wood blocks up, leaves as a 5x5 layer twice, then 3x3, then 1 on top (only into air)"
+
+I think:
+- Wood at H, H+1, H+2, H+3 (trunk)
+- At H+3: 5x5 leaves (center is wood, so 24 leaf blocks)
+- At H+4: 5x5 leaves (25 leaf blocks)
+- At H+5: 3x3 leaves (9 leaf blocks)
+- At H+6: 1 leaf block
+
+Total height: H to H+6, so 7 blocks above surface. For the trunk to fit, H+6 must be < 80, so H < 74. Also the trunk base must be >= 0, which is always true since H >= 5.
+
+Actually wait, "only into air" means we only place leaves where there's currently air. So we don't overwrite existing blocks.
+
+For the "trunk fits inside the chunk" condition: the trunk x,z must be at least 2 blocks from the chunk edge (since leaves extend 2 blocks in each direction). So local x and z must be >= 2 and <= 13.
+
+Now for the player physics:
+
+```javascript
+const player = {
+    x: 8, y: 50, z: 8,
+    vx: 0, vy: 0, vz: 0,
+    onGround: false
+};
+```
+
+Collision detection: The player's bounding box is:
+- Min: (x - 0.3, y, z - 0.3)
+- Max: (x + 0.3, y + 1.8, z + 0.3)
+
+Where y is the feet position and eye is at y + 1.62.
+
+Axis-separated collision:
+1. Move x, check collision, revert if overlapping
+2. Move y, check collision, revert if overlapping (set onGround if moving down)
+3. Move z, check collision, revert if overlapping
+
+For checking collision, I need to check all blocks that the AABB overlaps:
+```javascript
+function collides(px, py, pz) {
+    const minX = Math.floor(px - 0.3);
+    const maxX = Math.floor(px + 0.3);
+    const minY = Math.floor(py);
+    const maxY = Math.floor(py + 1.8);
+    const minZ = Math.floor(pz - 0.3);
+    const maxZ = Math.floor(pz + 0.3);
+    for (let bx = minX; bx <= maxX; bx++)
+        for (let by = minY; by <= maxY; by++)
+            for (let bz = minZ; bz <= maxZ; bz++)
+                if (getBlock(bx, by, bz) !== 0) return true;
+    return false;
+}
+```
+
+Now let me put it all together. I'll write the complete HTML file.
+
+One thing I need to be careful about: the water plane. It should be at height 14.3 and re-centered on the player. I'll make it a large plane (say 200x200) that follows the player.
+
+For clouds: 25 flat white transparent boxes at height ~90, drifting slowly and wrapping around the player.
+
+Let me also think about the raycasting. I'll use Three.js Raycaster against the chunk meshes. When I get a hit, I use the face normal to determine the break/place targets.
+
+Actually, for the raycaster to work properly with the chunk meshes, I need to make sure the geometry has proper normals. Since I'm building the geometry manually with flat normals, the raycaster should work fine.
+
+Wait, there's a subtlety. When I raycast against a mesh, the intersection gives me a point and a face normal. But the face normal from the raycaster is in object space. Since my meshes are at the origin and I use world coordinates for vertices, the object space normal IS the world space normal. Good.
+
+Let me also handle the case where the ray hits the back face of a block. Actually, with MeshLambertMaterial and side: THREE.FrontSide (default), the raycaster should only hit front faces. But wait, I'm building the geometry with explicit triangle winding, so front faces are the ones facing outward. The raycaster will hit those. Good.
+
+Actually, I realize I should use `side: THREE.FrontSide` explicitly or just leave it as default. The default for MeshLambertMaterial is FrontSide.
+
+Hmm, but actually for raycasting to work well, I might want to use `THREE.DoubleSide` to catch both sides? No, that could cause issues. Let me stick with FrontSide.
+
+Wait, actually there's a problem. When the player is inside a cave or looking at the inside of a block, the front face won't be visible. But that's fine because we're looking from outside.
+
+Actually no, the issue is different. The raycaster in Three.js by default checks both front and back faces for intersection (it depends on the material's side property). With FrontSide, it only intersects with front-facing triangles. This is what we want.
+
+Let me now write the complete file. I'll be very careful about all the details.
+
+One more thing: for the outline/wireframe box on the targeted block, I'll create a LineSegments with EdgesGeometry of a unit BoxGeometry, positioned at the target block.
+
+Let me also think about the spawn point. The player spawns at x=8, z=8. I need to find the surface height there and place the player above it.
+
+Actually, the spec says "spawn above terrain at x=8, z=8". So I'll set the player's y to something like 50 initially, and they'll fall to the ground. Or I can compute the terrain height and set y accordingly. Let me just set y to 50 and let gravity handle it.
+
+Wait, but the chunks might not be generated yet at spawn time. Let me generate the chunk at (0,0) first (since 8/16 = 0.5, floor = 0), then find the surface height.
+
+Actually, I'll just spawn at y=50 and let them fall. The collision system will stop them at the ground.
+
+Let me also handle the "falling below y=-20 teleports back to spawn" case.
+
+Now let me write the full code:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Minecraft Clone</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; width: 100vw; height: 100vh; }
+canvas { display: block; }
+#overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-family: Arial, sans-serif;
+    z-index: 100;
+}
+#overlay h1 { font-size: 48px; margin-bottom: 20px; }
+#overlay p { font-size: 16px; margin: 5px 0; }
+#overlay .play { font-size: 24px; margin-top: 30px; color: #4caf50; }
+#crosshair {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 20px; height: 20px;
+    z-index: 50;
+    pointer-events: none;
+}
+#crosshair::before, #crosshair::after {
+    content: '';
+    position: absolute;
+    background: white;
+}
+#crosshair::before {
+    width: 2px; height: 20px;
+    left: 9px; top: 0;
+}
+#crosshair::after {
+    width: 20px; height: 2px;
+    left: 0; top: 9px;
+}
+#hotbar {
+    position: fixed;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 2px;
+    background: rgba(0,0,0,0.5);
+    padding: 4px;
+    border-radius: 4px;
+    z-index: 50;
+}
+.hotbar-slot {
+    width: 48px; height: 48px;
+    border: 2px solid #555;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Arial, sans-serif;
+    font-size: 12px;
+    color: white;
+    text-shadow: 1px 1px 2px black;
+    position: relative;
+}
+.hotbar-slot.selected {
+    border-color: white;
+}
+.hotbar-slot .block-color {
+    width: 32px; height: 32px;
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+}
+</style>
+</head>
+<body>
+<div id="overlay">
+    <h1>Minecraft Clone</h1>
+    <p>WASD - Move</p>
+    <p>Space - Jump</p>
+    <p>Left Click - Break Block</p>
+    <p>Right Click - Place Block</p>
+    <p>1-7 / Scroll - Select Block</p>
+    <p class="play">Click to Play</p>
+</div>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ... game code
+</script>
+</body>
+</html>
+```
+
+Now let me write the JavaScript. This is going to be long.
+
+I need to be careful about a few things:
+1. The noise functions must be deterministic
+2. Chunk generation must be consistent regardless of when the chunk is generated
+3. The meshing must correctly handle chunk boundaries
+
+For tree placement, I need to make sure that when I generate a chunk, I only place trees whose trunks are entirely within that chunk. This means the trunk's x and z must be at least 2 blocks from the chunk boundary (since leaves extend 2 blocks in each direction).
+
+But wait, if a tree's leaves extend into a neighboring chunk, and that neighboring chunk hasn't been generated yet, the leaves won't be placed. This is a known issue with chunk-based tree generation. The spec says "when the trunk fits inside the chunk" so I'll only place trees where the trunk (and presumably the leaves) fit within the chunk.
+
+Actually re-reading: "on grass, when a per-column hash < 0.02 and the trunk fits inside the chunk". So the condition is that the trunk fits inside the chunk. The leaves might extend beyond, but we only place them "only into air" so they won't overwrite anything. But if the neighboring chunk isn't generated yet, the getBlock will return 0 (air), so we'll place leaves there. But when the neighboring chunk is generated, it won't know about those leaves...
+
+Hmm, this is a problem. Let me think about it differently. 
+
+Option 1: Only place trees where the entire tree (including leaves) fits within the chunk. This means trunk x,z must be at least 2 from the edge.
+
+Option 2: Place trees wherever the trunk is, and let leaves extend into neighboring chunks by writing to their data arrays.
+
+The spec says "the trunk fits inside the chunk" which suggests option 1 is what's intended. Let me go with that: the trunk's local x and z must be between 2 and 13 (inclusive) so that the 5x5 leaf layer (which extends 2 blocks in each direction) stays within the chunk.
+
+Actually wait, the 5x5 layer centered on the trunk extends 2 blocks in each direction. So if the trunk is at local position (lx, lz), the leaves go from (lx-2, lz-2) to (lx+2, lz+2). For this to be within [0, 15], we need lx >= 2 and lx <= 13, same for lz.
+
+OK let me finalize my approach and write the code.
+
+One more consideration: the water plane. I'll make it a large PlaneGeometry (say 200x200) at y=14.3, rotated to be horizontal, with a semi-transparent blue material. It re-centers on the player each frame.
+
+For clouds: I'll create 25 BoxGeometry objects (flat, like 20x1x10 or similar) with white transparent material, positioned at y~90, and they drift slowly in one direction, wrapping around the player.
+
+Let me now write the complete code. I'll be thorough.
+
+Actually, I realize I should double-check my face definitions. Let me verify with a concrete example.
+
+Consider a block at world position (0, 0, 0). Its top face should be visible from above.
+
+Top face vertices (using my definition): (0,1,0), (0,1,1), (1,1,1), (1,1,0)
+Triangles: (0,1,0)-(0,1,1)-(1,1,1) and (0,1,0)-(1,1,1)-(1,1,0)
+
+Looking from above (from +y):
+- (0,1,0) is at the "back-left" (negative z, negative x)
+- (0,1,1) is at the "front-left" (positive z, negative x)
+- (1,1,1) is at the "front-right" (positive z, positive x)
+- (1,1,0) is at the "back-right" (negative z, positive x)
+
+Going (0,1,0) -> (0,1,1) -> (1,1,1): left-back to left-front to right-front. That's clockwise when viewed from above!
+
+Hmm, let me reconsider. In a right-handed coordinate system with Y up:
+- X points right
+- Z points towards the viewer (out of screen)
+- Y points up
+
+When looking from above (looking in -Y direction):
+- X still points right
+- Z points "down" on the screen (towards the viewer, which is now "down")
+
+Wait, I'm confusing myself. Let me use the right-hand rule.
+
+For a triangle with vertices A, B, C in order, the normal is (B-A) × (C-A).
+
+Triangle 1: A=(0,1,0), B=(0,1,1), C=(1,1,1)
+B-A = (0,0,1)
+C-A = (1,0,1)
+Normal = (0,0,1) × (1,0,1) = (0*1-1*0, 1*1-0*1, 0*0-0*1) = (0, 1, 0) ✓
+
+Good, the normal points up (+y). So this face is visible from above. Correct!
+
+Let me verify the bottom face:
+Bottom face vertices: (0,0,0), (1,0,0), (1,0,1), (0,0,1)
+Triangle 1: A=(0,0,0), B=(1,0,0), C=(1,0,1)
+B-A = (1,0,0)
+C-A = (1,0,1)
+Normal = (1,0,0) × (1,0,1) = (0*1-0*0, 0*1-1*1, 1*0-0*1) = (0, -1, 0) ✓
+
+Points down. Correct!
+
+North face (-z): vertices (0,0,0), (0,1,0), (1,1,0), (1,0,0)
+Triangle 1: A=(0,0,0), B=(0,1,0), C=(1,1,0)
+B-A = (0,1,0)
+C-A = (1,1,0)
+Normal = (0,1,0) × (1,1,0) = (1*0-0*1, 0*1-0*0, 0*1-1*1) = (0, 0, -1) ✓
+
+Points in -z direction. Correct!
+
+South face (+z): vertices (0,0,1), (1,0,1), (1,1,1), (0,1,1)
+Triangle 1: A=(0,0,1), B=(1,0,1), C=(1,1,1)
+B-A = (1,0,0)
+C-A = (1,1,0)
+Normal = (1,0,0) × (1,1,0) = (0*0-0*1, 0*1-1*0, 1*1-0*1) = (0, 0, 1) ✓
+
+Points in +z direction. Correct!
+
+West face (-x): vertices (0,0,0), (0,0,1), (0,1,1), (0,1,0)
+Triangle 1: A=(0,0,0), B=(0,0,1), C=(0,1,1)
+B-A = (0,0,1)
+C-A = (0,1,1)
+Normal = (0,0,1) × (0,1,1) = (0*1-1*1, 1*0-0*1, 0*1-0*0) = (-1, 0, 0) ✓
+
+Points in -x direction. Correct!
+
+East face (+x): vertices (1,0,0), (1,1,0), (1,1,1), (1,0,1)
+Triangle 1: A=(1,0,0), B=(1,1,0), C=(1,1,1)
+B-A = (0,1,0)
+C-A = (0,1,1)
+Normal = (0,1,0) × (0,1,1) = (1*1-0*1, 0*0-0*1, 0*1-1*0) = (1, 0, 0) ✓
+
+Points in +x direction. Correct!
+
+All faces verified. Now let me write the complete code.
+
+For the 3D noise (caves), I need to interpolate over 8 corners of a cube:
+
+```javascript
+function noise3(x, y, z) {
+    const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+    const xf = x - xi, yf = y - yi, zf = z - zi;
+    const u = smoothstep(xf), v = smoothstep(yf), w = smoothstep(zf);
+    
+    const c000 = hash3(xi, yi, zi);
+    const c100 = hash3(xi+1, yi, zi);
+    const c010 = hash3(xi, yi+1, zi);
+    const c110 = hash3(xi+1, yi+1, zi);
+    const c001 = hash3(xi, yi, zi+1);
+    const c101 = hash3(xi+1, yi, zi+1);
+    const c011 = hash3(xi, yi+1, zi+1);
+    const c111 = hash3(xi+1, yi+1, zi+1);
+    
+    const x00 = c000 + (c100 - c000) * u;
+    const x10 = c010 + (c110 - c010) * u;
+    const x01 = c001 + (c101 - c001) * u;
+    const x11 = c011 + (c111 - c011) * u;
+    
+    const y0 = x00 + (x10 - x00) * v;
+    const y1 = x01 + (x11 - x01) * v;
+    
+    return y0 + (y1 - y0) * w;
+}
+```
+
+For the fractal 3D noise, I'll use fewer octaves (maybe 2-3) for performance since it's called for every block in the cave range.
+
+Actually, the spec says "plus a 3D version for caves" but doesn't specify octaves for 3D. Let me use 2 octaves for 3D to keep it fast.
+
+Wait, re-reading: "4 octaves combined into fractal noise, plus a 3D version for caves". I think the 3D version should also have multiple octaves. Let me use 3 octaves for 3D.
+
+Actually, for performance, let me use just 1 octave for 3D (just the raw noise3 function). The threshold of 0.67 should give reasonable caves. Let me try that first.
+
+Hmm, but with just 1 octave, the caves might be too uniform. Let me use 2 octaves.
+
+Actually, let me re-read the spec: "plus a 3D version for caves". It just says a 3D version exists. I'll implement noise3 and use it directly (1 octave) for caves. The threshold of 0.67 should work fine.
+
+Let me now write the complete file. I'll aim for correctness and completeness.
+
+One more thing: the spec says "y 0 = unbreakable stone". So when breaking, if the target block is at y=0, we don't break it.
+
+Also: "After an edit rebuild the chunk, and also the neighbor chunk if the block sits on a chunk border." A block sits on a chunk border if its local x is 0 or 15, or its local z is 0 or 15.
+
+Let me also think about the hotbar. The blocks are:
+1. Grass (id 1, color 0x4caf50)
+2. Dirt (id 2, color 0x795548)
+3. Stone (id 3, color 0x9e9e9e)
+4. Sand (id 4, color 0xe7d9a8)
+5. Wood (id 5, color 0x8d6e63)
+6. Leaves (id 6, color 0x2e7d32)
+7. Snow (id 7, color 0xffffff)
+
+For the hotbar UI, each slot shows a colored square and a number.
+
+OK, I think I have enough to write the complete file. Let me do it now.
+
+Wait, one more thought on performance. The meshing loop iterates over all 16*80*16 = 20480 blocks per chunk. For each non-air block, it checks 6 neighbors. That's at most 122880 neighbor lookups per chunk. Each lookup involves a floor division and a map lookup. This should be fine for the game.
+
+For the per-frame chunk generation limit (max 4 per frame) and mesh building limit (max 2 per frame), I'll use counters in the animation loop.
+
+Let me also make sure the fog and sky are set up correctly:
+- Background: 0x87ceeb
+- Fog: THREE.Fog(0x87ceeb, 40, 110)
+
+And lights:
+- AmbientLight(0xffffff, 0.65)
+- DirectionalLight(0xffffff, 0.8) positioned somewhere reasonable
+
+OK, I'm ready to write the final code. Let me be very careful and thorough.
+
+Actually, I want to double-check one thing about the raycaster. In Three.js r128, when you raycast against a Mesh, it returns intersections with `point` (world space) and `face` (with `normal` in object space). Since my meshes are at the origin and use world coordinates, object space = world space. So `intersection.face.normal` is already in world space.
+
+But wait, I need to be careful. The `face.normal` from the raycaster is the geometric normal of the triangle, which should match the face normal I defined. Since I'm using flat shading (each face has its own vertices with the same normal), this should be exact.
+
+Actually, in Three.js, `intersection.face.normal` is computed from the triangle vertices, not from the geometry's normal attribute. So it should be correct regardless.
+
+Hmm, but actually looking at the Three.js source, `intersection.face.normal` is indeed the normal of the intersected triangle face, computed from the geometry. For non-indexed geometry (which is what I'm creating), each face is a separate triangle, so the normal is well-defined.
+
+Wait, I'm creating indexed or non-indexed geometry? Let me use non-indexed (just push vertices in groups of 3 for each triangle). This is simpler and avoids index management.
+
+So for each visible face, I push 6 vertices (2 triangles) into the position array, 6 normals, and 6 colors.
+
+Let me finalize and write the code now.
+
+One last thing: the spec says "Keep all chunk meshes in a global array for raycasting". So I'll have a `chunkMeshArray` that I update whenever a mesh is added/removed, and pass it to the raycaster.
+
+Actually, I can just iterate over the scene's children or maintain a separate array. Let me use a separate array `raycastTargets` that I keep in sync.
+
+Or even simpler: I'll add all chunk meshes to a Group, and raycast against the group. Three.js Raycaster can intersect with a group and it recursively checks all children.
+
+Let me use a Group for chunk meshes. That's cleaner.
+
+OK, writing the final code now.

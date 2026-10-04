@@ -1,0 +1,344 @@
+Let me build this carefully. Key points: single HTML file, Three.js r128, chunk system, meshing with face culling using global readBlock, terrain generation with value noise, player physics, raycasting for break/place, hotbar, clouds, water plane.
+
+Let me plan the structure:
+
+- HTML: canvas via renderer, overlay div, crosshair div, hotbar div.
+- JS globals: CHUNKS Map keyed "cx,cz" → {data: Uint8Array(16*80*16), mesh or null}. Actually spec says value is Uint8Array plus mesh — I'll store an object {data, mesh}.
+
+Indexing: data[lx*16*? ...]. Let me index as (y*16 + lz)*16 + lx or idx = y*256 + lz*16 + lx. Size 16*80*16 = 20480.
+
+readBlock(x,y,z): if y<0||y>=80 return 0. cx=Math.floor(x/16), cz=Math.floor(z/16). chunk = CHUNKS.get(cx+','+cz); if !chunk return 0. lx=x-cx*16, lz=z-cz*16. return chunk.data[lx + lz*16 + y*256].
+
+writeBlock similarly; create chunk data if missing? For editing we only write within existing chunks.
+
+Terrain gen:
+
+hash3(x,y,z): seed = x*374761393 + y*668265263 + z*1274126177; mix with xorshift. Let me write:
+
+```
+function hash(x,y,z){
+  let h = (x*374761393 + y*668265263 + z*1274126177) | 0;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h = (h ^ (h >> 16)) >>> 0;
+  return h / 4294967295;
+}
+```
+
+valueNoise2(x,z): integer part, bilinear interp of hash(ix,iy,0) with smoothstep t*t*(3-2t).
+
+valueNoise3(x,y,z) similar.
+
+fbm2: 4 octaves: freq *=2, amp *=0.5, sum/total? Spec says combine into fractal noise — normalize to roughly 0..1. Sum amps = 1.875; divide by that.
+
+Height: m = fbm2(x*0.004, z*0.004), h = fbm2(x*0.02,z*0.004? no z*0.02). H = floor(5 + m*m*58 + h*10).
+
+Column filling per local block:
+- y=0: stone (unbreakable).
+- y < H-3: stone
+- within 3 layers below surface (y >= H-3 && y < H): dirt if not sand/stone conditions. Spec: "3 layers below surface are dirt (sand if H ≤ 16, stone if H ≥ 37)". So subsurface = H<=16 ? SAND : (H>=37 ? STONE : DIRT).
+- Surface at y == H: snow if H>=46, stone if H>=37, sand if H<=16, else grass.
+- Above H: air except trees.
+
+Caves: for y in 3..H-2: if noise3(x*0.09,y*0.09,z*0.09) > 0.67 → air (but keep y=0). Order: fill then carve caves? Carving can remove surface too but limited to y<=H-2 so surface remains.
+
+Trees: per-column hash(x,0,z) < 0.02 and surface is grass and trunk fits inside chunk: lx between 2..13, lz between 2..13 so leaves fit. Trunk: y=H+1..H+4 wood (4 blocks). Leaves: 5x5 layer at y=H+3? Spec: "leaves as 5x5 layer twice, then 3x3, then 1 on top". So layers: H+2 and H+3 with 5x5 around trunk center? Let's do: 5x5 at y=H+2 and H+3, 3x3 at H+4, single block at H+5. Only place in air cells. Trunk 4 wood blocks up from H+1 to H+4; leaves only where air so trunk remains visible through center? Actually the 3x3 at y=H+4 would overwrite... "only into air" — trunk occupies center of H+4 so leaves skip it. Good.
+
+Trees should be generated during chunk gen, but leaves could cross chunk boundaries — spec says "trunk fits in chunk" (lx 2..13) so 5x5 leaves stay within chunk. Good.
+
+Meshing: for each non-air block in chunk data, for each of 6 faces check neighbor via readBlock (world coords). If neighbor is air, add face. Water too? Water is visual only, not in data. But should we render top face of blocks below water level? They're hidden underwater — fine.
+
+Face definitions: for a block at (wx,wy,wz):
+- +Y face: normal (0,1,0), verts: 4 corners, two triangles.
+- -X etc.
+
+Colors: base color per block ID, multiplied by 1.0 top, 0.8 side, 0.55 bottom.
+
+Geometry: BufferGeometry with Float32Array positions/normals/colors, setAttribute, computeBoundingSphere if needed. Mesh at origin (no position offset). Shared material: MeshLambertMaterial({vertexColors:true}).
+
+Raycast: raycaster against array of chunk meshes; max distance 6.
+
+Chunk management per frame:
+- pcx = floor(px/16), pcz.
+- gen: for chunks within 5 (|dx|<=5,|dz|<=5) without data, generate up to 4 per frame. Iterate deterministically — spiral or nested loop with a counter. Simple: nested loops dx -5..5, dz -5..5, count generated this frame <=4.
+- mesh build: for chunks within 4 that have data, all 4 neighbors have data, and mesh==null, build up to 2 per frame. Push mesh into meshes array.
+- unload: iterate CHUNKS entries; if |cx-pcx|>7 or |cz-pcz|>7, dispose geometry, remove mesh from meshes array, delete entry. But careful: deleting chunks that have data but no mesh far away — spec says "for chunks farther than 7, remove mesh, dispose geometry, and delete entry". So we delete whole entry (data too). Fine since regeneration is deterministic.
+
+Player physics:
+- pos = feet position (camera at pos.y+1.62). Player box: half-width 0.3, height 1.8.
+- Each axis move: try new x; check collision with solid blocks in AABB [x-0.3, x+0.3] etc for y in [feet, feet+1.8]; if collide revert and vx=0. Move Y: vy -= 25*dt; y += vy*dt; check overlap → if moving down, set onGround true, vy=0, snap? Revert on overlap means we just revert position — could leave player floating slightly above ground. Better to snap: on downward collision, set y = blockTop (floor(y)+1)? Spec says "revert on overlap; landing sets onGround". Reverting means player may hover a fraction of a block but gravity keeps pushing and onGround is true each frame. Acceptable, but jitter possible: each frame vy accumulates, tries to move, collides, reverts, vy=0, onGround=true. Fine.
+
+Collision check: for AABB overlapping solid blocks: iterate integer cells covering box: x from floor(x0) to floor(x1), etc. Note block at cell (bx,by,bz) occupies [bx, bx+1). readBlock for each; if non-air → collide.
+
+Spawn: x=8,z=8, find terrain height: compute columnHeight(8,8) and set y = H+1 or so.
+
+Camera: PerspectiveCamera(75, aspect, 0.1, 400). rotation.order='YXZ'; camera.rotation.y=yaw; camera.rotation.x=pitch.
+
+Pointer lock: overlay click → canvas.requestPointerLock. pointerlockchange → if locked hide overlay, else show.
+
+Mouse: mousemove while locked: yaw -= dx*0.002; pitch -= dy*0.002 clamped to ±1.55.
+
+Keys: WASD movement relative to yaw: forward vector (−sin yaw? ) In Three.js with YXZ order, camera faces -Z when yaw=0. Forward = (-sin(yaw), 0, -cos(yaw)). Right = (cos yaw, 0, -sin yaw).
+
+Speed 5.5. Jump: onGround && space → vy=8.5.
+
+Wheel: hotbar selection wrap; also preventDefault to avoid page scroll. Keys 1-7 select.
+
+Break/place: on mousedown while locked: button 0 break, button 2 place. Suppress contextmenu.
+
+Targeting each frame: raycast center (0,0). hit → target block = floor(hit.point - normal*0.5) componentwise. Place cell = floor(hit.point + normal*0.5). Outline: wireframe box mesh — BoxGeometry(1.002?) at target+0.5 offset with black line material. Use THREE.BoxHelper? Simpler: create EdgesGeometry(BoxGeometry(1,1,1)) with LineSegments black; position = target center (tx+0.5,...).
+
+Edit: writeBlock(target,0) if target y>0; rebuild chunk containing target and neighbor chunk if lx==0/15 or lz==0/15.
+
+Place: cell must be air and not overlap player AABB. Write selected block id; rebuild similarly.
+
+Rebuild function: find chunk, dispose old geometry & remove from meshes array, rebuild geometry, set mesh.geometry, push back.
+
+Clouds: 25 boxes: BoxGeometry random-ish size — but Math.random forbidden? Spec says terrain is deterministic, no Math.random; clouds can use hash instead for safety. Use hash(i,0,0). Clouds at y~90, drift x += speed*dt, wrap around player (if cloud.x > player.x + 300, move to player.x - 300). Material MeshBasicMaterial white transparent opacity 0.8? Lambert fine too; use MeshLambertMaterial({color:0xffffff, transparent:true, opacity:0.75}).
+
+Water plane: PlaneGeometry(600,600), rotated horizontal, MeshLambertMaterial({color:0x3b7fd4? spec says semi-transparent blue}) opacity 0.6, y=14.3, position follows player each frame.
+
+Fog: scene.fog = new THREE.Fog(0x87ceeb, 40, 110); renderer clear color 0x87ceeb.
+
+Lights: AmbientLight(0xffffff, 0.65), DirectionalLight(0xffffff, 0.8) position (0.5,1,0.3)*...
+
+Hotbar: build in JS or HTML: 7 divs with background color, number, border on selected.
+
+Now let me write the code carefully.
+
+Meshing details — face vertex data. For block at (x,y,z), define corner coords x..x+1 etc.
+
+Faces:
+
+top (+y): corners (x,y+1,z), (x+1,y+1,z), (x+1,y+1,z+1), (x,y+1,z+1); triangles 0,1,2 and 0,2,3; normal (0,1,0).
+
+bottom: y face, normal (0,-1,0): corners (x,y,z),(x+1,y,z),(x+1,y,z+1),(x,y,z+1) with winding for downward facing: 0,2,1 and 0,3,2.
+
++X face: x+1 plane: corners (x+1,y,z),(x+1,y+1,z),(x+1,y+1,z+1),(x+1,y,z+1). Triangles: 0,1,2 & 0,2,3 — check winding for +X normal. Points p0=(1,0,0),p1=(1,1,0),p2=(1,1,1),p3=(1,0,1). Triangle (p0,p1,p2): edge1=p1-p0=(0,1,0), edge2=p2-p0=(0,1,1); cross = (1*1-0*1, 0*0-0*1, 0*1-1*0) = (1,0,0). Good, +X.
+
+-X face: p0=(0,0,1),p1=(0,1,1),p2=(0,1,0),p3=(0,0,0). e1=(0,1,0), e2=(0,1,-1); cross=(1*(-1)-0*1, 0*0-0*(-1), 0) = (-1,0,0). Good.
+
++Z: p0=(1,0,1),(1,1,1),(0,1,1),(0,0,1)? e1=p1-p0=(0,1,0), e2=p2-p0=(-1,1,0); cross = (1*0-0*1, 0*(-1)-0*0, 0*1 - 1*(-1)) = (0,0,1). Good.
+
+-Z: p0=(0,0,0),(1,0,0),(1,1,0),(0,1,0): e1=(1,0,0), e2=(1,1,0); cross=(0*0-0*1, 0*1-1*0, 1*1-0*1)=(0,0,1). Wrong — need (0,0,-1). Reverse winding: p0=(1,0,0),(0,0,0),(0,1,0),(1,1,0): e1=(-1,0,0), e2=(-1,1,0); cross = (0*0-0*1, 0*(-1)-(-1)*0, -1*1-0*(-1)) = (0,0,-1). Good.
+
+Similarly verify top: p0=(0,1,0),p1=(1,1,0),p2=(1,1,1),p3=(0,1,1): e1=(1,0,0),e2=(1,0,1); cross=(0*1-0*0, 0*1-1*1, 0)=(0,-1,0). Wrong. Swap: p0=(0,1,1),p1=(1,1,1),p2=(1,1,0),p3=(0,1,0): e1=(1,0,0), e2=(1,0,-1); cross=(0*(-1)-0*0, 0*1-1*(-1), 0)=(0,1,0). Good.
+
+Bottom: normal (0,-1,0): p0=(0,0,0),p1=(1,0,0),p2=(1,0,1),p3=(0,0,1): cross computed as above = (0,-1,0)? e1=(1,0,0),e2=(1,0,1): cross=(0*1-0*0, 0*1-1*1, 0)=(0,-1,0). Good.
+
+I'll define FACES array: each face = {dir:[dx,dy,dz], corners:[[..4 relative corners]], light: multiplier}. Then triangles indices [0,1,2,0,2,3].
+
+Colors per block ID:
+1 grass 0x4caf50, 2 dirt 0x795548, 3 stone 0x9e9e9e, 4 sand 0xe7d9a8, 5 wood 0x8d6e63, 6 leaves 0x2e7d32, 7 snow 0xffffff.
+
+Precompute r,g,b per ID and per face multiplier → just multiply per vertex.
+
+Per-chunk generation: loop lx,lz 0..15, compute world x,z; compute H once per column; fill y=0..H; then caves carve; then tree.
+
+Tree check: if surface is grass (H>16 && H<37) and hash(x, 987, z) < 0.02 and lx>=2 && lx<=13 && lz>=2 && lz<=13: place trunk y=H+1..H+4 wood; leaves: for dy in [2,3]: 5x5 at H+dy around (x,z); for dy=4: 3x3; for dy=5: center. Only set if cell currently air and within chunk bounds (guaranteed by lx range). But wait — 5x5 at H+2/H+3: with lx in [2,13], lx-2..lx+2 in [0,15]. Good.
+
+Caves carve after filling but before tree so trees don't float? Trees are above surface anyway.
+
+Also cave carving shouldn't remove y=0. Loop y=3..H-2.
+
+Column height function needs world x,z.
+
+fbm2:
+```
+function noise2(x,z){
+ const ix=Math.floor(x), iz=Math.floor(z);
+ const fx=x-ix, fz=z-iz;
+ const sx=fx*fx*(3-2*fx), sz=fz*fz*(3-2*fz);
+ const a=hash(ix,0,iz), b=hash(ix+1,0,iz), c=hash(ix,0,iz+1), d=hash(ix+1,0,iz+1);
+ return a+(b-a)*sx + (c-a)*sz + (a-b-c+d)*sx*sz;
+}
+function fbm2(x,z){ let sum=0,amp=0.5,f=1; for(let i=0;i<4;i++){sum+=noise2(x*f,z*f)*amp; amp*=0.5; f*=2;} return sum/1.875? }
+```
+Actually 0.5+0.25+0.125+0.0625 = 0.9375. Divide by 0.9375.
+
+noise3 similar with hash(ix,iy,iz).
+
+Hash function: ensure positive modulo behavior for negatives — bitwise ops handle negatives fine (|0 makes int32). >>>0 to unsigned. Good.
+
+Frame loop chunk management:
+
+```
+const genR=5, meshR=4, unloadR=7;
+let genCount=0;
+for(let dx=-genR;dx<=genR&&genCount<4;dx++)for(let dz=-genR;dz<=genR&&genCount<4;dz++){
+ const cx=pcx+dx, cz=pcz+dz, k=cx+','+cz;
+ if(!CHUNKS.has(k)){ CHUNKS.set(k,{data:genChunk(cx,cz),mesh:null}); genCount++; }
+}
+```
+
+Mesh build similarly with neighbor check: neighbors have data (may need to be generated first — check CHUNKS.get for 4 neighbors has data). Up/down not needed since faces at y=79/0 boundary handled by readBlock returning air. Fine per spec.
+
+Unload: iterate CHUNKS entries; if Math.max(|cx-pcx|,|cz-pcz|) > 7 → dispose mesh geometry, remove from meshes array, delete.
+
+Rebuild chunk function rebuild(cx,cz): entry = CHUNKS.get(k); if !entry return; if entry.mesh { remove from meshes; scene.remove; entry.mesh.geometry.dispose(); entry.mesh.geometry = buildGeometry(entry.data,cx,cz); } else build new. Actually simpler: buildChunkMesh sets geometry on existing mesh or creates new.
+
+buildGeometry(data): returns BufferGeometry.
+
+Raycast: raycaster.setFromCamera({x:0,y:0}, camera); raycaster.far=6; intersectObjects(meshes). Note meshes positioned at origin — intersection points in world coords.
+
+Outline box: create once:
+```
+const outlineGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.001,1.001,1.001));
+const outline = new THREE.LineSegments(outlineGeo, new THREE.LineBasicMaterial({color:0x000000}));
+```
+Position at target center.
+
+Place overlap check: AABB player vs cell [cx,cx+1)... standard overlap test.
+
+Physics collision function collides(px,py,pz) where py = feet: iterate bx from floor(px-0.3) to floor(px+0.3), by from floor(py) to floor(py+1.799?) height 1.8 → top at py+1.8; if block occupies cell... use floor(py+1.8 - epsilon)? Use floor(py+1.7999). Actually iterate y from floor(py) to floor(py+1.8); a block at cell by spans [by, by+1). If top exactly on boundary (py+1.8 = integer) overlap is zero measure; use py+1.8-1e-6? Use by <= Math.floor(py + 1.8 - 1e-4)? Simpler: for(by=Math.floor(py); by<=Math.floor(py+1.8); by++) — if py+1.8 exactly integer, block at that cell overlaps only on face; floor gives that cell → false collision. Use epsilon: Math.floor(py+1.8-1e-6). Similarly x bounds with ±0.3 minus eps.
+
+Landing snap: when downward move collides, set feet y = Math.floor(newY+?) hmm. Revert: py stays old value. If falling fast (vy*dt could exceed 1 block per frame? vy max ~ fall from height; at 60fps vy up to 25*dt*frames... terminal velocity not capped; vy*dt could exceed 1 block/frame for large dt). To avoid tunneling, cap dt and clamp vy, or substep Y move. Clamp dt to 0.05 and cap vy to -30 → max 1.5 blocks per step — still can tunnel. Do substeps: split movement into steps of ≤0.25 each axis? Simpler: substep entire physics: n = ceil(maxmove/0.2). Let me implement moveAxis with substeps.
+
+Let's write physics:
+
+```
+function tryMove(dx,dy,dz){
+ // per-axis
+ ...
+}
+```
+
+Implement collision check and axis movement with revert; for Y down collision set onGround. Snap feet to top of block: when moving down and collision detected at new position, set py = Math.floor(newY + 1.8)?? Hmm. Let's just revert; jitter minimal since dt small. Actually potential issue: player standing on ground: gravity gives vy=-25*dt≈-0.4*... at dt=0.016 vy=-0.4, dy=-0.0064. Feet py = 3 (top of block at y=2). Move to 2.9936 → feet inside block cell 2 → collide → revert to 3. onGround=true. Stable. Good.
+
+Jump: vy=8.5.
+
+Teleport below -20.
+
+Now hotbar UI and overlay HTML/CSS.
+
+Crosshair: center div with two bars or text "+"? Use CSS ::before/::after or two child divs. Simple: div crosshair with two spans.
+
+Overlay content: title "Minecraft", controls list, "Click to play". Overlay click requests pointer lock on renderer.domElement.
+
+pointerlockchange: document.pointerLockElement === canvas → locked=true, hide overlay; else locked=false show overlay.
+
+mousedown handler: if !locked return; if e.button===0 break; if 2 place. contextmenu preventDefault globally.
+
+Wheel: selection = (selection + (e.deltaY>0?1:-1) + 7) % 7; update class.
+
+Keys: keydown: track keys set for WASD/Space; digits select.
+
+Clouds: create 25 meshes once; store in array; each frame drift x += (speed based on hash) * dt; wrap relative to player: if cloud.position.x > player.x + 350 → cloud.position.x -= 700; same for z.
+
+Water plane follows player: waterMesh.position.set(player.x, 14.3, player.z).
+
+Renderer: antialias true? Fine.
+
+Resize handler.
+
+Now let me write the file. Careful with negative floor division: Math.floor handles negatives.
+
+genChunk(cx,cz): data = new Uint8Array(16*16*80). idx(lx,lz,y) = (lx + lz*16 + y*256).
+
+Column loop:
+```
+for lx 0..15 for lz 0..15:
+ wx=cx*16+lx, wz=cz*16+lz;
+ H = heightAt(wx,wz); clamp to 1..78.
+ for y=0..H:
+   let id;
+   if(y===0) id=STONE;
+   else if(y < H-3) id=STONE;
+   else if(y < H) id = H<=16?SAND:(H>=37?STONE:DIRT);
+   else id = H>=46?SNOW:(H>=37?STONE:(H<=16?SAND:GRASS));
+   if(id!==AIR && y>=3 && y<=H-2 && noise3(wx*0.09,y*0.09,wz*0.09)>0.67) id=AIR;
+   data[idx]=id;
+ // tree
+ if(H>16 && H<37 && hash(wx,987,wz)<0.02 && lx>=2&&lx<=13&&lz>=2&&lz<=13){
+   for(let t=1;t<=4;t++) data[idx(lx,lz,H+t)]=WOOD;
+   for(let dy=2;dy<=3;dy++) for(dx=-2..2) for(dz=-2..2) setLeaf(lx+dx,H+dy,lz+dz);
+   for(dy=4) 3x3; center at dy=5.
+ }
+```
+setLeaf: if within 0..15 and data currently AIR → LEAVES.
+
+heightAt: m=fbm2(wx*0.004,wz*0.004); h=fbm2(wx*0.02,wz*0.02); H=Math.floor(5+m*m*58+h*10); clamp to 1..78.
+
+Note: noise inputs negative — Math.floor works fine.
+
+Hash function:
+```
+function hash(x,y,z){
+ let h = (x*374761393 + y*668265263 + z*1274126177) | 0;
+ h = (h ^ (h >>> 13)) | 0;
+ h = (h * 1274126177) | 0;
+ h = (h ^ (h >>> 16)) >>> 0;
+ return h / 4294967296;
+}
+```
+Multiplication of big numbers: x*374761393 can exceed 2^53? For large coords x could be big but world is small near player; |0 truncates. Fine.
+
+Mesh building: arrays pos[], norm[], col[] (plain arrays, then Float32Array). Loop all blocks in chunk data. For each face check neighbor readBlock(wx+dx, wy+dy, wz+dz)===AIR → addFace.
+
+Performance fine for ~4 chunks/frame build.
+
+Raycast far distance: raycaster.far = 6.
+
+Break/place target computation:
+
+```
+if(hit){
+ const p=hit.point, n=hit.face.normal; // normal in object space; mesh at origin, no rotation → world normal same.
+ tx=Math.floor(p.x - n.x*0.5); etc → break cell.
+ px2=Math.floor(p.x + n.x*0.5); → place cell.
+}
+```
+
+Store currentTarget for outline and click action.
+
+Edit rebuild:
+```
+function editBlock(x,y,z,id){
+ const cx=Math.floor(x/16), cz=Math.floor(z/16);
+ const e=CHUNKS.get(cx+','+cz); if(!e) return;
+ e.data[x- cx*16 + (z-cz*16)*16 + y*256] = id;
+ rebuild(cx,cz);
+ const lx=x-cx*16, lz=z-cz*16;
+ if(lx===0) rebuild(cx-1,cz); if(lx===15) rebuild(cx+1,cz);
+ if(lz===0) rebuild(cx,cz-1); if(lz===15) rebuild(cx,cz+1);
+}
+```
+
+rebuild: entry exists? entry has mesh → remove & dispose & rebuild geometry; if not, skip (data updated but no mesh yet — will build later).
+
+Remove from meshes array: index = meshes.indexOf(mesh); splice.
+
+buildChunkGeometry(data,cx,cz): returns BufferGeometry.
+
+Place overlap with player: player AABB [px-0.3,px+0.3]×[py,py+1.8]×... vs block cell [bx,bx+1]. Overlap if px-0.3 < bx+1 && px+0.3 > bx && py < by+1 && py+1.8 > by && pz-0.3 < bz+1 && pz+0.3 > bz.
+
+Clouds: geometry BoxGeometry(w, 2, d) with w,d from hash. Position random-ish from hash(i*131,...). y = 88 + hash*6.
+
+Material for clouds: MeshLambertMaterial({color:0xffffff, transparent:true, opacity:0.75}).
+
+Water: PlaneGeometry(700,700), rotateX(-PI/2), MeshLambertMaterial({color:0x4a90d9, transparent:true, opacity:0.55}).
+
+Camera near 0.1 far 400 per spec.
+
+Movement: velocity applied directly (no inertia): each frame compute move vector from keys, apply axis-separated with collision.
+
+Order: X move, Z move, then Y.
+
+Let me write the complete code now. Also update hotbar selection class on change.
+
+Edge case: raycast hits water plane or clouds? Only intersect chunk meshes — pass meshes array. Good.
+
+Outline visibility: outline.visible = !!target && locked.
+
+Start spawn: find H at (8,8): y = heightAt(8,8)+1. Compute after gen? heightAt is pure function — call directly.
+
+Let me write it all out.
+
+One more check: "generate block data for all chunks within 5 of player (max 4 per frame)" — my nested loop with counter does that. "Build meshes for chunks within 4 whose 4 neighbors already have data (max 2 per frame)".
+
+Mesh at origin: mesh.position default (0,0,0). Good.
+
+computeBoundingSphere needed for frustum culling and raycast — BufferGeometry auto-computes on demand. Fine.
+
+Fog color matches background.
+
+Let me write the final HTML now.

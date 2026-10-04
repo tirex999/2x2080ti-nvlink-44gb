@@ -1,0 +1,637 @@
+The user wants a 3D aquarium with Three.js. I should build a single HTML file, rich and crafted. Let me make it genuinely polished: a layered underwater background, custom typography, micro-interactions, a distinctive HUD designed like a real aquarium control panel / marine lab instrument rather than generic glass everywhere (the glass UI is literally in the brief here, so glass panels make sense for an aquarium — but I'll give them their own character).
+
+Key design direction: A "marine observation deck" / aquarium lab instrument aesthetic. Deep ocean gradient background with caustics-like animated overlay. Typography: distinctive display face + readable body. Use Google Fonts — e.g., "Bodoni Moda"? Hmm, for a marine tech feel maybe "Chakra Petch" or "Space Grotesk"... Let's pick something with character: display "Unbounded" or "Syne" or "Bricolage Grotesque"; body "IBM Plex Sans" or "Sora". Let me use display: "Instrument Serif"? For an aquarium/naturalist vibe — a vintage naturalist plate feel combined with lab instrumentation. I'll do: display = "Bodoni Moda" italic for "Aquarium" title, labels/data in "IBM Plex Mono", body in "IBM Plex Sans". That's distinctive and reads like a naturalist's specimen catalogue.
+
+Palette: deep ocean navy/teal, sand ochre accents, coral/signal orange for interactive elements, bioluminescent cyan for data.
+
+Layout: the aquarium itself is the star, so it fills the viewport immediately with the tank. HUD panels: top-left title card + controls (specimen catalogue style), top-right stats readout with FPS graph sparkline, bottom bar maybe feeding instructions / food tin. Add a fish species legend list with color swatches that highlight on hover.
+
+Features to implement carefully in Three.js r128:
+- Scene, fog exp2, background gradient via CSS behind transparent renderer? Better: renderer with alpha true and CSS gradient background + animated caustics overlay. Actually MeshPhysicalMaterial transmission requires... In r128, transmission is supported (transmission in MeshPhysicalMaterial). It needs the renderer to have a background render target for proper refraction, but it works approximately — actually in r128 transmission uses `_transmissionRenderTarget`? Transmission was introduced around r127 with a simple approach where transmissive materials render the scene's background... Let me not rely on it heavily; I'll use transmission 0.95 as requested but with fallback properties (opacity, roughness, ior/thickness). If transmission doesn't render nicely, glass may look weird. Safer approach: use MeshPhysicalMaterial with transparent:true, opacity ~0.08, transmission maybe. Hmm the brief explicitly asks for transmission: 0.95. I'll set it but also set opacity so if transmission is ignored, still fine. Actually with transmission in r128: material with transmission renders using a copy of the framebuffer (the "transmission render target" was added in r128? The `_transmissionRenderTarget` came later ~r132). In r128, transmission implementation used `material.transmission` sampling from the background cube/envmap only... Risk: fish inside invisible through glass. Let me test mentally: In three r128 WebGLRenderer, transmissive objects are rendered in a separate pass with `_transmissionRenderTarget`. I believe that arrived in r129/r130 ("Transmission improvements"). To be safe, I'll use glass with `transparent: true, opacity: 0.12, roughness: 0.05, metalness: 0, side: DoubleSide`, plus a MeshPhysicalMaterial with transmission 0.9 but ALSO low opacity so it works either way. Hmm — if transmission works and opacity is 0.12, glass nearly invisible. That's fine, actually looks good — subtle glass with edges wireframe.
+
+Actually simplest reliable: MeshPhysicalMaterial({ transmission: 0.95, opacity: 1, transparent: true, ... })? If transmission unsupported, opacity 1 → solid glass box hiding fish. Bad. So use transparent:true + opacity: 0.14 and set transmission: 0.95 anyway (harmless in r128 if partially supported... but if supported it may override alpha). Hmm, in r128 MeshPhysicalMaterial with transmission > 0 forces the material into the transmissive pass which renders with the framebuffer copy; alpha handling... Risky.
+
+Decision: Use two-layer glass: an outer shell mesh with MeshPhysicalMaterial (transparent, opacity 0.1, roughness 0.05, clearcoat) — reliable look; plus wireframe edges via EdgesGeometry LineSegments in a light cyan; plus a subtle inner "water volume" mesh with additive-ish shading. Skip real transmission to guarantee visual correctness. I'll keep `transmission: 0.95` in the material params but also set opacity low — in r128, if transmission is honored it just adds refraction-ish tint; low opacity keeps things safe either way. Actually with transparent:true and transmission in newer versions... fine.
+
+Hmm, but there's another risk: transmission materials in some versions render the object *before* transparent objects and can cause the fish to be occluded... With opacity 0.1 it's a nearly invisible panel; even if it renders in an odd order, depthWrite:false will prevent occlusion. Set depthWrite: false on glass. Good.
+
+Fish model: group with body (scaled sphere), eyes (spheres + pupils), tail (cone/plane hinged), dorsal fin, side fins, mouth maybe, stripes via a second thin mesh? Add color patterns: stripes/two-tone using a slightly larger partial sphere with different color? Could add "stripe" rings using TorusGeometry or scaled cylinders clipped... Simpler: use vertex colors or a canvas-generated texture for stripes/spots. Canvas textures per fish = 15 canvases, fine (256x128). That gives real "realistic" tropical look: stripes, gradients, spots. Nice touch — procedural canvas texture per color scheme.
+
+Fish behavior: wander, avoid, boundary reflect, chase food, grow. Orientation: mesh.lookAt(position + velocity) with banking roll.
+
+Bubbles: 30 spheres physical material, rise with sine wobble, reset.
+
+Food: click raycast onto an invisible plane / the water volume → spawn food at clicked point near top? Better: raycast against a plane facing camera inside tank; spawn food there, it falls with gravity, fish within radius 15 chase it. Remove on bottom reached or eaten.
+
+Environment: sand plane with procedural displacement (PlaneGeometry with vertices displaced by noise, computed vertex normals), 8 deformed dodecahedron rocks, 12 seaweed TubeGeometry plants swaying.
+
+Lighting: ambient, directional w/ shadows 2048, 2 point lights blue, toggle button.
+
+Extras for polish:
+- Caustics overlay: animated CSS radial gradients + a shader-ish plane? Use CSS animated caustic layer over the canvas with mix-blend-mode: soft-light, plus vignette.
+- Floating dust particles (Points) for underwater ambience.
+- FPS sparkline canvas in HUD.
+- Fish count, food count, avg size readouts.
+- Species legend with hover highlight that flashes corresponding fish (e.g., pulse emissive on those fish) — nice micro-interaction.
+- Buttons with hover transitions, ripple.
+- Intro: loading overlay "заполнение аквариума..." progress then fade in? Nice but keep light: a brief boot sequence with animated water fill. I'll add a short intro overlay that fades after scene ready.
+- Scroll reveal isn't relevant (full-screen app). But maybe below the fold there's nothing — it's an app. Keep it single screen, responsive.
+
+Language: Russian (request in Russian). All UI in Russian.
+
+Let me now write the code carefully.
+
+Structure:
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head> meta, title, fonts (Google Fonts: Bodoni Moda + IBM Plex Sans + IBM Plex Mono) </head>
+<style> ... </style>
+<body>
+  <div class="ocean-bg"></div> (layered gradients)
+  <canvas id="scene"></canvas>
+  <div class="caustics"></div>
+  <div class="vignette"></div>
+  <header class="hud hud--title"> ... </header>
+  <aside class="hud panel-controls"> buttons + species legend </aside>
+  <aside class="hud panel-stats"> readouts + sparkline </aside>
+  <footer class="hud hint-bar"> click to feed, etc </footer>
+  <div id="boot"> ... </div>
+</body>
+```
+
+Layout: Use CSS grid overlay with pointer-events none on container, auto on panels. Panels positioned absolute corners. On mobile, stack/compact.
+
+Design details for HUD: "naturalist lab plate" — thin double border, corner ticks, mono labels uppercase letterspaced, big display numbers in Bodoni Moda. Accent colors: coral #ff6a3d, cyan #6ff2ff, sand #e8d5ab. Deep ocean bg: #03121f → #06283c → #0a3b52.
+
+Title: "Аквариум" in Bodoni Moda italic huge with a small caps subtitle "Живая система · Three.js". Strong contrast: title 44px+ vs mono labels 10px.
+
+Now the Three.js code. Let me write it thoroughly.
+
+```js
+const THREE_OK = typeof THREE !== 'undefined';
+if (!THREE_OK) { show error }
+```
+
+Renderer setup:
+```js
+const canvas = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+```
+
+Scene: fog Exp2(0x062c42, 0.016)? Tank is 36x24x20 so fog density ~0.012.
+
+Camera: PerspectiveCamera(52, aspect, 0.1, 400), position (0, 10, 40).
+
+Controls: OrbitControls, target (0, 4, 0), damping .06, minDistance 10, maxDistance 60, maxPolarAngle Math.PI/1.8, enablePan true.
+
+Tank dims: W=36 (x), H=24 (y), D=20 (z). Bounds for fish: x ±(18-2), y from 0.8 to 24-1.5, z ±(10-1.5).
+
+Actually place sand at y=0, tank from y=0 to 24. Center target y ~ 9.
+
+Glass box: BoxGeometry(36,24,20) with material double side, depthWrite false, opacity .07, roughness .05, metalness 0, transmission .95, clearcoat 1. Position (0,12,0).
+
+Edges: EdgesGeometry of box → LineSegments with LineBasicMaterial color 0x8fe9ff, opacity .5 transparent.
+
+Also add a metal frame: use thin boxes along edges for a rim at top and bottom (looks premium): TorusGeometry no — use BoxGeometry beams: top rim frame 4 beams, bottom rim 4 beams, 4 vertical corner posts. Material: MeshStandardMaterial metalness .9 roughness .35 color 0x2a3b46. That gives a real aquarium cabinet look. Nice detail. Plus a base stand? Maybe a plinth below y=0: Box(40, 1.6, 24) at y=-0.8 dark. Good — grounds the scene.
+
+Water surface: a plane at y=23.6 with transparent bluish material and animated vertices (ripple) — nice living element. Use PlaneGeometry(36,20, 30, 18) with vertex animation in loop, MeshPhysicalMaterial transparent opacity .25, side double.
+
+Sand: PlaneGeometry(36,20, 60,40), displace z (before rotation) with pseudo-noise, computeVertexNormals, rotateX(-PI/2), y ~0.05. Material MeshStandardMaterial color 0xd9c08a roughness .95. Receives shadow. Add a canvas texture for grain? Could generate sand texture via canvas noise — good realism, cheap. Let's do a procedural canvas texture (sand grains) with repeat.
+
+Rocks: 8 DodecahedronGeometry(rand 1..2.2, 0) with vertex jitter; MeshStandardMaterial color grayish brown, flatShading true. castShadow, receiveShadow.
+
+Plants: 12 bushes each with 3-5 blades: CatmullRomCurve3 points going up with slight curve, TubeGeometry(curve, 20, radius 0.12, 6), MeshStandardMaterial green variants, transparent? no. Group per bush for swaying rotation. castShadow.
+
+Bubbles: 30 SphereGeometry(0.12..0.35, 12, 12) shared geometry scaled; MeshPhysicalMaterial({transparent:true, opacity:.35, roughness:0, metalness:0, transmission: .9?}) — again risky; use MeshPhongMaterial with transparent opacity .25, shininess 100, specular white, plus envMap? Simpler and safe. I'll use MeshPhysicalMaterial without transmission: {transparent:true, opacity:0.22, roughness:0.05, metalness:0, clearcoat:1, color 0xffffff}. Looks like bubbles with highlights. Good.
+
+Dust particles: THREE.Points with PointsMaterial size .08, color 0x9fe8ff, opacity .5, 300 points inside tank, drifting slowly (update positions minimal — maybe rotate the whole group slightly and bob via shader-less loop).
+
+Light rays: a few large transparent planes with additive gradient texture from top — "god rays". Could be nice: 4 planes with canvas gradient texture, additive blending, slowly rotating. Adds atmosphere. Keep subtle.
+
+Fish creation function `createFish(colorSchemeIndex?)`:
+
+Color schemes (8):
+1. Оранжевая: base #ff7a1a, accent #ffd28a, fin #ffbe6b, pattern stripes white-ish
+2. Синяя: #2f6bff / #a9d8ff
+3. Жёлто-красная: #ffd21e / #e0322a (clownfish-like bands)
+4. Фиолетовая: #8b46ff / #d9b3ff
+5. Красная: #e0204a / #ff8fa3
+6. Зелёная: #21c07a / #bff2cf
+7. Розовая: #ff5fb0 / #ffd6ea
+8. Золотая: #ffb300 / #fff0b8
+
+Texture generator: canvas 256x128, vertical gradient from darker belly to accent top? Actually fish sphere UV: u wraps around, v from bottom(0) to top(1). So gradient along v: belly = lighter/darker, back = accent. Then stripes along u (vertical bars) for some patterns; spots for others. Randomize pattern type per fish: 'bands' | 'gradient' | 'spots' | 'two-tone'.
+
+Body geometry: SphereGeometry(1, 24, 18) scaled (1.55, 0.72, 0.62)? Let's define body scale so nose points +Z or -X? Let's make fish forward = +X? Standard: build along Z axis with head at +Z, then lookAt handles orientation since lookAt points -Z... Actually Object3D.lookAt makes the object's +Z axis point toward the target? For cameras it's -Z; for regular objects, lookAt rotates so that the object's positive Z axis faces the target. Yes — `Object3D.lookAt` uses `m.lookAt(position, target, up)` with eye/target order such that +Z points from object to target for non-camera objects? Let me recall: In Object3D.lookAt: if camera or light → m1.lookAt(eye, target, up) else m1.lookAt(target, eye, up). The Matrix4.lookAt(eye, target, up) builds a basis where z = normalize(eye - target). For non-camera they swap args: lookAt(position /*as target*/, this.position /*as eye*/) → z = normalize(target - eye) = direction toward the target. So yes, for regular objects +Z faces the target. Great: build fish with head at +Z, tail at -Z.
+
+Body: sphere scaled (0.62 wide in x, 0.8 tall in y, 1.5 long in z), head at +z.
+Tail: at z = -0.9*len; a shape made from a custom "fin" geometry: use a LatheGeometry? Simpler: create tail via a custom BufferGeometry triangle fan or use ConeGeometry flattened / CircleGeometry with thetaLength. A nice tail: `new THREE.CircleGeometry(0.75, 12, Math.PI*0.6, Math.PI*0.8)` scaled in y to make a vertical caudal fin, rotated so it lies in the XY plane (facing sideways) and positioned behind. Then pivot group at tail base for rotation about Y (side-to-side swing) — brief says rotation on Z axis, but for a fish swimming with forward +Z and up +Y, the tail swings about the Y axis. The brief says "вращение по оси Z" — I'll do yaw swing (which in their orientation might be Z). I'll implement anatomically correct: tail pivot rotates about local Y. Fine.
+
+Actually let me build a nicer caudal fin with custom geometry: shape via THREE.Shape → ExtrudeGeometry? Thin extrusion gives solid fins that catch light. Use `THREE.Shape` with bezier curves forming a forked tail, then ShapeGeometry (flat, double-sided) — flat shapes are cheap and look decent. Let's use ShapeGeometry with DoubleSide material, slight thickness not needed.
+
+Fins:
+- Dorsal fin (top): Shape curve along the back, ShapeGeometry in YZ plane... Building shapes: easier to define shape in XY plane then rotate the mesh: for dorsal, rotate Y by 90° so its plane is the XZ... hmm. Let me think: a Shape defined in local XY. Dorsal fin should lie in the YZ plane (vertical plane along body length). So rotate about Y axis by Math.PI/2 → local X maps to world -Z, local Y stays Y. So define shape with x = along body length, y = up height. Good.
+- Caudal fin: lies in the YZ plane too (vertical), so same rotation. Define shape with x = backward direction... careful with sign; I'll define and adjust visually by reasoning: after rotateY(PI/2), local +X → world -Z? Rotation about Y by θ: x' = x cosθ + z sinθ, z' = -x sinθ + z cosθ. θ=π/2: x'=z, z'=-x. So a point (1,0,0) → (0,0,-1). So local +X maps to world -Z (backwards). For the caudal fin, we want it extending backwards — so define shape extending in +X local, and it maps to -Z world = behind. 
+- Pectoral fins (side): lie roughly horizontal-ish, angled; rotate about Y by 0 (plane XY) then tilt. Define shape extending in +X (local), rotateY(±small) so they stick out sideways ±X. For left fin, we want it to extend toward +X: local +X → world -Z after π/2 rotation... no — for side fins don't rotate by 90°; keep plane XY and shape extends along +X → world +X. Then tilt with rotateZ and rotateX to angle backwards. Good: right fin at x = -0.5 needs mirroring via scale.x = -1.
+
+Simplify: create fin shapes as functions and mirror using mesh.scale.set(-1,1,1) for the other side.
+
+Eyes: sphere white/sclera (0.17), pupil black sphere slightly forward and bigger-ish, plus small specular highlight sphere with emissive white. Positioned at x=±0.34, y=0.18, z=0.72 (relative to body).
+
+Mouth: small dark torus arc? Use a small squashed sphere dark at head front. Or a tiny cone. Add subtle.
+
+Materials: MeshStandardMaterial with map = canvas texture, roughness .45, metalness .05, plus emissive? Add slight sheen: clearcoat via physical material would be nicer but heavier; use MeshPhysicalMaterial with clearcoat 0.6, roughness .35 for wet look. 15 fish × ~8 meshes = 120 meshes — fine.
+
+Also add a subtle "gill" line? Skip.
+
+Fish data:
+```js
+{ mesh, tail, leftFin, rightFin, velocity, speed, tailSpeed, phase, targetFood, avoidanceRadius, size (scale), scheme, baseScale }
+```
+
+Update loop per fish:
+- if targetFood: steer toward it (normalize dir * speed), if dist < eatRadius (0.9 + size) → eat: remove food, grow scale *=1.05, spawn crumb bubbles, update stats.
+- else wander: occasionally add random steering; apply sin-based drift.
+- avoidance: for each other fish within avoidanceRadius, add repulsion.
+- boundary: soft steer away from walls when near bounds (margin 3).
+- clamp velocity magnitude to speed (with slight variation), and a minimum.
+- position += velocity * dt.
+- orientation: desired quaternion via lookAt target = pos + velocity; smooth: mesh.lookAt then slerp. Implementation: create dummy Object3D, copy position, lookAt(pos+vel), then mesh.quaternion.slerp(dummy.quaternion, 1 - Math.exp(-dt*6)).
+- banking roll: mesh.rotateZ after lookAt? Simpler: apply roll to the inner body group based on horizontal turn rate. I'll add a `body` child group that we can roll: fishGroup (orientation) → bodyGroup (roll) → parts. Roll = clamp(turnRate * k).
+- animation: tail.rotation.y = sin(t*tailSpeed*6 + phase) * 0.55; fins flap; bodyGroup scale y/x slight pulse; speed influences tail speed.
+
+Food: group with small irregular dodecahedron/tetrahedron flakes, brownish/orange, castShadow. Physics: velocity.y -= gravity*dt, drag; when near bottom → rest then dissolve after few seconds (brief says remove at bottom; I'll let it settle briefly and fade out — nicer, and fish can still eat it).
+
+Click handling: raycaster from mouse; intersect an invisible "click plane" — better: intersect the glass box (front face) and place food at intersection point moved inside by a few units? Simplest robust approach: intersect against a plane through tank center perpendicular to camera direction, clamped inside bounds. Then set y near top? The brief: "Клик по аквариуму создает корм" — food falls from click position. I'll clamp the point into bounds with y ≤ 22 and spawn there with tiny random velocity. Also spawn a ripple ring at surface above it maybe.
+
+Also spawn small bubble burst at feed point. Nice feedback.
+
+Buttons:
+- "Добавить рыбку" (+fish, max maybe 60)
+- "Больше пузырей" (+10)
+- "Свет" toggle directional intensity (with visual dim + UI state)
+- Extra: "Очистить корм"? Not needed. Maybe "Корм ×5" auto-drop? Add "Покормить" that drops 6 flakes at random — nice. And "Сброс". Keep to brief plus one or two extras.
+
+Stats: fish count, food count, bubbles, FPS with sparkline canvas (draw bars), avg size %. Also a small "глубина"/camera distance readout? Nice touch: show camera distance and azimuth in mono.
+
+Species legend: 8 rows with color swatch + name + count; hovering highlights matching fish (set emissive pulse). Clicking a row spawns that species. That's a strong micro-interaction. Implement highlight: fish.filter(scheme===i) → set a `highlight` flag; in update, lerp material.emissiveIntensity toward 0.6 for those. Need materials to have emissive set to accent color and emissiveIntensity 0 initially.
+
+Boot overlay: dark panel with "наполнение…" progress bar animating over ~1.1s then fade. Also shows a fish silhouette? Keep simple: mono text lines appearing + progress line, then fade out.
+
+Caustics CSS: two layers of repeating radial-gradient / conic with animation translate + blur, mix-blend-mode: overlay, opacity .25. Plus animated "light shafts" via linear-gradient rotating slowly.
+
+Also add a subtle vignette and top light gradient.
+
+Responsive: on small screens, panels shrink, legend collapses (hide), font sizes reduce; keep controls accessible. Use media queries.
+
+Also handle window resize, visibility pause.
+
+Let me now write everything out concretely. Careful with r128 API specifics:
+- `THREE.sRGBEncoding` exists ✓
+- `renderer.outputEncoding` ✓
+- `ACESFilmicToneMapping` ✓
+- OrbitControls global `THREE.OrbitControls` from examples/js ✓
+- `ShapeGeometry` ✓, `TubeGeometry` ✓, `CatmullRomCurve3` ✓
+- `PlaneGeometry` (r128 uses PlaneGeometry, PlaneBufferGeometry alias) ✓
+- Geometry `.attributes.position.setZ()` — with BufferGeometry in r128, `geometry.attributes.position.setZ(i, v)` then `needsUpdate = true`, then computeVertexNormals ✓.
+- DodecahedronGeometry ✓.
+
+Note: PlaneGeometry in r128 is BufferGeometry ✓.
+
+Sand texture canvas + repeat wrapping requires `texture.wrapS = wrapT = RepeatWrapping` ✓ and anisotropy.
+
+Fish texture: canvas → THREE.CanvasTexture, needs encoding sRGB: `tex.encoding = THREE.sRGBEncoding` ✓ (r128 supports texture.encoding).
+
+Now write the fish shape functions.
+
+Caudal fin shape:
+```js
+function caudalShape(){
+  const s = new THREE.Shape();
+  s.moveTo(0, 0);
+  s.bezierCurveTo(0.35, 0.25, 0.75, 0.65, 1.0, 0.85);   // top lobe tip
+  s.bezierCurveTo(0.72, 0.35, 0.72, -0.35, 1.0, -0.85); // inner notch? 
+  ...
+}
+```
+Let me design: local x = backward (0 → 1), y vertical from -0.9 to 0.9. Forked tail: start at root top (0, 0.18), curve out to top tip (1.0, 0.9), curve in to notch (0.62, 0), out to bottom tip (1.0, -0.9), curve back to root bottom (0, -0.18), close.
+
+```js
+const s = new THREE.Shape();
+s.moveTo(0, 0.2);
+s.bezierCurveTo(0.45, 0.35, 0.75, 0.65, 1.02, 0.95);
+s.bezierCurveTo(0.82, 0.45, 0.72, 0.18, 0.6, 0);
+s.bezierCurveTo(0.72, -0.18, 0.82, -0.45, 1.02, -0.95);
+s.bezierCurveTo(0.75, -0.65, 0.45, -0.35, 0, -0.2);
+```
+Good enough — a nice forked caudal.
+
+Dorsal fin shape: local x = along body (0 at head-side to 1 at tail-side), y up from 0 to height ~0.55, sail-shaped:
+```js
+s.moveTo(0,0);
+s.bezierCurveTo(0.25, 0.5, 0.6, 0.62, 1, 0.12);
+s.lineTo(1,0); closePath
+```
+Then rotate so local X maps to -Z (rotateY(PI/2)) and position along back.
+
+Wait: for dorsal fin, local +X maps to world -Z meaning the shape's x=0 end is at the mesh origin and increases toward the back. Position it at z = +0.35 (front part of back), extending backward ✓.
+
+Pectoral fin shape: rounded triangle extending in +X (world +X for right... let's define leftFin with scale.x=1 at x=+0.42, and rightFin with scale.x=-1 at x=-0.42). Shape: moveTo(0,0), quadraticCurveTo(0.5,0.18,0.85,-0.05), quadraticCurveTo(0.5,-0.3,0,-0.16) — a paddle. Then rotate mesh: rotateZ(0.35) to sweep back? Rotating about Z moves +X toward +Y... For a pectoral fin we want it to stick out sideways and sweep backward (-Z) and tilt down slightly. Since shape is in local XY plane with x=spanwise, y=lengthwise-in-plane. Hmm, if the shape stays in the XY plane (world), then the fin's flat face points up/down (+Y normal). We want the fin's flat face pointing sideways-ish? Real pectoral fins are roughly vertical-ish planes angled. Simplest: define paddle with local x = spanwise outward, y = fore-aft; keep plane as XY → normal along Z (front-back)?? A fin whose plane is XY has normal along Z, meaning it's a horizontal... no: the XY plane is horizontal? No — XY plane is vertical (contains X and Y axes), normal is Z. So a shape in the XY plane is a vertical fin facing front/back. For a pectoral fin sticking out to the side, we want its plane roughly containing X (spanwise) and Z (fore-aft) — i.e., normal along Y → rotateX(-PI/2) maps local Y→ world Z? Rotation about X by -π/2: y' = y cos(-90) - z sin(-90) = z... let's compute properly. R_x(θ): y' = y cosθ − z sinθ; z' = y sinθ + z cosθ. θ = −π/2: cos=0, sin=−1 → y' = z; z' = −y. So local (0,1,0) → world (0, 0, −1) i.e. local +Y → world −Z (backward). And local +X stays +X. So after rotateX(-π/2), the shape lies in the XZ plane (horizontal), with local y extending backward. Then add slight tilt: rotate about X by a bit more/less, e.g. rotateX(-π/2 + 0.45) tilts fin downward/outward. And rotateZ to sweep. Good enough; combined with flapping animation (rotate about Z or Y small oscillation) it'll read as fins.
+
+Flap animation: leftFin.rotation.z = base + sin(t*3+phase)*0.25; also rotation.y slight.
+
+Careful: applying rotations after using mesh.rotateX in constructor changes order semantics — I'll set `fin.rotation.set(...)` explicitly with Euler order default XYZ, computing base rotations as: fin.rotation.x = -Math.PI/2 + tilt, and use a parent pivot group for flapping so it's clean. Let me create a pivot Object3D at the fin base attached to body, then add the shape mesh inside offset appropriately; animate pivot rotation. Cleaner.
+
+So per fish:
+```
+group (fish)
+ └ bodyGroup (roll/pitch)
+    ├ bodyMesh (sphere w/ texture)
+    ├ dorsalPivot → dorsalMesh
+    ├ tailPivot → caudalMesh
+    ├ finLPivot → finLMesh
+    ├ finRPivot → finRMesh
+    ├ eyeL(white)→pupilL, glintL
+    ├ eyeR...
+    └ mouthMesh
+```
+
+Sizes: body radius base 1 scaled by (0.55, 0.72, 1.35)? Let's define bodyLen ~1.3 (half-length). Overall fish length ≈ 2.7 * scale, with scale 0.6–1.2 → 1.6 to 3.2 units. Tank is 36 long — reasonable (fish look small relative to tank but visible; camera min distance 10). Maybe scale up: multiply all by 1.4 → fish 2.2–4.5 units long in a 36-long tank. Good proportion (like 6 fish lengths across... hmm real tanks have smaller fish, but for visual appeal bigger is better). Let's use base multiplier 1.25.
+
+Body: SphereGeometry(1, 26, 20) scaled (0.55, 0.78, 1.3) then multiply group by fishScale.
+
+Tail pivot at z = -1.25 (body local), caudal mesh scaled ~0.85, rotateY(PI/2).
+Dorsal pivot at z = 0.15, y = 0.6; dorsal shape scale 0.7, rotateY(PI/2).
+Head/mouth at z = +1.25.
+Eyes at (±0.36, 0.2, 0.72) — but body half-width 0.55 in x, so eye radius 0.19 at x=0.4 partially embedded ✓.
+
+Now the texture mapping on a scaled sphere: fine.
+
+Let me write `makeFishTexture(scheme, pattern)` returning CanvasTexture.
+
+```js
+function makeFishTexture(s){
+  const c = document.createElement('canvas'); c.width=256; c.height=128;
+  const g = c.getContext('2d');
+  // base vertical gradient (v: 0 bottom? In sphere UV, v=0 at bottom(-Y) pole... For SphereGeometry, uv.y goes 0 at theta start (top). Actually phiStart... In three, sphere UV v=1 at top (y+) I think: `uv.y = 1 - v` where v iterates from top? Let's just make gradient with both ends distinct and check pattern symmetry — not critical.
+  const grad = g.createLinearGradient(0,0,0,128);
+  grad.addColorStop(0, s.dark);   // back (top)
+  grad.addColorStop(0.55, s.base);
+  grad.addColorStop(1, s.light);  // belly
+  g.fillStyle = grad; g.fillRect(0,0,256,128);
+  // pattern...
+}
+```
+Patterns:
+- 'bands': 4 vertical white/dark bands with soft edges: fillRect with alpha + slight bezier wobble.
+- 'spots': random circles of accent color, radius 3–8, plus a few dark.
+- 'fade': horizontal stripe line (lateral line) in accent + iridescent sheen.
+- 'saddle': dark patches along top.
+Also always: subtle noise speckle for scale texture; darker at tail root; gill arc line near u≈0.85? The head is at +Z of the sphere... UV on a sphere: u wraps around the Y axis starting from +Z? In three's SphereGeometry, u = phi/(2π) starting at... vertex x = -radius*cos(phiStart+u*phiLength)*sin(theta)... complicated; pattern placement along u relative to head is uncertain. Since stripes are vertical bands (along v), orientation-agnostic-ish: they'll wrap around the body vertically → looks like proper fish stripes regardless of rotation. Spots also fine. Good, choose patterns that are rotation-robust. 
+
+Add per-fish slight color variation via HSL shift.
+
+Now the "highlight" emissive: MeshPhysicalMaterial with emissive = accent, emissiveIntensity = 0. On hover of legend row → set fish.highlighted = true.
+
+Also raycast on fish: clicking a fish (not feeding) could make it dart away — fun! Implement: on click, first test intersection with fish bodies; if hit, that fish gets a startle impulse (burst speed + ripple ring). Otherwise feed. Nice interactive detail. Show cursor pointer on hover over fish? Requires raycast on mousemove — throttle to every ~80ms. Could be a nice touch but costs perf; with 15-60 fish, raycasting bounding spheres is cheap if I use a simplified approach: raycast against the group children (meshes) — could be heavy with many meshes. Alternative: maintain invisible proxy spheres? Simpler: raycast against an array of fish body meshes only (one per fish). That's ≤60 meshes → fine at throttled rate.
+
+Let me include it: hover on fish → cursor change + slight highlight of that fish; click on fish → startle + a small "pulse" ring sprite. Click elsewhere in tank → drop food.
+
+Sound? No audio (could be annoying). Skip.
+
+Stats sparkline: canvas 120x30, draw FPS history bars with cyan gradient. Update every frame or every 200ms. Draw each frame is fine (small canvas) but let's do every 4 frames.
+
+Now UI markup and CSS. Let me design carefully.
+
+Palette:
+```
+--abyss:#02101b; --deep:#052435; --mid:#0a3d55; --shallow:#12708f;
+--foam:#e9f7fb; --sand:#e6cfa1; --coral:#ff6b3d; --amber:#ffb64d; --bio:#5ff0e0 / #57e6ff;
+```
+Fonts: 
+- Display: 'Bodoni Moda' (serif, high contrast) — for the title & big numbers. Its numerals are elegant.
+- Mono/labels: 'IBM Plex Mono'
+- Body: 'IBM Plex Sans'
+Google Fonts link with display=swap.
+
+Hmm, Bodoni + aquarium = naturalist plate. Works well and is distinctive against the usual sci-fi HUD cliché. Good contrast pairing.
+
+Title block top-left:
+```
+<div class="brand">
+  <div class="eyebrow">Морская лаборатория · установка №07</div>
+  <h1>Аквариум<span class="brand-sub">живая система</span></h1>
+  <p class="lede">Пятнадцать тропических рыб, ...</p>
+</div>
+```
+Title: "Аквариум" in Bodoni Moda italic 56px with letter-spacing -0.02em; the subtitle inline small caps mono. Add a thin animated "water line" underline (svg wave? use a repeating gradient animating).
+
+Controls panel (left, below brand): buttons stacked full-width with icon glyph + label + hint key badge. Hover: translateX(3px), border glow, background sweep. Active state for light toggle.
+
+Stats panel (right): grid of readouts: РЫБ / КОРМ / ПУЗЫРИ / FPS each with big Bodoni number and mono label; sparkline below; plus camera telemetry line.
+
+Legend panel (right, below stats): "Каталог окрасов" list of 8 rows: swatch (gradient), name, count. Hover → highlight fish in tank + row shifts. Click → spawn that color.
+
+Bottom hint bar: mono text with kbd chips: "ЛКМ — вращать · ПКМ — панорама · Колесо — зум · Клик по воде — корм". Center bottom, small.
+
+Boot overlay: full screen dark with centered mono lines + progress bar; fades out.
+
+Also a toast/flash message when feeding/growth? Small transient badge near cursor: "+5% массы" floating up at click point (DOM element positioned at projected coords). Nice feedback! Implement simple: create div at clientX/clientY with animation, remove after 900ms.
+
+Let's write CSS with care but not endless. Include:
+- body overflow hidden, background layered gradients + noise via SVG data URI? Use a subtle noise via repeating-conic? I'll add an SVG feTurbulence data URI for grain at low opacity — cheap and adds texture.
+- caustics: two absolutely positioned divs with radial-gradient patterns animated by keyframes (translate/scale), mix-blend-mode: screen, opacity .18, filter blur(30px).
+- vignette: radial gradient overlay pointer-events none.
+
+Also the canvas needs to sit behind HUD: z-index layering: bg(0) → canvas(1) → caustics(2, blend) → vignette(3) → hud(10).
+
+Note: caustics overlay above canvas will tint fish — that's fine/desirable (subtle).
+
+Let me now write the final code. I'll be thorough but organized.
+
+Key numbers for bounds:
+```js
+const TANK = { w: 36, h: 24, d: 20 };
+const B = { x: TANK.w/2 - 2.6, yMin: 1.2, yMax: TANK.h - 2.6, z: TANK.d/2 - 2.4 };
+```
+Fish z bound: 10 - 2.4 = 7.6 ✓.
+
+Food spawn clamp within bounds too.
+
+Camera default position (28, 16, 34) → distance ~ sqrt(784+ (16-9)^2 +1156)= ~45 < maxDistance 60 ✓.
+
+Directional light: position (18, 40, 22), castShadow, shadow.camera bounds: left/right ±28, top/bottom ±28, near 1 far 120; mapSize 2048; bias -0.0005.
+
+Point lights: blue at (-14, 6, 8) color 0x2ea8ff intensity 1.2 distance 60; cyan at (14, 4, -8) 0x1e5cff... Use colors 0x39c2ff and 0x2f7bff with intensity ~1.1, distance 70, decay 2? With r128 default legacy lights (physicallyCorrectLights false), intensity 1.2 distance 60 gives nice falloff. Fine.
+
+Also a subtle hemisphere light for fill: HemisphereLight(0x9fdcff, 0x0a2233, 0.35).
+
+Water surface animation: modify vertices each frame with sin waves; keep segments modest (24x14).
+
+God rays: 3 planes with canvas gradient texture (vertical white fade), additive, depthWrite false, rotated slightly, opacity .06, slowly oscillating. Place inside the tank near top.
+
+Let me write it all now.
+
+One more: `renderer.physicallyCorrectLights` false default ✓.
+
+Fog: FogExp2(0x063049, 0.014). With alpha:true background transparent so fog color blends oddly? Fog affects objects only; the CSS bg shows through where nothing is drawn. Fog color should match CSS deep blue at distance — set fog color 0x04202f matching mid bg. Fine.
+
+Let me also make sure fish don't clip through glass visually: bounds keep them inside ✓.
+
+Bubble wobble and reset: y > TANK.h - 1.5 → reset to y ~ 0.6 with new random x,z, and pop ripple? Just reset.
+
+Now the code.
+
+```js
+// ---------- boot
+const bootLines = [...]; animate progress via rAF over 1200ms then add .done class.
+```
+
+I'll write it as a single file. Let me produce final answer with brief intro text in Russian and the code block. Keep explanation short — main deliverable is the file. I'll add a short list of what's included after/before code, concise.
+
+Writing the code now in full.
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Аквариум · живая система</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@0,6..96,400;0,6..96,700;1,6..96,500;1,6..96,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+```
+
+CSS. Let me write it.
+
+```css
+:root{
+  --abyss:#010c15; --deep:#04202f; --mid:#0a3a52; --teal:#0e6a80;
+  --foam:#eaf7fb; --mist:#a9cede;
+  --sand:#e8d3a5; --coral:#ff6b3d; --amber:#ffbb52; --bio:#5fe9ff;
+  --panel: rgba(6,32,46,.62);
+  --stroke: rgba(120,214,240,.22);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--abyss);color:var(--foam);font-family:'IBM Plex Sans',system-ui,sans-serif;overflow:hidden;-webkit-font-smoothing:antialiased}
+#scene{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:1;touch-action:none}
+.bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+ background:
+  radial-gradient(120% 80% at 50% -10%, #1a7fa0 0%, rgba(10,60,84,.9) 30%, rgba(3,26,40,0) 62%),
+  radial-gradient(90% 60% at 12% 100%, rgba(232,211,165,.16), transparent 60%),
+  linear-gradient(#062a3d 0%, #04202f 45%, #010c15 100%);
+}
+```
+
+Caustics:
+```css
+.caustics{position:fixed;inset:-10%;z-index:2;pointer-events:none;mix-blend-mode:screen;opacity:.28;
+ background:
+  repeating-conic-gradient(from 10deg at 30% 20%, rgba(150,240,255,.0) 0deg 12deg, rgba(150,240,255,.16) 14deg 18deg),
+  radial-gradient(40% 30% at 70% 10%, rgba(190,250,255,.35), transparent 70%);
+ filter: blur(28px); animation: drift 26s linear infinite;
+}
+```
+Hmm repeating-conic-gradient with blur creates shafts — ok. Add second layer `.caustics--b` with different animation & blend soft-light.
+
+Vignette + grain.
+
+HUD styles: panels with backdrop-filter blur(14px) saturate(1.2), background var(--panel), border 1px solid var(--stroke), border-radius 2px (sharp, instrument-like), plus corner ticks via ::before/::after using clip-path or small pseudo borders. I'll do a "double rule" inset shadow: box-shadow: inset 0 0 0 1px rgba(...,.06), 0 24px 60px rgba(0,0,0,.45).
+
+Buttons:
+```css
+.btn{display:flex;align-items:center;gap:.7rem;width:100%;padding:.66rem .8rem;background:linear-gradient(100deg, rgba(255,107,61,.16), rgba(95,233,255,.06));border:1px solid rgba(255,140,90,.35);color:var(--foam);font:500 .8rem/1 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;cursor:pointer;position:relative;overflow:hidden;transition:.35s cubic-bezier(.2,.7,.3,1)}
+.btn:hover{transform:translateX(4px);border-color:rgba(255,187,82,.8);box-shadow:0 0 0 1px rgba(255,187,82,.2), 0 10px 30px rgba(255,107,61,.18)}
+.btn::after{content:'';position:absolute;inset:0;background:linear-gradient(100deg,transparent 20%, rgba(255,255,255,.18), transparent 80%);transform:translateX(-100%);transition:.6s}
+.btn:hover::after{transform:translateX(100%)}
+.btn .k{margin-left:auto;font-size:.62rem;opacity:.6;border:1px solid rgba(255,255,255,.18);padding:.15rem .35rem}
+.btn.is-off{...}
+```
+
+Stat numbers: `font-family:'Bodoni Moda',serif;font-size:2.1rem;font-weight:700;` with tabular-nums? Bodoni has proportional figures; fine.
+
+Legend rows with hover.
+
+Now JS. Let me write it fully and carefully.
+
+I need to double check OrbitControls r128 from jsdelivr examples/js — it attaches THREE.OrbitControls ✓.
+
+Also handle case where THREE fails to load: show fallback message in boot overlay.
+
+Let me write the whole thing.
+
+For fish material highlight, store `mats` array per fish (body + fins materials) — I'll create per-fish materials: bodyMat (with map), finMat (semi-transparent accent), eyeWhite, pupil, glint. fins use MeshPhysicalMaterial with transparent opacity .82, side DoubleSide, color accent, roughness .4, transmission? no.
+
+Startle: fish.startle = 1 → speed multiplier decays.
+
+Growth: fish.scale *= 1.05 clamp max 2.2; apply mesh.scale.setScalar(fish.scale * baseScale). Also update avoidanceRadius slightly.
+
+Stats avg growth: percent relative to initial scale.
+
+Food eat radius: 1.1 * fish.scale + 0.4.
+
+Food detection radius 15 as specified ✓ (choose nearest food within 15).
+
+Let me write the update with dt clamped to 0.05.
+
+Fish count cap 60.
+
+Also "Добавить рыбку" spawn near a random edge inside tank, with pop-in animation (scale from 0) — nice: set fish.spawnT = 0, lerp scale.
+
+Let me write final code.
+
+Regarding `THREE.Object3D` dummy for orientation: create one shared dummy.
+
+Turn rate for banking: compute angle between previous and current horizontal velocity → roll target.
+
+Simplify banking: roll = clamp(-lateralAccel * k). I'll compute steering vector's x component in local space... Easier: keep `fish.prevVel`; after updating velocity, compute cross product y-component of (prevDir × curDir) → sign gives turn direction; roll target = clamp(crossY * 6, -0.5, 0.5); lerp fish.roll.
+
+Since forward is +Z and up is +Y: turning right (toward local -X) should bank... sign whatever looks plausible; I'll use bodyGroup.rotation.z = roll.
+
+Compute in world: cross = prevDir.x*curDir.z - prevDir.z*curDir.x (y-component of cross product). Use that.
+
+Now write the sand texture function:
+```js
+function makeSandTexture(){
+ const c=document.createElement('canvas'); c.width=c.height=512; const g=c.getContext('2d');
+ g.fillStyle='#d9c193'; g.fillRect(0,0,512,512);
+ // speckles
+ for(let i=0;i<26000;i++){ const x=Math.random()*512,y=Math.random()*512,r=Math.random()*1.4+.2;
+   const l = 190+Math.random()*60; g.fillStyle=`rgba(${l|0},${(l*0.87)|0},${(l*0.62)|0},${.12+Math.random()*.35})`;
+   g.beginPath();g.arc(x,y,r,0,6.283);g.fill(); }
+ // soft blotches
+ for(let i=0;i<60;i++){ const x=Math.random()*512,y=Math.random()*512,r=20+Math.random()*70;
+   const gr=g.createRadialGradient(x,y,0,x,y,r); const dark=Math.random()>.5;
+   gr.addColorStop(0, dark?'rgba(120,95,60,.14)':'rgba(255,240,205,.14)'); gr.addColorStop(1,'rgba(0,0,0,0)');
+   g.fillStyle=gr; g.fillRect(x-r,y-r,2*r,2*r); }
+ return tex with repeat(4,3)
+}
+```
+
+Noise function for sand displacement: simple layered sin/cos + hash.
+
+```js
+function n2(x,y){ return Math.sin(x*0.7)*Math.cos(y*0.9)*0.5 + Math.sin(x*1.9+1.3)*Math.cos(y*2.3-0.7)*0.22 + Math.sin(x*4.1)*0.06; }
+```
+Multiply amplitude 0.55.
+
+Rocks placement avoid center? Just random within bounds, y = surface height ~ small; set rock.position.y = -0.15 + r*0.35.
+
+Plants: bushes at random x,z; blades count 3-6; each blade: curve points from base (0,0,0) up to (dx, h, dz) with lateral sway offsets; TubeGeometry(curve, 18, radiusTop... tube has constant radius; use radius 0.14 tapering not supported → use two tubes? Just constant thin radius 0.1 and it's fine. Actually can taper by scaling the mesh along Y? no. Use `TubeGeometry` with radius 0.11 — leaves look like straps? A strap needs width; tube gives a rope look. Alternative: build blade as a tapered ribbon via custom BufferGeometry — more work but nicer. Compromise: use TubeGeometry as specified in brief (they asked for it) but flatten by scaling the mesh along local X (scale.x = 0.35) to make a strap-like leaf ✓ cheap and looks like a leaf blade. Since blades curve mostly vertically, scaling x flattens them into ribbons. 
+
+Plant material: MeshStandardMaterial with color green variants, roughness .7, side DoubleSide, flatShading false.
+
+Sway: bush.rotation.x = sin(t*0.7 + phase)*0.08; rotation.z = cos(t*0.55+phase)*0.09. Plus per-blade slight scale pulse? Keep group sway only (12 groups).
+
+God-ray texture: canvas 64x256 vertical gradient white→transparent, plus horizontal soft edges: create linear gradient along x too via composite; simpler: radial? I'll make canvas 128x512: fill with linear gradient top(white .5)→bottom(transparent), then apply a horizontal gradient mask using 'destination-in'. ✓
+
+Dust: BufferGeometry with random positions in tank, PointsMaterial({size:0.09, color:0xbfefff, transparent:true, opacity:.55, depthWrite:false}). Animate: rotate group slowly + move y up slightly and wrap by modifying attribute (300 pts fine).
+
+Alright — also a "surface ripple ring" when food hits water? Skip; but add bubble burst on feeding.
+
+Let me write the DOM toast for growth: on eat, show "+ рост" only sometimes? Show on every eat at projected position of fish — could spam. Show small dot particles instead: I'll show text toast with throttle 250ms.
+
+Projection to screen: `v.copy(fish.mesh.position).project(camera)` → x = (v.x*0.5+0.5)*w, y=(-v.y*0.5+0.5)*h ✓.
+
+Keyboard shortcuts: F = add fish, B = bubbles, L = light, Space = feed 5 flakes. Add key badges in UI ✓.
+
+Now write everything. Also `renderer.domElement.addEventListener('pointerdown')` for click detection but must distinguish orbit drag: track pointerdown position and time; if moved < 6px and dt < 400ms → treat as click ✓ (important with OrbitControls).
+
+Let me write the final file.
+
+For stats FPS: accumulate frames over 0.5s.
+
+Let me write out all code now, final answer. I'll keep the prose intro to a couple of lines in Russian.
+
+One more consideration on `THREE.Shape` + `ShapeGeometry`: ShapeGeometry(shape, curveSegments) ✓ triangulates fine with beziers.
+
+Also fins need DoubleSide and slight translucency; add `depthWrite:true` to avoid sorting artifacts? Transparent fins with depthWrite true can cause halo issues but generally ok. I'll set transparent:true, opacity .85, depthWrite:false? Fins overlapping body with depthWrite false → fins may draw over eyes etc. Set depthWrite: true and transparent true — acceptable.
+
+Alright, writing final code.
+
+Also need `mesh.castShadow = true` for fish parts (a lot of shadow casters; 15 fish × 6 = 90 shadow meshes at 2048 map — ok).
+
+Let me limit shadow casting to body + tail + dorsal only.
+
+Final: write it.
+
+Code length will be large, that's fine.
+
+Let me carefully handle the `lightOn` toggle: directional intensity lerp between 1.5 and 0.12; also change point lights up when main off (night mode: bio lights brighter), body class 'night' on documentElement to shift CSS bg darker with a cyan glow → nice dramatic effect. Also ambient dims. Use smooth lerp in animation loop toward target intensities.
+
+Now writing.
+
+For the legend counts update: recount each 500ms.
+
+Let me write the HTML structure:
+
+```html
+<div class="bg"></div>
+<canvas id="scene"></canvas>
+<div class="caustics" aria-hidden="true"></div>
+<div class="caustics caustics--b" aria-hidden="true"></div>
+<div class="grain" aria-hidden="true"></div>
+<div class="vig" aria-hidden="true"></div>
+
+<div class="hud">
+  <header class="brand reveal">
+    <p class="eyebrow"><span class="dot"></span>Морская лаборатория · установка №07</p>
+    <h1>Аквариум<em>живая система</em></h1>
+    <p class="lede">Тропическое сообщество в стеклянном резервуаре 36×24×20. Кормите, наблюдайте, запускайте новых особей.</p>
+  </header>
+
+  <section class="panel controls reveal" style="--d:.1s">
+    <h2 class="ph"><span>Управление</span><i>01</i></h2>
+    <button class="btn" id="btnFish">…
+```
+
+Panel header style: mono uppercase with number on right and a hairline. Good instrument feel.
+
+Stats panel markup:
+```html
+<section class="panel stats reveal">
+ <h2 class="ph"><span>Телеметрия</span><i>live</i></h2>
+ <div class="grid">
+   <div class="stat"><b id="sFish">15</b><span>особей</span></div>
+   <div class="stat"><b id="sFood">0</b><span>частиц корма</span></div>
+   <div class="stat"><b id="sBub">30</b><span>пузырьков</span></div>
+   <div class="stat"><b id="sFps">60</b><span>кадр/с</span></div>
+ </div>
+ <canvas id="spark" width="240" height="42"></canvas>
+ <p class="tele" id="tele">камера 45.2 · курс 128°</p>
+</section>
+```
+
+Legend:
+```html
+<section class="panel legend reveal">
+ <h2 class="ph"><span>Каталог окрасов</span><i>8</i></h2>
+ <ul id="legend"></ul>
+</section>
+```
+Rows built from JS with swatch gradient.
+
+Bottom hint bar centered: kbd chips.
+
+Mobile: hide legend and lede, shrink panels, bottom bar wraps.
+
+OK writing now for real. I'll produce the final code.
+
+Sparkline drawing: history array of 60 fps values, bars with gradient from bio to transparent; plus a baseline.
+
+Let me finalize numbers/labels in Russian.
+
+Also add `aria` niceties minimal.
+
+Time to write out the answer.

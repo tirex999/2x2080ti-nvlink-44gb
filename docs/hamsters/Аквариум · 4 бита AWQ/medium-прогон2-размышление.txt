@@ -1,0 +1,189 @@
+The user wants a complete HTML file for a 3D aquarium using Three.js r128. Note: in r128, MeshPhysicalMaterial's transmission is supported (transmission was added around r110). Let me write a single HTML file that implements all the features.
+
+Write it concisely but completely. Use CDN scripts. Include fish creation, AI, bubbles, feeding, lighting, OrbitControls, and UI.
+
+Let me write the code.
+
+Main parts:
+- Scene, fog, camera, renderer with shadows
+- Glass box 36x24x20 with wireframe edges
+- Sand floor plane with vertex displacement
+- Rocks: 8 dodecahedrons
+- Seaweed: 12 tube geometries with curves, swaying
+- Bubbles: 30 spheres, rising with sine-wave sway
+- Fish: groups with body (scaled sphere), eyes, tail, fins; 8 color schemes; size 0.6–1.2
+- Behavior: separation, wall bounce, wandering, food following, growth
+- Feeding: raycast on click → food falls with gravity, fish within radius 15 follow it, eating → +5% growth
+- Lights: ambient, directional with 2048 shadow map, PCFSoft, 2 point lights, toggle button
+- OrbitControls with damping, min/max distance, maxPolarAngle
+- UI panel: info, stats (fish count, FPS), buttons
+
+Boundary: aquarium half-sizes: x=18, y=12, z=10. Fish stay inside with margin.
+
+Food: small spheres, fall with gravity, delete when hitting sand (y ≈ 0.5).
+
+Fish AI per frame:
+- If no targetFood or food is gone, look for nearest food within 15
+- Velocity: base direction + wander (occasionally randomize heading), separation from other fish, wall repulsion, attraction to food
+- Move, rotate toward velocity direction (lookAt or slerp quaternion)
+- Tail wag: rotation.z = sin(time*tailSpeed+phase)*0.5
+- Fins also rotate
+
+Fish orientation: body faces +Z? Make the body along the X axis... simpler: build the fish facing +X? Use lookAt: create a temporary target = position + velocity, mesh.lookAt(target). But the group's children are built facing +Z (default lookAt direction). Actually, Object3D.lookAt points -Z at the target... For non-camera objects, lookAt points the positive Z axis at the target? In three.js, Object3D.lookAt rotates so the object's positive Z axis faces the target (cameras use -Z). So build the fish facing +Z: nose in +Z direction, tail in -Z direction.
+
+Body: scaled SphereGeometry(1, 12, 10) to (0.6, 0.5, 1.4)? The tail is attached behind at z=-1.2, and the tail is a cone or flattened sphere rotated around the Y axis? Tail animation: rotate around... the spec says "rotation on Z axis". Tail as a flat cone pointing backward; pivot at the connection point. Create a tail group at (0,0,-1.1), put the cone inside offset by z=-0.3, animate tailGroup.rotation.y? The spec says Z — well, whatever, rotate around Y for realistic side-to-side wagging... actually, horizontal wagging of a fish tail = rotation around the Y axis (vertical axis). But the spec says Z. Rotate around Y for realism; or just follow the spec. Let's do rotation.y — looks better. Hmm, the spec explicitly says "animated tail (rotation on Z axis)". Follow the spec: rotation.z. A vertical-axis wag would look like the tail is flapping up and down — less realistic but per spec. Compromise: use rotation.y. No, let me follow the spec loosely — use Y for realism. No, just follow the spec: rotation.z. OK.
+
+Eyes: two small black spheres with white sclera on the sides near the front.
+
+Fins: top fin (dorsal) — flattened cone on top; side fins — flattened spheres/cones on the sides.
+
+Color schemes: array of {body, tail, fin}.
+
+Bubbles: MeshPhysicalMaterial with transmission, transparent, low opacity.
+
+FPS counter: simple frame count every second.
+
+Click handling: raycast against invisible plane or tank walls; place food at intersection clamped inside the tank. Better approach: raycast against the glass box (invisible helper box mesh) and place food at the point.
+
+Use a raycaster against an invisible box mesh matching the tank dimensions; get the point, clamp, spawn food there.
+
+Prevent conflict between clicks and orbit controls: distinguish click vs drag with a mousedown/mouseup movement threshold.
+
+Growth: scale *= 1.05, cap at about 2.
+
+Let me write the code.
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>3D Aquarium</title>
+<style>...</style>
+</head>
+<body>
+<div id="info">...</div>
+<div id="stats">...</div>
+<script src three></script>
+<script src orbitcontrols></script>
+<script>
+// code
+</script>
+</body>
+</html>
+```
+
+CSS: gradient background, glass panels with backdrop blur, gradient buttons.
+
+JS structure:
+
+```js
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a1e3a);
+scene.fog = new THREE.FogExp2(0x0a2a4a, 0.012);
+
+renderer, shadowMap PCFSoft, antialias.
+camera at (0, 8, 40).
+controls: target (0,0,0), minDistance 10, maxDistance 60, maxPolarAngle PI/1.8, enableDamping.
+
+Tank dimensions: W=36, H=24, D=20. Centered at y=H/2 so the bottom is at y=0.
+Half: hx=18, hy=12 (center y=12), hz=10.
+
+Glass: BoxGeometry(36,24,20), MeshPhysicalMaterial({color:0x88ccff, metalness:0, roughness:0.05, transmission:0.95, transparent:true, opacity:0.3, side:DoubleSide}), positioned at y=12. Edges: EdgesGeometry + LineSegments.
+
+Sand: PlaneGeometry(36,20,40,30), rotated -PI/2, displaced vertices with random y noise *0.4, computeVertexNormals, MeshStandardMaterial 0xc2a25f, receiveShadow.
+
+Rocks: 8, DodecahedronGeometry(random 0.8-1.8, 0), vertices randomly displaced, gray material, cast/receive shadow, random positions on the sand.
+
+Seaweed: 12 bushes; each bush has several blades: CatmullRomCurve3 points going upward with random sway, TubeGeometry(curve, 8, 0.15, 5). Group them, green material, castShadow. Swaying: rotation.x/z = sin(t + phase)*0.08. Store in seaweedArray with phase.
+
+Bubbles: makeBubble() function creates a sphere of radius 0.1-0.3, MeshPhysicalMaterial({color:0xaaddff, transparent, opacity:0.35, transmission:0.9, roughness:0, metalness:0}); store {mesh, speed, swayPhase, swayAmp}. Update: y += speed*dt; x += sin... reset when y > 23.
+
+Fish: createFish(colorSchemeIndex, scale).
+Group:
+- Body: SphereGeometry(1,14,12), scale (0.55, 0.45, 1.2)
+- Head merged? Leave as is.
+- Eyes: white spheres 0.12 at (±0.22, 0.15, 0.75), pupils 0.06 black at (±0.24, 0.15, 0.85)
+- Tail: group at (0,0,-1.15); cone geometry(0.45, 0.9, 8) rotated x=PI/2? Cone points +Y by default; rotate x = -PI/2 to point -Z... Cone tip: geometry.rotateX(-Math.PI/2) makes the tip point -Z? Cone apex is at +Y; rotateX(-90°): +Y→ -Z? Rotating -90° around X: Y→ -Z? Rotation of -90° around X: y' = y cosθ - z sinθ... vector (0,1,0) rotated -90° around X: (0, cos(-90)*1, sin(-90)*1) = (0,0,-1). Yes, apex at -Z, base at +Z. Good: tailGroup child cone placed at z=-0.45 (base at group origin). Animate tailGroup.rotation.z? That tilts the tail up/down. Per spec, OK.
+Actually, better to also add slight rotation.y. Just do z per spec.
+- Dorsal fin: flattened cone(0.3, 0.7, 8) at (0,0.4,0), scale z 0.3
+- Side fins: flattened cones at (±0.5, -0.1, 0.1) rotated to point back-downward.
+All materials MeshStandardMaterial, flatShading probably true, roughness 0.6.
+
+Fish data: velocity random, speed 2-4 units/sec, tailSpeed 6-10, phase random, avoidanceRadius 1.5*scale.
+
+updateFish(dt, t):
+- Food search: if no targetFood or !targetFood.active, find nearest active food within 15.
+- Desired velocity:
+  - Base: current velocity direction (wandering)
+  - Wander: per-fish timer, occasionally set a random small steering
+  - Separation: sum of (pos - other)/dist^2 for others within avoidanceRadius*2
+  - Walls: if pos.x > hx-margin, push in -x direction, etc.
+  - Food: if targetFood, steer toward food position, increase speed.
+- velocity = normalize(desired) * speed (+ boost if chasing food)
+- pos += velocity*dt
+- Clamp inside tank
+- Orientation: mesh.lookAt(pos.clone().add(velocity)) — smooth with slerp: compute target quaternion via temp object, slerp 0.1.
+Simpler: mesh.lookAt directly is fine but jerky; use slerp.
+
+Implementation:
+```js
+const target = f.mesh.position.clone().add(f.velocity);
+tmpObj.position.copy(f.mesh.position);
+tmpObj.lookAt(target);
+f.mesh.quaternion.slerp(tmpObj.quaternion, 0.15);
+```
+tmpObj = new THREE.Object3D().
+
+Tail: f.tail.rotation.z = Math.sin(t*f.tailSpeed + f.phase)*0.6; fins similarly with smaller amplitude.
+
+Food: makeFood(point): sphere 0.3, orange/brown material, {mesh, vel: Vector3, active:true}. Update: vel.y -= 9.8*dt*0.5 (slower underwater), pos += vel*dt; drag: vel.multiplyScalar(0.98). If pos.y < 0.6: active=false, remove after a short delay? Spec: delete when reaching the bottom. Remove immediately.
+
+Eating: fish within 1.2 of food: remove food, grow fish scale *=1.05 (cap 2.5), clear targetFood, maybe spawn extra bubbles.
+
+Add-fish button: createFish(random scheme, random scale 0.6-1.2) at random position.
+
+More bubbles: add 10.
+
+Light toggle: dirLight.intensity = dirLight.intensity > 0 ? 0 : 1 (toggle).
+
+Lights:
+- Ambient 0x404040, 0.4
+- Directional 0xffffff, 1.0, position (10, 30, 10), castShadow, shadow.mapSize 2048, camera bounds ±25.
+- PointLight 0x4488ff at (-10, 5, 5), 0.5
+- PointLight 0x2266aa at (10, 5, -5), 0.5
+
+FPS: frames++, every 1000ms update text.
+
+Click: record on mousedown; on mouseup if movement < 5px, raycast. Raycaster against a hidden helper box (Mesh with BoxGeometry 36x24x20, visible false, material visible false — raycast works even with visible false? Does Raycaster intersect invisible meshes too? By default, does Raycaster check object.visible? In three.js, Mesh.raycast doesn't check visibility; Raycaster.intersectObjects checks... actually, Raycaster respects `layers` but not visible? In older versions, intersectObject checks object.visible? Let me recall: in three.js, Raycaster.intersectObjects → intersectObject → object.raycast(raycaster, intersects) — Mesh.raycast doesn't check visible. But Raycaster has no visible filter by default... hmm, actually in some versions it does check: `if (object.layers.test(raycaster.layers))`. Visibility isn't checked. To be safe, use material transparent with opacity 0, depthWrite false, and renderOrder... simpler: keep the glass mesh itself as the raycast target (it exists and is transparent). Clicking the glass gives a point on the surface; clamp to inside. But clicking through the center hits the far wall — that's fine, clamp to inside.
+
+Better UX: intersect with a large invisible plane? Use the glass box: raycaster.intersectObject(glassMesh). Take the first point, shrink slightly toward center, clamp to boundaries minus margin. Good enough.
+
+Clamp: x∈[-hx+1, hx-1], y∈[1, H-1], z∈[-hz+1,hz-1].
+
+Also, only spawn food if the ray hits the tank (i.e., the user clicked the tank area).
+
+Now let me write the full code. Keep it reasonably compact.
+
+Fish colors:
+```js
+const schemes = [
+ {body:0xff7f2a, tail:0xffa040, fin:0xffc060}, // orange
+ {body:0x2277ff, tail:0x3399ff, fin:0x66bbff}, // blue
+ {body:0xffcc00, tail:0xff3300, fin:0xff6600}, // yellow-red
+ {body:0x9944ff, tail:0xbb66ff, fin:0xcc88ff}, // purple
+ {body:0xff2233, tail:0xff5566, fin:0xff8899}, // red
+ {body:0x33cc55, tail:0x55ee77, fin:0x88ffaa}, // green
+ {body:0xff77aa, tail:0xffaacc, fin:0xffccee}, // pink
+ {body:0xffc030, tail:0xffd860, fin:0xffe890}  // gold
+];
+```
+
+Update loop with clock delta, cap dt at 0.05.
+
+UI HTML:
+
+Info panel: title "🐠 3D Aquarium", description, buttons (add fish, more bubbles, light).
+Stats: fish count, FPS.
+
+Write the final answer with the complete code and a brief explanation in Russian.

@@ -1,0 +1,746 @@
+The user wants a single-file Three.js low-poly hamster playground. I want to build something polished: cage, tray floor, several low-poly hamsters with autonomous behavior (wander, pause, sniff, run on wheel), an interactive wheel (click to spin, hamsters hop in and run), food bowl with pellets, tunnel tube.
+
+For the UI, I want a chunky, playful HUD that feels like a zoo/nature-documentary control panel. Pair a distinctive display face with a readable body face. Something like "Bungee" or "Fredoka" — for a cute toy-like vibe I'll use display: "Chivo Mono"? Let's pick: display = "Bungee" (chunky, playful), body = "Nunito" (rounded, readable). That pairing feels toy-like and cute. Good.
+
+Palette: bright primaries / candy colors — teal, sunny yellow, coral, grass green — matching the "colorful low-poly" ask, on a mid-tone slate/teal page with a subtle dotted ambient background.
+
+Layout: open with the 3D scene itself (full-bleed canvas), with an overlay HUD: top-left title badge, left side stat panel (hamster roster with names, current state — living elements updating), bottom bar controls (orbit hint, buttons: spin wheel, drop food, toggle cage bars, day/night light), a small "hamster cam" follow mode. Scroll reveals? It's a single-screen 3D app; scroll reveal not necessary. I'll add an intro overlay that fades in with staged animation, plus hover micro-interactions on buttons, and a "poop counter"? Funny: pellets count, wheel RPM, nap meter.
+
+Technical plan (Three.js r160+ via ESM import map from unpkg/jsdelivr). Use OrbitControls. Everything procedural geometry — low-poly: use low-segment spheres/boxes with flatShading MeshLambert/MeshStandard.
+
+Key components:
+
+1. Scene: sky gradient background (canvas texture or CSS behind transparent renderer? Use scene.background color + fog). Ground tray: rounded box (BoxGeometry) with sand-colored material, plus scattered wood chips (small boxes), a few pebbles.
+
+2. Cage: base tray (plastic teal), vertical bars around perimeter (thin boxes/cylinders), top frame, a lid with handle, a water bottle (cylinder transparent + tube), food bowl (lathe/cylinder), tunnel (open cylinder lying down, colorful), a small ladder/ramp, a wooden platform.
+
+3. Hamsters: group made of body (icosahedron scaled / sphere low seg flat shaded), head sphere, ears (small cones/discs), eyes (tiny black spheres), nose, tiny legs (4 small boxes) that animate walk cycle, tail? hamsters have tiny tails—skip or tiny nub. Cheeks (small spheres). Different fur colors.
+
+Behavior state machine per hamster: IDLE, WALK, RUN_WHEEL, EAT, SLEEP, INVESTIGATE. Steering: pick random target within cage bounds, walk toward with leg animation and bobbing, pause, groom (shake head), etc. Wheel interaction: a hamster can enter the wheel and run — legs spin fast, wheel rotates, wheel RPM stat increases; after some seconds exits.
+
+Food bowl: click to drop pellets; hamsters target pellets, when close they "eat" (head bob, crumb particles), pellet disappears.
+
+Wheel: click to spin (raycast), gives a burst of rotation and hamster inside runs faster.
+
+4. Camera: OrbitControls with damping, min/max polar angle, target center. Auto-rotate toggle. Click on hamster → focus (smooth lerp target), show name tag.
+
+5. Rendering: shadows (PCFSoft), hemisphere light + directional sun with shadow, warm fill. Tone mapping ACES, sRGB output.
+
+6. Performance: keep object counts modest; use InstancedMesh? Not necessary — a few hundred meshes max is fine. Bars: ~40 thin boxes. Fine.
+
+7. UI overlay: 
+- Top-left: title "LOW-POLY HAMSTER PLAYGROUND" with Bungee, badge with cage icon.
+- Left panel: roster list of hamsters with color swatch, name, live state text + tiny animated bar (energy). Hover highlights the hamster in 3D (emissive outline / scale pop). Click → camera focus.
+- Bottom-left: stats: wheel RPM, pellets, chips pooped? "Cage cleanliness" meter decreasing as they poop — funny and living.
+- Bottom-right: buttons: SPIN WHEEL, FEED, SLEEPY TIME (lights dim), AUTO-ORBIT, RESET.
+- Hint pill: "drag to orbit • scroll to zoom • click a hamster".
+- Loading/intro: staged fade-in of HUD after scene ready.
+- Day/night transition lerps light colors and background.
+
+Add ambient page background: CSS layered radial gradients + subtle animated grain/dot pattern behind canvas (canvas covers, so visible only in overlay areas? The canvas is full-bleed; the 3D background provides visuals). Overlay panels get their own layered styling with noise. Fine.
+
+Let me write code carefully.
+
+Import map:
+```html
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module"> import * as THREE from 'three'; import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+```
+
+Careful: unpkg module resolution — three.module.js imports nothing external; addons OrbitControls imports 'three' → resolved by import map. Good.
+
+Geometry helpers for low-poly: define `flatMat(color, opts)` → MeshStandardMaterial({color, flatShading:true, roughness:.85, metalness:0}).
+
+Hamster builder:
+- body: SphereGeometry(0.5, 7, 5) scaled (1.05, 0.9, 1.15) flat shaded → chunky potato.
+- belly: lighter sphere slightly forward/below? Optional small sphere scaled.
+- head: SphereGeometry(0.34, 7,5), positioned front-top; ears: 2 spheres flattened (SphereGeometry(0.13,5,3) scaled y .6) at sides top; inner ear pink tiny.
+- eyes: SphereGeometry(0.055, 6,4) black, plus tiny white highlight sphere.
+- nose: small cone or sphere pink.
+- cheeks: two spheres (0.13) scaled, fur color lighter.
+- legs: 4 small boxes (0.12,0.12,0.14) at corners; animate rotation.x for walk.
+- paws: skip.
+- tail: tiny sphere at back.
+- group with userData: {state, target, speed, legs[], head, body, wheel...}
+
+Use a shared geometry set to reduce memory (define geometries once, reuse across hamsters, materials per-color).
+
+Hamster colors: cream #F2D5A8, golden #E8A34A, grey-blue #9FB6C6, brown #A9673C, white-cream #F7EFE2, panda-ish black/white.
+
+Names: "Nugget", "Waffles", "Biscuit", "Mochi", "Sir Chonk", "Peanut".
+
+Behavior details:
+Bounds: cage interior rect e.g. x in [-4.2, 4.2], z in [-3.0, 3.0] with obstacles avoidance (simple: keep target away from wheel/bowl; hamsters walk around by simple steering — avoid complex pathing). Keep it simple: they can walk through the tunnel opening? Just let them wander on floor; obstacles are small; allow slight overlap (cute).
+
+States:
+- 'idle': stand, occasional head bob / sniff, timer 1-3s → choose new.
+- 'walk': move toward target at speed 0.6-1.0; rotate smoothly to heading; legs animate; when reach within 0.25 → idle or next.
+- 'wheel': go to wheel entry point, then enter (lerp into wheel), run: wheel angular velocity from hamster speed; timer 5-10s; then exit with a small tumble.
+- 'eat': go to bowl when pellets exist; head dips repeatedly; consume pellet after ~2s.
+- 'sleep': lie down (rotate body z, close eyes → scale eyes y), snore particles "z" sprite? Simple: a small floating sphere bobbing. Timer 4-8s. In night mode most hamsters sleep.
+- 'groom': spin in circle slowly (funny).
+
+Poop: while walking, tiny chance to drop a small dark-brown low-poly sphere "chip"? Actually make them drop wood chips? Poop is funny but keep it cute: "drops" as tiny brown pellets count as "plops", cleanliness meter decreases; add a "Clean cage" button to remove them. That's living and interactive. Keep the count small (max 12).
+
+Wheel: cylinder-based wheel: torus-ish ring built from a low-segment TorusGeometry (radialSegments 6, tubularSegments 16) → two rings; spokes: boxes across; a solid disc inside? Classic hamster wheel: a disc running surface. Build: a Cylinder with radius 1.05, height 0.7, openEnded true, radialSegments 14 → the running surface (curved). Plus side discs (CircleGeometry low seg) as plastic sides in coral color. Plus stand: two boxes + axle cylinder. Wheel rotates about its axis (x-axis if wheel plane is XY... define wheel group with rotation axis z? Let's set wheel standing vertical rolling around Z axis, placed at x = 2.6, facing so hamster enters from -X side. Simpler: wheel plane parallel to XY plane, rotating around Z. Stand holds axle along Z.
+
+Wheel geometry: group `wheel` at position (3.0, 1.15, -1.2). Inside group: 
+- running surface: CylinderGeometry(1.0,1.0,0.75, 16, 1, true) rotated so its axis aligns with Z: rotate X by PI/2. Material double-sided, color mint.
+- side discs: CircleGeometry(1.0, 14) at z=±0.38, coral, DoubleSide.
+- rungs (steps): boxes across the surface at angles for visual spin read — place 8 boxes at radius .96 spanning width, attached to wheel group. Good for reading rotation.
+- axle: cylinder along Z, dark grey.
+- stand: two angled boxes from base to axle + base plate.
+
+Wheel spin: wheelSpin variable; wheel.rotation.z -= spin*dt. Spin driven by hamster running inside or click impulse (with damping).
+
+Inside hamster: position at wheel center offset, legs cycle fast, body tilted forward slightly.
+
+Food bowl: LatheGeometry for a bowl profile? Simpler: Cylinder(0.42,0.3,0.28,10) as outer + inner disc darker; use a torus rim. Pellets: small boxes/cylinders (0.07) in orange/seed colors, placed inside bowl.
+
+Water bottle: cylinder transparent (MeshPhysicalMaterial? keep MeshStandard with transparency 0.35, color white) lying horizontal along Z at cage side, with metal cap cylinder + tiny straw + water level (blue cylinder scaled).
+
+Tunnel: open cylinder (radius .42, height 1.8, 10 segments, openEnded), rotated to lie along X, colorful stripes: use two cylinders of different colors? Just single color (sunflower yellow) with a couple of rings (torus). Hamsters can walk through: allow them to pass — set tunnel as a target waypoint; hamsters walking through will intersect visually — that's fine and cute (they emerge). To avoid the hamster being hidden inside, make tunnel open-ended so you see through. OK.
+
+Platform + ramp: box platform at 1.2 high with legs, ramp box tilted. Hamsters can't climb (keep simple) — maybe one hamster sleeps on platform: place a sleeping hamster statically on the platform (state sleep, position fixed). Cute.
+
+Cage bars: base tray: Box(9.6, 0.9, 7.2) teal at y=-0.45 top at 0? Let's set floor y=0 as tray top surface; tray box from y=-0.7 to 0. Bars: vertical thin boxes (0.07 x 3.4 x 0.07) spaced along perimeter at y=1.7, plus top frame boxes and corner posts. Also a top lid with bars across? Keep: perimeter bars + top frame + a couple of crossbars. Add a handle on top: torus? A "carry handle" box arch — nice.
+
+Bars count: perimeter 9.6+7.2: front/back each ~13 bars at spacing .75 → 26; sides ~9 each → 18; total ~44 boxes. Fine.
+
+Bar material: metalness .8, roughness .35, color #cfd8e0 — with only hemisphere+directional lights, MeshStandard with metalness needs env for good look. Use MeshLambertMaterial? Standard with low metalness (0.1) and high-ish roughness reads fine; add a bit of emissive? Simpler: MeshStandardMaterial({color:0xdfe7ee, metalness:.5, roughness:.4, flatShading:true}) plus an environment from RoomEnvironment? Adding RoomEnvironment via addons gives nice PBR. `import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js'` + PMREMGenerator. That's a nice touch for material quality. It's a standard addon; safe. I'll include it with a try/catch fallback.
+
+Shadows: directional light with shadow map 2048, tight frustum around cage. Ground receives shadows.
+
+Day/night: lerp between day (bg #bfe3ee? sky) and night (#1a2340). Use scene.background = Color lerped; fog color matched. Ambient/hemisphere intensity lerp; a "lamp" warm point light at night.
+
+Night mode: hamsters get sleepy, wheel slows, one hamster runs (night owl) — funny.
+
+UI details with CSS:
+- Font imports from Google Fonts: Bungee (display), Nunito (body, weights 400/700/900).
+- Panels: solid chunky "plastic" cards with thick borders and hard offset shadows (sticker style) — reads toy-like, matches the low-poly vibe. Rounded corners ~14px on panels, pill buttons with 3D bottom edge (like chunky toy buttons) that press down on click (translateY).
+- Accent colors: sunny yellow #FFC53D, coral #FF6B5A, mint #4FD8A9, sky #57C4E5, deep ink #14212B for panel bg with cream text? Panels in dark ink with bright accents pop over a light scene. Good contrast.
+- Roster rows: color dot + name (Bungee small) + state (Nunito, uppercase, small, muted). State changes animate (flash). Energy bar: thin track with fill width transitions.
+- Hover row → highlight hamster in 3D (scale pulse + emissive ring under them: a ring mesh shown). Click → focus camera.
+- Buttons bottom-right with icons drawn as inline SVG.
+- Stat chips top-right: WHEEL RPM (live number, tabular), PELLETS, PLOPS, TIME OF DAY.
+- Toast messages: funny one-liners appear at bottom-center ("Waffles discovered a pellet. Historic.") — living element. Queue system.
+- Intro overlay: big title card with "ENTER THE CAGE" button? Requirement is run immediately — an intro overlay is fine, adds polish; keep it dismissible and auto-dismiss? I'll do a brief loading card that fades when scene ready, with the title animating in. Then HUD elements stagger in. No blocking gate (auto fade after load).
+
+Mobile: hide side panels on small screens or make compact; canvas touch works with OrbitControls.
+
+Now write code. Careful with sizes and layout: cage interior x ∈ [-4.4, 4.4], z ∈ [-3.1, 3.1]. Tray top at y=0, bedding depth ~0.1.
+
+Let me define constants:
+```
+const CAGE = { w: 9.4, d: 6.6, h: 3.4 }; // interior extents centered origin
+const BOUND = { x: CAGE.w/2 - 0.7, z: CAGE.d/2 - 0.7 };
+```
+
+Objects placement:
+- Wheel at (3.1, 1.05, -1.3), radius 1.0 → bottom of wheel at y≈0.05, stand base on floor.
+- Bowl at (-3.4, 0.12, 1.9).
+- Tunnel along X at (-1.6, 0.45, -1.9), length 2.0, radius 0.45.
+- Platform at (2.6, 0.95, 1.8) size 2.0x0.18x1.6 with legs; ramp from platform to floor at its left.
+- Water bottle attached at right side x=4.5, y=1.4, z=1.2 with spout into cage.
+
+Hamsters: 5.
+
+Movement steering: 
+```
+function steer(h, dt){ move toward target; }
+```
+Obstacle avoidance: simple repulsion from wheel stand & platform center when close (push target perpendicular). Keep it light: define obstacle circles list; if hamster within radius, add tangential steering.
+
+Legs animation: legs[i].rotation.x = sin(t*speed*...)*0.7 with phase offsets; body bob y = sin(t*2*f)*0.03; head slight nod.
+
+Turning: h.rotation.y lerp toward heading angle.
+
+Facing convention: hamster built facing +X (so head at +x). Then rotation.y = atan2(-dz? ) For facing direction vector (dx, dz): angle y = Math.atan2(-dz? Let's recall: object forward is +X in local. World forward after rotY(θ) = (cos θ, 0, -sin θ). We want forward = normalize(dx, dz) → cos θ = dx, -sin θ = dz → θ = atan2(-dz, dx). Good.
+
+Wheel running: hamster inside wheel at world position = wheel center + offset rotating? Classic: hamster stays at bottom inside, wheel spins under it. Position hamster at wheel center (x, y - 0.45, z) facing... The wheel rolls around Z axis; hamster runs toward -X? If wheel rotates so top surface moves away from camera... Let's have hamster face +X (θ=0) at position wheelCenter + (0, -0.42, 0), and wheel.rotation.z increases (counter-clockwise viewed from +Z) meaning bottom of wheel moves toward +X → hamster runs toward +X. Set spin positive: rotation.z += spin*dt with spin>0 → point at bottom (0,-r): velocity = ω × r, with ω=(0,0,ω), r=(0,-r,0) → v = ω*... cross((0,0,ω),(0,-r,0)) = (0*0 - ω*(-r), ω*0-0*0, 0*(-r)-0*0) = (ω r, 0, 0). Yes bottom moves +X for ω>0. So hamster runs facing +X. Good.
+
+Wheel entry: hamster walks to point wheelCenter + (-1.3, 0, 0.9)? The wheel is a disc; entering means walking into the disc from the front (+Z side, since wheel plane XY and thickness ±0.38 in z). Hamster should step in from the near side (+z) to center. So target = (cx, 0, cz + 1.4) approach, then lerp z from cz+1.4 → cz, y up to cy-0.42, facing +X. Then run. Exit: lerp back out to z=cz+1.2 then resume wander. Since wheel side disc is at z=+0.38 (solid), the hamster passing through it looks odd... Make the +Z side disc a ring (torus + partial) with transparency? Use side discs as CircleGeometry with transparent 0.35 opacity plastic — cute acrylic wheel, and hamster visible inside! Yes: transparent acrylic sides so you can see the running hamster. 
+
+Render order/transparency: transparent discs with depthWrite false to avoid artifacts. Set side disc material: MeshStandardMaterial({color:0xff8fa3, transparent:true, opacity:0.35, side:DoubleSide, depthWrite:false}). Fine.
+
+Camera focus on click: raycast against hamster groups (recursive). On hit, find root hamster via userData.isHamster walking up parents. Then set focusTarget = hamster; controls.target lerps to hamster position each frame; show name tag (HTML label projected to screen). Nice living element: floating labels for each hamster? Might clutter; show label only for hovered/focused. I'll show a small label div that follows the focused/hovered hamster.
+
+Raycast also on wheel for spin (name the wheel group userData.clickable='wheel').
+
+Clicks: use pointerdown/up with small movement threshold to distinguish from orbit drag.
+
+Feeding: "FEED" button adds 3 pellets into bowl (max 14) + toast. Pellets are meshes; when eaten remove mesh.
+
+Clean cage: removes plops, meter back to 100.
+
+Sleep mode toggle: night lighting; hamsters get sleepy faster; one runs wheel at night ("insomnia").
+
+Auto-orbit toggle: controls.autoRotate.
+
+Reset view button.
+
+Stats update every ~0.2s.
+
+RPM: spin (rad/s) * 60/(2π).
+
+Cleanliness meter decreases with plops count: cleanliness = 100 - plops*7 clamped.
+
+Energy per hamster: decreases while running, recovers while sleeping/idle. Bar in roster.
+
+Now the "plop" mechanic: while walking, small random chance (rate ~0.02/s) to drop a plop (max 14). Toast occasionally: "Nugget left a present." Keep it low-key.
+
+Also add wood chips scattered as bedding (small boxes, tan colors) and a couple of pebbles, a wooden chew block, a small ladder. Don't overcomplicate: bedding ~26 chips instanced-ish (just meshes), 3 pebbles.
+
+Sky/background: use scene.background = color; plus fog for depth. Add a soft ground plane outside cage (large disc, light mint) so shadows land and it feels like a table? A "table" plane in warm grey with subtle radial vignette. Good — shadow catcher large circle at y=-0.7 (tray bottom).
+
+Let me now write the code in full.
+
+```js
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+```
+
+Setup renderer: antialias true, pixelRatio min(devicePixelRatio,2), shadowMap enabled PCFSoft, toneMapping ACESFilmic, outputColorSpace srgb.
+
+Lights:
+- hemi = HemisphereLight(0xdff3ff, 0xf5d9a8, 0.75)
+- sun = DirectionalLight(0xfff1cf, 1.5), pos (6,9,5), shadow.mapSize 2048, camera left/right ±8, top/bottom ±7, near .5 far 30, bias -0.0008, normalBias .02
+- fill = DirectionalLight(0x9fd6ff, 0.35) pos(-6,4,-5)
+- lamp (night) = PointLight(0xffb45c, 0, 12) at (0,4.5,3)
+
+Env: PMREM RoomEnvironment for subtle PBR reflections, envMapIntensity .5.
+
+Day/night lerp: keep `dayT` (1 day, 0 night), lerp toward target. Colors: bgDay #cfeaf2, bgNight #131b2e; hemi intensity .75→.25; sun intensity 1.5→.12 color warm; lamp 0→1.6; floor/table color lerp.
+
+Add a moon? Skip.
+
+Now the cage build function.
+
+Tray: BoxGeometry(9.9, 0.85, 7.1) at y=-0.425, color 0x2fb3a1 (teal plastic), plus inner floor plane at y=0.001 color sand #E8CFA0 (BoxGeometry(9.4,.06,6.6) at y=-0.03). Rounded? Use BoxGeometry only; add rim: a slightly larger box top lip (torus? no). Add rim frame: 4 boxes along top edge of tray, brighter teal.
+
+Bars: for i in range along front/back z=±3.3, x from -4.5..4.5 step .72 → bar Box(0.06,3.3,0.06) at y=1.65. Sides x=±4.65, z from -3.0..3.0 step .72. Top rails: 4 boxes forming frame at y=3.3. Corner posts: Box(0.16,3.4,0.16) at corners, color coral plastic. Top lid bars: bars across top (x direction) at y=3.32 spaced in z: Box(9.3,0.06,0.06). Good for top-down view.
+
+Handle: two boxes + a bar on top at y=3.9.
+
+Water bottle: group at (4.75, 1.55, 1.0): cylinder radius .28 length 1.5 axis Z? Bottle horizontal along Z outside the bars: CylinderGeometry(.3,.3,1.5,12) rotated X PI/2 → axis Z. transparent white; cap cylinder at inner end (z-) metal; spout thin cylinder going into cage with a small ball tip. Attach to bars via two rings.
+
+Bowl: group at (-3.4,0,1.9): Cylinder(0.45,0.32,0.26,12) color coral flat; inner: Cylinder(0.36,0.26,0.06,12) at y=.12 dark; rim torus (0.45, 0.05, 6, 14). Pellets: small cylinders (0.06,0.06,0.12,6) random rotations, colors orange/yellow/brown.
+
+Tunnel: group at (-1.3, 0.5, -1.7), rotation.z = Math.PI/2 to lay cylinder along X: CylinderGeometry(0.46,0.46,2.1,12,1,true) rotate z PI/2 → axis along X. Material double-sided yellow. Rings: 3 torus (radius .46, tube .06) rotated to face X at x=-0.7,0,0.7 color mint/coral.
+
+Platform: at (2.7, 0, 1.9): top Box(2.2,0.16,1.7) at y=0.95 color #F2A65A wood; 4 legs Box(0.16,0.95,0.16). Ramp: Box(0.9,0.12,1.5) rotated z ~ -0.5 rad placed from platform left edge to floor.
+
+Chew toy: small wooden cube with holes at random spot; a ball (icosahedron radius .22, green) that hamsters can nudge? Interactive object extra: ball nudged by hamsters when they walk near → ball gets velocity, rolls, bounces off walls. Fun and cheap! Add simple physics: velocity, friction, wall bounce; hamsters within 0.4 push it (impulse away). Hamster 'play' state: chase the ball. Nice living element. Keep it.
+
+Now hamster builder with shared geometries:
+
+```js
+const G = {
+ body: new THREE.SphereGeometry(0.36, 8, 6),
+ head: new THREE.SphereGeometry(0.245, 8, 6),
+ ear: new THREE.SphereGeometry(0.1, 6, 4),
+ eye: new THREE.SphereGeometry(0.045, 6, 5),
+ glint: new THREE.SphereGeometry(0.017, 5, 4),
+ nose: new THREE.SphereGeometry(0.038, 6, 4),
+ cheek: new THREE.SphereGeometry(0.1, 6, 4),
+ leg: new THREE.SphereGeometry(0.075, 5, 4),
+ tail: new THREE.SphereGeometry(0.05, 5, 3),
+};
+```
+Body scaled (1.15, 0.95, 1.0) with head at x=0.32,y=0.16.
+
+Hamster scale overall ~1.0 relative to cage of 9.4 wide; hamster length ~0.8 → looks right for a big cage (cage is like 12 hamster-lengths, fine visually).
+
+Materials per hamster: fur (color), belly lighter, ear pink, eye #1b1b22, nose #ff8fa3, cheek tinted.
+
+Add subtle outline? A "highlight ring" mesh (TorusGeometry(0.5,0.045,4,20)) at feet, visible on hover/focus, color yellow, emissive.
+
+Hamster states machine code:
+
+```js
+function updateHamster(h, dt){
+  h.t += dt;
+  switch(h.state){ ... }
+}
+```
+
+State functions:
+
+setState(h, s, data)
+
+WANDER: 
+- target chosen random point in bounds (avoid obstacles list: pick with rejection sampling).
+- speed = base * (1 - energy*0.3)
+- move: dir = target - pos; dist; if dist < 0.18 → arrive → next state (idle/eat if pellets/wheel if wheel free/sleep if night & sleepy/groom)
+- steering: avoid obstacles: for each obstacle circle (x,z,r): d = pos - c; if |d| < r+0.35 push dir tangentially.
+- clamp position to bounds.
+- legs animation speed proportional to actual velocity.
+- chance to plop.
+
+IDLE: stand, head bob sniffing (head.rotation.x sin), timer → pick next.
+
+EAT: target = bowl position offset; on arrive, state 'eating': head dips (head.rotation.x = -0.5 + sin*0.35); after 1.6s consume one pellet from bowl (remove mesh, pellets--, toast random). Continue if more pellets & hunger.
+
+WHEEL: approach wheel front point, then 'inwheel' with spin: h.runT; wheelSpin target ~ 7 rad/s scaled by energy; legs spin fast; after 4-9s exit → 'exited' dizzy wobble → wander.
+
+SLEEP: lie down: bodyGroup.rotation.z = 0.25, y -= .1; eyes closed (eye scale y .15); timer 5-10s; energy += ; snore: small spheres? Add "z" sprite via canvas texture with letter z — cute! Use THREE.Sprite with canvas texture of "z". Spawn every 1.2s floating up and fading. Cheap and delightful.
+
+GROOM: rotate body spin slowly (rotation.y += 3*dt) 1.2s + head tilt — funny.
+
+BALL PLAY: if ball is free & hamster bored: target = ball; on contact, impulse ball; ball rolls; toast "Nugget body-slammed the ball."
+
+Night behavior: probability of SLEEP increases strongly at night; wheel running decreases (one insomniac).
+
+Energy: 0..1; walking drains .01/s, wheel drains .06/s, idle +.02/s, sleep +.12/s. Low energy → prefers sleep.
+
+Now UI HTML/CSS.
+
+Layout structure:
+```html
+<div id="app">
+  <canvas id="scene"></canvas>
+  <div class="vignette"></div>
+  <header class="hud hud-top">
+     <div class="brand"> ... title, subtitle </div>
+     <div class="stats"> chips </div>
+  </header>
+  <aside class="hud roster"> ... </aside>
+  <div class="hud dock"> buttons </div>
+  <div class="hint">drag to orbit…</div>
+  <div id="toast"></div>
+  <div id="tag" class="tag"></div>
+  <div id="boot"> loading card </div>
+</div>
+```
+
+Styling: chunky toy UI. Panels: background #10202a with border 2px solid rgba(255,255,255,.08), hard shadow 0 10px 0 rgba(0,0,0,.18) plus blur. Radius 18px. Accent stripes.
+
+Buttons: pill, background var(--c), color #12202a, font Bungee 12px, letter-spacing .04em, border-radius 999px, box-shadow 0 4px 0 rgba(0,0,0,.35); :active translateY(4px) shadow none; :hover brightness + slight rotate.
+
+Roster rows: grid; dot with color; name Bungee 13px; state Nunito 10px uppercase letterspacing; energy bar 3px.
+
+Tag label: absolutely positioned, transform translate(-50%,-140%), pill dark with arrow.
+
+Toast: bottom center above dock, slide up + fade, auto-remove after 3s, queue.
+
+Boot overlay: full-screen with big title, animated "spinning wheel" CSS loader (a circle with dashes), fades out on first frame; staggered HUD reveal via .ready class on body with transition delays.
+
+Add keyboard shortcuts: F feed, W spin wheel, N night, R reset, Space auto-orbit. Show in hint.
+
+Responsive: @media (max-width: 860px) hide roster (or collapse), shrink dock.
+
+Also a "camera view" segmented control: OVERVIEW / SIDE / TOP. Nice extra with smooth camera tween.
+
+Let me write the code now, being careful about correctness.
+
+Key details for OrbitControls: enableDamping, dampingFactor .06, minDistance 4, maxDistance 22, maxPolarAngle ~1.45, target (0,1.0,0). autoRotate speed .6.
+
+Camera tween: implement custom lerp: store camGoal {pos, target} and tween alpha; when tweening, set controls.target and camera.position via lerp; disable autoRotate during.
+
+Focus hamster: continuous follow: if focus set, controls.target.lerp(hamsterPos, 0.08); user can still orbit around it.
+
+Label projection: project world pos to NDC → screen px.
+
+Now write everything. Also handle resize.
+
+Pellet/plop meshes: reuse geometry.
+
+Let me write the JS in order:
+
+1. Constants & helpers
+2. Renderer/scene/camera/lights/env
+3. Materials palette
+4. buildCage(), buildTray, buildProps (wheel, bowl, tunnel, platform, ball, bottle, chips)
+5. buildHamster(cfg), roster creation
+6. Interaction: raycast, buttons, keys
+7. Update loop: day/night, hamsters, wheel physics, ball physics, sprites, UI stats, label
+8. Toast system
+
+Careful: RoomEnvironment usage:
+```js
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+```
+In r160, `new RoomEnvironment()` takes no renderer arg (older versions took renderer optionally). r160: `constructor()`. Fine.
+
+Version pin: use 0.160.0 on unpkg. `three/addons/` path maps to examples/jsm/. Good.
+
+Let me write the hamster geometry so it reads cute: body potato, big head relative, tiny ears, shiny eyes, pink nose, cheeks.
+
+Also add tiny "fur tuft" on top? A small cone. Cute.
+
+Write code:
+
+```js
+function makeHamster(cfg){
+  const g = new THREE.Group();
+  const fur = mat(cfg.fur, {rough:.95});
+  const belly = mat(cfg.belly);
+  const body = new THREE.Mesh(G.body, fur); body.scale.set(1.18,0.98,1.02); body.position.set(0,0.34,0); ...
+```
+Wait: body sphere radius .36 scaled x1.18 → length .85, height .70. Center y at 0.34 → bottom at ~0. Legs under.
+
+Head: mesh(G.head, fur) scale (1,0.95,1), position (0.36, 0.5, 0). Ears at (0.36, 0.72, ±0.17) flattened sphere; inner pink smaller.
+Eyes: (0.55, 0.55, ±0.13). Nose: (0.60, 0.47, 0). Cheeks: (0.48, 0.44, ±0.19) scale .9.
+Legs: 4 at (±0.24, 0.11, ±0.19) spheres scaled (1.2,1,1); animate rotation about x? Spheres rotating invisible. Use small elongated capsules: use G.leg scaled (1,1,1.6) as paw and animate position.y + z offset for a scuttle: leg.position.y = 0.11 + max(0, sin(phase))*0.07; leg.position.z fixed; leg.position.x = baseX + cos(phase)*0.06. That reads as tiny legs paddling. Good for spheres.
+Tail: (−0.44, 0.34, 0) tiny pink sphere.
+Tuft: cone? small sphere at (0.15, 0.72, 0) fur darker.
+
+Group hierarchy: g (root, on floor y=0) → bodyGroup (for bob/tilt) containing everything; head group for nodding (contains head, ears, eyes, nose, cheeks).
+
+Root rotation.y = heading.
+
+Eyes: store eyeL/eyeR meshes to scale for blinking/sleep. Blink: scale.y between 1 and .15 randomly.
+
+Highlight ring: TorusGeometry(0.46, 0.05, 4, 18) rotate x -PI/2 at y=0.02, material MeshBasicMaterial color 0xffd23f, visible false, toneMapped false.
+
+Marking for raycast: g.traverse(o => o.userData.hamster = hObj); set g.userData.isHamster = true.
+
+Now the wheel click detection: give wheel group userData.clickable='wheel' on all children.
+
+Raycaster intersectObjects(scene.children, true) then walk up parents to find userData.hamster/clickable.
+
+Ball physics: pos, vel; each frame: vel *= (1 - 1.2*dt); pos += vel*dt; bounce at bounds ±(BOUND); hamsters: if dist < 0.45 → ball.vel += dir * 2.2, toast sometimes; also ball spins: ball.rotation.z -= vel.x*dt*2 etc.
+
+Wheel spin dynamics:
+```
+let wheelSpin = 0; // rad/s
+// in update: wheelSpin *= Math.pow(0.35, dt) (damping)
+if runner inside: wheelSpin += (target - wheelSpin)*Math.min(1,dt*2.5)
+wheel.rotation.z += wheelSpin*dt
+```
+Click: wheelSpin += 9 (and hamster inside gets excited).
+
+RPM = Math.abs(wheelSpin) * 9.549.
+
+Stats chips update: rpm with 1 decimal, pellets count, plops, clock time (game time: day cycle mapped to a fake clock, e.g. t*? Show "12:00" style). Fun: in-game clock advancing; night at 21:00-06:00. Let's make day/night driven by an internal clock: `clockHour` advances at rate (1 real second = 4 game minutes → full day 6 min). Night when hour >= 20.5 || < 6.5. Toggle button "NIGHT MODE" forces night/day instantly? Simpler: button toggles auto cycle vs forced; Let's do: button cycles DAY / NIGHT / AUTO. Display clock chip shows time; the light lerp target = based on hour with smooth transitions (dayT computed from hour via smoothstep at dawn/dusk). Nice living element!
+
+dayT from hour: 1 during 7..19, ramp down 19→21, 0 during 21..5, ramp up 5→7.
+
+Speed control? Add a "TIME ×" button to speed the clock (funny: fast-forward day). Keep 3-state cycle for light + separate clock speed? Simplify: buttons: FEED, SPIN WHEEL, CLEAN, NIGHT SWITCH (forces time to 22:00 or 09:00), AUTO-ORBIT, RESET VIEW. Clock chip shows time. Good.
+
+Sleepiness from hour: night → hamsters sleep.
+
+Now the boot overlay: show for ~900ms with animated loader then fade. Everything runs immediately (no gate).
+
+Also add a subtle "cage floor shadow" ambient occlusion: skip.
+
+Bedding chips: 30 boxes random, y=0.02, rotation random, colors from tan palette. Also 4 pebbles (icosahedron grey scaled flat).
+
+Write CSS with variables:
+```
+--ink:#0e1b24; --ink2:#16283400; --cream:#fdf6e8; --sun:#ffc93c; --coral:#ff6f59; --mint:#43d6a2; --sky:#5bc8ef; --pink:#ff9ec4;
+```
+
+Background page (behind canvas): radial gradients — invisible mostly. Add a vignette overlay div with radial gradient + subtle noise via SVG data URI for depth, pointer-events none.
+
+Also add scanline-free grain: use `background-image: url("data:image/svg+xml,...feTurbulence...")` with opacity .06 and mix-blend-mode overlay. OK.
+
+Type scale: title Bungee clamp(22px, 3vw, 38px) with letter-spacing; subtitle Nunito 11px uppercase tracking .28em. Strong contrast — good.
+
+Title treatment: "LOW-POLY" small mint + "HAMSTER PLAYGROUND" big cream with coral shadow (text-shadow hard offset). Fun, sticker-like.
+
+Let me now write the final code fully.
+
+Code sketch for main loop:
+
+```js
+const clock = new THREE.Clock();
+function tick(){
+  const dt = Math.min(clock.getDelta(), 0.05);
+  time += dt;
+  updateClock(dt);
+  updateLights(dt);
+  updateWheel(dt);
+  updateBall(dt);
+  for (const h of hamsters) updateHamster(h, dt);
+  updateProps(dt); // bowl? tunnel? 
+  updateSprites(dt);
+  controls.update();
+  if (focus) { controls.target.lerp(focusPos, 1-Math.pow(0.001,dt)); }
+  renderer.render(scene, camera);
+  updateLabels();
+  requestAnimationFrame(tick);
+}
+```
+
+updateClock: clockHour = (clockHour + dt * MIN_PER_SEC/60) % 24, MIN_PER_SEC = 12 (so full day = 24*60/12 = 120s). 2 minutes per game day — that's fast; night arrives quickly which is fun. Set MIN_PER_SEC = 8 → 3 min day. Good.
+
+Chip update every frame is fine (throttle to 6/s for DOM writes).
+
+Hamster AI details:
+
+```js
+function pickNext(h){
+  const hour = clockHour;
+  const night = dayT < 0.35;
+  const r = Math.random();
+  if (h.energy < 0.22 || (night && r < 0.55)) return setState(h,'sleep');
+  if (pellets.length > 2 && r < 0.3) return setState(h,'eat');
+  if (!wheelRunner && r < 0.34) return setState(h,'wheel');
+  if (r < 0.45) return setState(h,'groom');
+  if (r < 0.62 && !night) return setState(h,'play'); // chase ball
+  return setState(h,'wander');
+}
+```
+Wander needs a target: setTarget(h).
+
+Implementation of states with h.stateT timer.
+
+Movement helper:
+```js
+function walkTo(h, tx, tz, dt, speed){
+  const dx = tx - h.pos.x, dz = tz - h.pos.z;
+  const d = Math.hypot(dx,dz);
+  if (d < 0.02) return 0;
+  let ux = dx/d, uz = dz/d;
+  // obstacle avoidance
+  for (const o of obstacles){
+    const ox = h.pos.x - o.x, oz = h.pos.z - o.z;
+    const od = Math.hypot(ox,oz);
+    if (od < o.r + 0.4 && od > 0.0001){
+      const push = (o.r + 0.4 - od);
+      ux += (ox/od) * push * 2.2; uz += (oz/od) * push * 2.2;
+      const l = Math.hypot(ux,uz); ux/=l; uz/=l;
+    }
+  }
+  const v = speed;
+  h.pos.x = clamp(h.pos.x + ux*v*dt, -BOUND.x, BOUND.x);
+  h.pos.z = clamp(h.pos.z + uz*v*dt, -BOUND.z, BOUND.z);
+  const want = Math.atan2(-uz, ux);
+  h.heading = angleLerp(h.heading, want, 1 - Math.pow(0.0015, dt));
+  h.speed = v;
+  return d;
+}
+```
+
+Apply to mesh: h.root.position.set(pos.x, 0, pos.z); h.root.rotation.y = heading.
+
+Leg animation: h.legPhase += dt * (4 + h.speed*9); each leg: offset phase by index*Math.PI (diagonal pairs) → y bob & x paddle.
+
+Body bob: bodyGroup.position.y = Math.abs(Math.sin(phase))*0.035*h.speed... plus idle breathing sin(t*2)*0.01.
+
+Head: idle sniff nod; eat dip; run slight up-front.
+
+Wheel state machine:
+- on enter: if wheelRunner && wheelRunner !== h → don't. set wheelRunner = h; h.wheelPhase='enter'.
+- approach target point (cx, cz + 1.5) → arrive → phase 'in': lerp h.pos toward (cx, cz) and y offset for h.root.position.y = 0.58 (inside at radius .42). Set heading to face +X (θ=0).
+- run: legs fast; wheelSpin target 6 + energy factor; energy drains; timer counts down 5..10s; if energy < .1 → exit.
+- phase 'exit': lerp z out to cz+1.3, y back to 0; then setState wander; dizzy wobble for 1s (bodyGroup.rotation.z = sin*0.15).
+
+Wheel center: wheelGroup.position = (3.05, 1.02, -1.45). Wheel radius 1.0. Inside hamster y = 1.02 - 0.46 = 0.56, x = 3.05, z = -1.45.
+
+Wheel bottom edge at y = 0.02 — good (just above floor).
+
+Stand: two boxes from floor to axle at z=±0.55, tilted; plus base rail Box(0.5,0.1,1.6) at y=0.05. Axle cylinder along Z length 1.4 radius .06.
+
+Wheel parts inside `wheelSpin` group (rotates), stand separate.
+
+Wheel rotation.z += spin*dt on the spinning group.
+
+Rungs: 10 boxes Box(0.06, 0.06, 0.72) positioned at angle a: x = cos(a)*0.93, y = sin(a)*0.93, rotation.z = a. Good visual spin.
+
+Running surface: CylinderGeometry(0.98,0.98,0.74,18,1,true) rotated X PI/2 → axis along Z. Material MeshStandardMaterial color 0x7fd8ff, side DoubleSide, transparent .25? Make it semi-transparent light blue plastic so we see hamster from behind. opacity .45, depthWrite false.
+
+Side discs: CircleGeometry(1.0, 18) at z=±0.39 rotation.y = 0 (faces +Z) and z=-0.39 rotation.y=Math.PI, DoubleSide, opacity .3 pink.
+
+Rim torus: TorusGeometry(1.0, 0.07, 6, 22) at z=±0.4 coral.
+
+Bowl pellets: array of meshes added to bowl group; positions random within radius .28, y .16.
+
+Eat: consume nearest pellet from array.
+
+Plops: group children added to scene at floor y=0.03, SphereGeometry(0.055,5,4) color #6b4a2f, scaled (1,0.8,1). Max 16; cleanliness = max(0, 100 - plops*6.5).
+
+Clean: remove all, toast "Cage scrubbed. 5 stars."
+
+Sprites for zzz: canvas texture with 'z' text; SpriteMaterial transparent, depthWrite false. Pool array of {sprite, life}. Spawn at head position + random offset; rise & fade.
+
+Also add a "poof" particle when plop? Skip.
+
+Water bottle drip? skip.
+
+Now DOM updates for roster states: each hamster row element with data-index; update state text when changed (compare lastState). Also flash class.
+
+Hover on roster → highlight ring visible + slight scale (1.08) tween. Click → focus camera & tag.
+
+Tag label shows name + state + energy? Show name + state. Follows projected position.
+
+Also clicking a hamster in 3D sets focus; clicking empty space clears focus.
+
+Buttons:
+- FEED (adds pellets)
+- SPIN WHEEL (+impulse, toast)
+- CLEAN
+- NIGHT/DAY toggle (jump clock)
+- ORBIT (auto-rotate toggle, active state styling)
+- VIEW cycle: OVERVIEW → SIDE → TOP → CLOSE → back.
+
+Keyboard: f,s,c,n,o,r.
+
+Toast queue with funny lines arrays.
+
+Edge cases: clamp hamster count 5. Ensure no NaN in angleLerp: handle wrap.
+
+```js
+function angleLerp(a,b,t){
+  let d = ((b - a + Math.PI) % (Math.PI*2)) - Math.PI;
+  return a + d*t;
+}
+```
+
+Camera views:
+- overview: pos (8.5, 6.2, 10.5), target (0,1,0)
+- side: pos (13, 3.2, 0.5), target (0,1.2,0)
+- top: pos (0.01, 14, 0.02), target (0,0.6,0)
+- close: pos (2.6, 1.6, 3.4), target (0,0.6,0)
+
+Tween: set camFrom = camera.position.clone(), camTo, tgtFrom, tgtTo, tweenT=0, dur=1.1; update with easeInOutCubic; during tween disable controls? Keep enabled but set position/target each frame (user drag conflicts). Disable controls.enabled during tween for cleanliness.
+
+Focus follow: when focus set, controls.target lerps to hamster pos + (0,0.4,0), and camera distance maintained. Works fine with OrbitControls.
+
+Label projection:
+```js
+const v = new THREE.Vector3();
+function updateLabels(){
+  if(!focus){ tag.style.opacity = 0; return }
+  focus.root.getWorldPosition(v); v.y += 0.9;
+  v.project(camera);
+  if (v.z > 1) hide;
+  x = (v.x*0.5+0.5)*w; y = (-v.y*0.5+0.5)*h;
+  tag.style.transform = `translate(${x}px, ${y}px) translate(-50%,-100%)`;
+}
+```
+
+Add a ground disc "table": CircleGeometry(26, 48) rotated -PI/2 at y=-0.85, MeshStandardMaterial color #cfe0d8 (day) → lerp to night; receiveShadow. Plus a few big low-poly props outside the cage for context: a couple of books? Keep it minimal — add two simple potted plants (cone + cylinder) and a lamp at night. A floor lamp with emissive shade at night is charming and lights the scene. Add: lamp at (-7, 0, -4): pole cylinder, shade cone (emissive at night) + point light. Cheap.
+
+Also add a couple of "spotlight" ellipses under cage for grounding — the shadow does it.
+
+CSS grain SVG data URI:
+```
+background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)' opacity='.5'/></svg>");
+```
+
+OK, writing final. Aim for a complete, correct single file.
+
+Details on hamster configs:
+
+```js
+const ROSTER = [
+ {name:'NUGGET',  fur:0xf6d9a6, belly:0xfff3df, kind:'snacker', quip:'hoards sunflower seeds'},
+ {name:'WAFFLES', fur:0xe89a45, belly:0xffe7c6, kind:'athlete', quip:'wheel world record holder'},
+ {name:'MOCHI',   fur:0xf3f0ea, belly:0xffffff, kind:'napper',  quip:'professional pillow'},
+ {name:'BISCUIT', fur:0x9a6b45, belly:0xdcb98f, kind:'explorer',quip:'tunnel engineer'},
+ {name:'CHONK',   fur:0xb9c6d4, belly:0xeef4fa, kind:'philosopher', quip:'questions gravity'},
+];
+```
+Bias behaviors by kind: athlete prefers wheel, napper prefers sleep, snacker prefers eat, explorer wanders/plays, philosopher idles/grooms.
+
+Chonk is bigger (scale 1.25). Cute.
+
+Now write updateHamster fully:
+
+```js
+function updateHamster(h, dt){
+  const p = h.root.position;
+  h.stateT += dt;
+  h.speed = Math.max(0, h.speed - dt*2);
+  const body = h.body;
+  body.rotation.z = 0; body.rotation.x = 0;
+  h.eyes.scale.y = 1; // blink below
+
+  switch(h.state){
+   case 'wander': {
+     const d = walkTo(h, h.tx, h.tz, dt, h.cfg.speed*(0.7+0.5*h.energy));
+     if (d < 0.28 || h.stateT > 9) { h.stateT=0; pickNext(h); }
+     if (Math.random() < dt*0.02) dropPlop(h);
+     break;
+   }
+   case 'idle': {
+     h.head.rotation.x = Math.sin(h.stateT*6)*0.12;
+     h.head.rotation.y = Math.sin(h.stateT*1.3)*0.4;
+     if (h.stateT > h.hold) { h.stateT=0; pickNext(h); }
+     break;
+   }
+   ...
+```
+
+Blink: global blinkTimer per hamster; if t in window → h.eyeL.scale.y = 0.15, eyeR too. Store eyes as a group `eyes` containing both eyes+glints; scale group y.
+
+Sleep pose: h.body.rotation.z = 0.35, position.y = -0.06, eyes scale .12, spawn zzz.
+
+Groom: h.root.rotation.y += dt*4 (spin), head.rotation.z = Math.sin(t*10)*0.3.
+
+Play: target ball; on arrival dist<0.5 → push ball; stateT> 3 → pickNext.
+
+Eat: target bowl + offset (h.feedOffset); head dip; every 1.8s eat pellet.
+
+Wheel as described.
+
+Energy update per state.
+
+Also ensure at most one wheel runner: `wheelRunner`.
+
+For 'wheel' state target = (wheel.x, wheel.z + 1.6) approach; then phase in.
+
+Write the code with h.wphase.
+
+One more consideration: the DOM stat chips + roster + dock must not block canvas pointer events: `.hud` containers get pointer-events:none, interactive children pointer-events:auto.
+
+For the dock buttons I'll include inline SVG icons (small 14px). Keep simple shapes: seed (circle), wheel (circle with spokes), sparkle (star), moon, orbit arrows, camera.
+
+CSS for chunky buttons with `--c` custom prop per button.
+
+Roster row markup generated in JS.
+
+Boot overlay: title + "spinning wheel" loader. Fade out after first render frame + 700ms.
+
+Add a small footer credit line "drag • scroll • click".
+
+Also handle WebGL context creation failure with a message.
+
+Wheel runner position inside wheel — the wheel group is at (3.05,1.02,-1.45) and rotates; the hamster must not rotate with it (it stays at bottom). Set h.root.position directly in world coords: x=3.05, y=0.56, z=-1.45. Since hamster root is child of scene at origin, world = local. Good.
+
+During 'in' phase, wheelSpin should match running; the rungs pass under the hamster. 
+
+Hamster inside wheel facing +X: heading 0. Set h.heading → angleLerp toward 0.
+
+Exit: lerp z from -1.45 to -1.45+1.5 and y 0.56→0. Use simple lerp factor; when |z - target| small → wander.
+
+For the 'in' phase, keep h.pos.x/z fixed at wheel center; legs spin fast.
+
+Also add a "wheel creak" visual: wheel wobbles slightly. Skip.
+
+Obstacles list for steering (x,z,r):
+- wheel stand: (3.05,-1.45) r 0.9
+- bowl: (-3.4,1.9) r 0.5
+- platform legs: (2.7,1.9) r 1.1 → make platform area walkable? Platform occupies x 1.6..3.8, z 1.05..2.75; treat as circle r 1.2 at (2.7,1.9).
+- tunnel: (-1.3,-1.7) r 0.7
+- water bottle is above floor, no obstacle.
+Random target sampling rejects points inside obstacles.
+
+Final bounds for hamsters: x ±3.9, z ±2.6 (inside tray with margin). Tray interior 9.4x6.6 → half 4.7/3.3; margin .8 → 3.9/2.5. Good.
+
+Pellet geometry: CylinderGeometry(0.05,0.05,0.11,6) with colors [0xf2a33c, 0xd96b3f, 0x8fbf5a, 0xe7cf7a].
+
+Plop geometry: SphereGeometry(0.06,5,4).
+
+zzz sprites: create texture once via canvas 64x64, draw 'z' in Bungee? Canvas font "bold 44px sans-serif". Fine.
+
+updateSprites(dt): for each active sprite: life -= dt; sprite.position.y += dt*0.5; material.opacity = life/max; scale grows. Remove when done (return to pool).
+
+Performance: shadow map 2048 with many meshes — ok.
+
+`renderer.shadowMap.autoUpdate = true` default. Bars casting shadows = many; keep bars castShadow true, receiveShadow on floor only. Fine.
+
+Add `scene.fog = new THREE.Fog(color, 18, 46)` subtle.
+
+Background: gradient sky via a large sphere with vertex-color shader? Simpler: scene.background = color lerped; the page CSS behind is hidden. Use fog to soften. Add a big backdrop: cylinder wall (radius 22, height 14, open, BackSide, low-poly color mint) to give a room feel. A soft cyclorama disc + wall reads nicely with fog.
+
+Write it all now. I'll be careful and complete.

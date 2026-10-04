@@ -1,0 +1,507 @@
+Output a complete HTML file that implements a Minecraft clone following the spec. Let's write it carefully.
+
+Key elements:
+- Three.js r128 via script tag.
+- Hash noise, fractal noise, 3D noise.
+- Chunk generation, meshing, player physics, raycasting, hotbar, overlay, clouds, water surface.
+
+Let's write the code carefully.
+
+Noise:
+```js
+function hash2(x,z){ let n = x*374761393 + z*668265263; n = (n ^ (n>>13)) * 1274126177; n = n ^ (n>>16); return (n>>>0)/4294967295; }
+```
+Use Math.imul for safety? Large prime multipliers — JS numbers are fine up to 2^53, but xor shifts convert to 32-bit. Use Math.imul.
+
+```js
+function hash(x, y, z){
+  let n = Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1274126177);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n = n ^ (n >>> 16);
+  return (n >>> 0) / 4294967295;
+}
+```
+
+smoothstep: t*t*(3-2*t). Bilinear value noise 2D:
+```js
+function noise2(x,z){
+  const xi=Math.floor(x), zi=Math.floor(z);
+  const xf=x-xi, zf=z-zi;
+  const u=xf*xf*(3-2*xf), v=zf*zf*(3-2*zf);
+  const a=hash(xi,0,zi), b=hash(xi+1,0,zi), c=hash(xi,0,zi+1), d=hash(xi+1,0,zi+1);
+  return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;
+}
+```
+fractal2: 4 octaves, amplitude 0.5, frequency 2, normalize by 0.9375.
+
+noise3 similarly trilinear. fractal3: probably 2-3 octaves. Cave: 3D noise at position*0.09 — the spec says "3D noise at position*0.09 exceeds 0.67". Use fractal3 or plain noise3? Spec: "plus a 3D version for caves". Use fractal3 with fewer octaves, or just noise3. Use fractal3 with 3 octaves? Threshold 0.67. Plain noise3*... noise3's value is 0-1, threshold 0.67 gives sparse caves. Use fractal3 with 3 octaves normalized. Either works.
+
+Terrain height: m = fractal2(x*0.004, z*0.004), h = fractal2(x*0.02, z*0.02), H = floor(5 + m*m*58 + h*10).
+
+Column filling:
+- y=0: stone (unbreakable)
+- y < H-3: stone
+- 3 layers below surface (y from H-3 to H-1): dirt (sand if H<=16, stone if H>=37)
+- Surface y=H: snow if H>=46, stone if H>=37, sand if H<=16, otherwise grass
+- Above that is air.
+
+Wait, "3 layers below surface are dirt (sand if H ≤ 16, stone if H ≥ 37)". So subsurface = sand if H<=16, stone if H>=37, otherwise dirt.
+
+Caves: y from 3 to H-2: if fractal3(x*0.09, y*0.09, z*0.09) > 0.67 → air. But keep y=0 as stone.
+
+Trees: on grass surface, hash < 0.02 per column, trunk fits within chunk (i.e., lx between 2 and 13 so leaves fit? Leaves are 5x5 so need lx 2..13, ly H+1..H+4 wood, leaves). Tree: 4 wood blocks up (y=H+1..H+4), leaves: 5x5 layers twice (y=H+5? Actually typically: 5x5 at y=H+3 and H+4? Spec: "4 wood blocks up, leaves as 5x5 layers twice, then 3x3, then 1 on top"). So leaves at y=H+5 and H+6 (5x5), y=H+7 (3x3), y=H+8 (1 block). Hmm, but leaves start after the trunk? Trunk is H+1..H+4. Leaves 5x5 at H+5, H+6? That would float above the trunk. Actually leaves should overlap the trunk: probably 5x5 at H+3 and H+4 (around the trunk), 3x3 at H+5, 1 at H+6. But the spec says "4 wood blocks up, leaves as 5x5 layers twice, then 3x3, then 1 on top (only into air)". Place leaves at y=H+5, H+6 (5x5), H+7 (3x3), H+8 (single). Trunk top is H+4, leaves sit on top. Fine. Actually to connect, put 5x5 at H+3, H+4? "Only into air" means leaves don't replace wood. Either works. Let's do: leaves at levels H+3 and H+4 as 5x5 (skip center where wood is — only into air handles it), H+5 as 3x3, H+6 as single. Hmm, but "4 wood blocks up, then leaves" — ambiguous. Let's do: trunk y=H+1..H+4; leaves: 5x5 at H+5 and H+6? That leaves a gap? No — leaves at H+5 sit directly on top of trunk top H+4. Looks like a lollipop. Fine.
+
+Actually, to make it look better: 5x5 at H+3, H+4 (around trunk), 3x3 at H+5, 1 at H+6. Trunk visible through? Only into air, so trunk stays. Let's do that — canopy around trunk top. Either works.
+
+Tree generation issue: trees cross chunk boundaries. Spec says "trunk fits within chunk" — so only generate trees where lx is 2..13, lz is 2..13, so 5x5 leaves fit within the chunk. But leaves are written into the chunk being generated — since 5x5 fits, all within this chunk. Good. But when generating a chunk, neighboring columns near the edge might have trees that extend into this chunk — spec ignores that (trunk fits within chunk constraint means trees near chunk edges just don't spawn). Fine.
+
+But wait: tree placement must be deterministic per column, and when generating a chunk, we check the hash of each column within the chunk. Since trunk is constrained to lx 2..13, leaves stay within the chunk. Good.
+
+Chunk data: Map key "cx,cz" → {data: Uint8Array(16*80*16), mesh: null}. Index: (y*16 + z)*16 + x or x + z*16 + y*256.
+
+getBlock(x,y,z): if y<0 or y>=80 return 0; chunk lookup; if missing return 0; return data.
+
+setBlock similarly.
+
+generateChunk(cx,cz): fill data.
+
+Meshing: buildMesh(cx,cz): iterate lx,ly,lz; world coords wx=cx*16+lx etc. For each of 6 faces, neighbor = getBlock(wx+dx, wy+dy, wz+dz); if 0, add face. Face brightness: top 1.0, bottom 0.55, sides 0.8.
+
+Block colors: {1:0x4caf50, 2:0x795548, 3:0x9e9e9e, 4:0xe7d9a8, 5:0x8d6e63, 6:0x2e7d32, 7:0xffffff}.
+
+Face vertex data: define per-face vertex arrays for a unit cube at (x,y,z) spanning [x,x+1] etc.
+
+Face definitions (positions relative):
++X (right, n=(1,0,0)): vertices (1,0,0),(1,1,0),(1,1,1),(1,0,1) — need consistent winding (outward CCW when viewed from outside). Let's use a standard table:
+
+faces = [
+ {n:[1,0,0], v:[[1,1,1],[1,0,1],[1,1,0],[1,0,0]]}?
+
+Let me define each face with 4 corners and triangles [0,1,2, 2,1,3].
+
+Standard cube faces (outward):
++X: (1,0,0),(1,1,0),(1,1,1),(1,0,1) — triangles (0,1,2),(0,2,3). Check normal: v0=(1,0,0), v1=(1,1,0), v2=(1,1,1). e1=(0,1,0), e2=(0,1,1)... cross(e1,v2-v0=(0,1,1)) = (1*1-0*1, 0*0-0*1, 0*1-1*0) = (1,0,0). Good, outward.
+
+-X: (0,0,1),(0,1,1),(0,1,0),(0,0,0). e1=(0,1,0), e2=(0,1,-1)... v2-v0=(0,1,-1). cross((0,1,0),(0,1,-1)) = (1*(-1)-0*1, 0*0-0*(-1), 0*1-1*0)=(-1,0,0). Good.
+
++Y: (0,1,1),(1,1,1),(1,1,0),(0,1,0)? v0=(0,1,1), v1=(1,1,1), v2=(1,1,0). e1=(1,0,0), e2=(1,0,-1). cross = (0*(-1)-0*0, 0*1-1*(-1), 0) = (0,1,0). Good.
+
+-Y: (0,0,0),(1,0,0),(1,0,1),(0,0,1). e1=(1,0,0), e2=(1,0,1). cross=(0*1-0*0, 0*1-1*1, 0)=(0,-1,0). Good.
+
++Z: (0,0,1),(1,0,1),(1,1,1),(0,1,1). e1=(1,0,0), e2=(1,1,0). cross=(0*0-0*1, 0*1-1*0, 1*1-0*1)=(0,0,1). Good.
+
+-Z: (1,0,0),(0,0,0),(0,1,0),(1,1,0). e1=(-1,0,0), e2=(-1,1,0). cross=(0*0-0*1, 0*(-1)-(-1)*0, -1*1-0)= (0,0,-1). Good.
+
+Triangles: indices 0,1,2 and 0,2,3.
+
+Push positions with world offset, normals = face normal, colors = block color * brightness.
+
+Material: MeshLambertMaterial with vertexColors: true. In r128: `new THREE.MeshLambertMaterial({vertexColors: true})`.
+
+Geometry: BufferGeometry with setAttribute position/normal/color as Float32BufferAttribute.
+
+Meshes stored in a global array `meshList` for raycasting; rebuild function removes old mesh, disposes geometry, removes from array, rebuilds.
+
+Per-frame update loop:
+- Player chunk pcx, pcz.
+- Generation: iterate chunks within 5 (Chebyshev distance? "within 5 chunks" — use ring iteration sorted by distance, or just nested loop; generate up to 4 per frame). Collect needed list sorted by distance, generate up to 4 missing.
+- Meshing: chunks within 4 where all 4 neighbors have data, build up to 2.
+- Unload: chunks with Chebyshev distance > 7: remove mesh, dispose, delete.
+
+Player physics:
+pos = feet position (x, y, z), y is feet. Half-width 0.3, height 1.8, eye 1.62.
+
+Collision: after moving along an axis, check overlap with solid blocks: iterate blocks in AABB [x-0.3, x+0.3] × [y, y+1.8] × [z-0.3, z+0.3], if any non-air → revert that axis; if axis is Y and moving down → onGround = true, vy=0.
+
+Standard approach:
+```js
+function collide(){
+  const minX=Math.floor(pos.x-0.3), maxX=Math.floor(pos.x+0.3);
+  const minY=Math.floor(pos.y), maxY=Math.floor(pos.y+1.8);
+  ...
+  for each block if getBlock solid return true;
+}
+```
+Move per axis: pos.x += vx*dt; if collides → pos.x -= vx*dt. Same for z. Y: pos.y += vy*dt; if collides: if vy<0 { onGround=true } revert, vy=0.
+
+Gravity: vy -= 25*dt, clamp. Jump: if onGround and Space → vy=8.5, onGround=false.
+
+Movement: WASD relative to yaw. Forward = (−sin(yaw), −cos(yaw))? Camera with YXZ order, yaw around Y axis. Camera looks down -Z when yaw=0. Forward vector = (-sin(yaw), 0, -cos(yaw))? Actually rotating (0,0,-1) around Y by yaw: (−sin yaw·? ) Rotation around Y by angle θ: x' = x cosθ + z sinθ, z' = −x sinθ + z cosθ. Applied to (0,0,−1): x' = −sinθ, z' = −cosθ. So forward = (−sin yaw, −cos yaw). Right = (cos yaw, −sin yaw).
+
+Spawn: x=8, z=8, y = find surface: scan from top for first solid at column (8,8), y = H+1. Or just y=60 and fall. Better: scan y from 79 down for first non-air, spawn y = that+1.
+
+Raycast: use THREE.Raycaster against meshList, far 6. Raycaster with camera direction. Only when locked.
+
+Break: target = floor(p − n*0.5) componentwise. p is hit point, n is face normal (world). If hit block face, p − n*0.5 lands inside the block. floor gives block coords. setBlock to air if y>0.
+
+Place: cell = floor(p + n*0.5). Check getBlock is air and doesn't overlap player AABB. Player AABB: x±0.3, y..y+1.8, z±0.3. Block AABB: [bx,bx+1] etc. Overlap check with strict inequalities.
+
+Rebuild chunk of edited block, and neighbor chunk if lx==0, lx==15, lz==0, lz==15.
+
+Outline: THREE.LineSegments with EdgesGeometry(BoxGeometry(1.001)) black, positioned at target center.
+
+Pointer lock: overlay click → canvas.requestPointerLock. On mousemove when locked: yaw -= e.movementX*0.002; pitch -= e.movementY*0.002; clamp pitch to ±(π/2−0.01). camera.rotation.set(pitch, yaw, 0), order 'YXZ'.
+
+Mousedown: if not locked return. button 0 break, button 2 place. Suppress contextmenu.
+
+Wheel: selected = (selected + sign(deltaY) + 7) % 7.
+
+Keys 1-7.
+
+Clouds: 25 white transparent boxes at y~90, drift in x, wrap around player: if cloud.x > player.x + 300 → cloud.x -= 600 etc. Material white, transparent, opacity 0.7, MeshBasicMaterial? Lambert is fine too. Use MeshLambertMaterial({color:0xffffff, transparent:true, opacity:0.75}).
+
+Water: PlaneGeometry(1000,1000) rotated -π/2, y=14.3, color 0x3d7fe0? "translucent blue" — 0x3388cc, opacity 0.55. Re-center on player each frame (x,z).
+
+Fog: new THREE.Fog(0x87ceeb, 40, 110). Background same.
+
+Lights: AmbientLight(0xffffff, 0.65), DirectionalLight(0xffffff, 0.8) position (0.5, 1, 0.3) normalized * something.
+
+Note: vertex colors + Lambert + lights: final color = color * light. Fine.
+
+Hotbar HTML: div#hotbar with 7 .slot divs, background color, number label. Update .sel class.
+
+Overlay: div#overlay with title, controls, "Click to play". pointerlockchange: if locked hide overlay, else show.
+
+Resize handler.
+
+Frame loop: requestAnimationFrame, dt clamped to 0.05.
+
+Order of operations in loop: physics, camera update, chunk update, raycast/outline, clouds, water re-centering, render.
+
+Chunk update details:
+
+```js
+function updateChunks(){
+  const pcx = Math.floor(pos.x/16), pcz = Math.floor(pos.z/16);
+  // generation queue
+  let genCount = 0;
+  // iterate by ring distance for priority
+  outer:
+  for(let r=0;r<=5;r++){
+    for(let dx=-r;dx<=r;dx++) for(let dz=-r;dz<=r;dz++){
+      if(Math.max(Math.abs(dx),Math.abs(dz))!==r) continue;
+      const cx=pcx+dx, cz=pcz+dz;
+      if(!chunks.has(key(cx,cz))){
+        genCount++;
+        if(genCount>4) break outer; // hmm, this stops after 4 but breaks out
+        genChunk(cx,cz);
+      }
+    }
+  }
+```
+Better: generate up to 4 per frame: counter, break when 4 generated.
+
+Meshing: chunks within 4 where all 4 neighbors have data and no mesh: build up to 2. Iterate r 0..4 rings similarly.
+
+Unload: iterate chunks map; Chebyshev distance > 7 → remove.
+
+Mesh build condition: chunk has data, no mesh, 4 neighbors have data. Note: neighbors are also within 5 of player? If chunk is within 4, neighbors are within 5, so they'll be generated eventually. Good.
+
+Edge case: meshList for raycasting — include only chunk meshes.
+
+Rebuild function:
+```js
+function rebuild(cx,cz){
+  const c = chunks.get(key(cx,cz));
+  if(!c || !c.data) return;
+  if(c.mesh){ scene.remove(c.mesh); c.mesh.geometry.dispose(); meshList.splice(meshList.indexOf(c.mesh),1); c.mesh=null; }
+  if(neighborsReady(cx,cz)) c.mesh = buildMesh(cx,cz);
+}
+```
+buildMesh adds mesh to scene and meshList.
+
+getBlock for meshing uses world coords — fine.
+
+Tree generation: during genChunk, after filling column, check: if surface block is grass (H between 17 and 36, not sand/stone/snow — grass condition: H<37 && H>16 && H<46 → grass). Check hash(x, 777, z) < 0.02. Trunk fits: lx>=2 && lx<=13 && lz>=2 && lz<=13. Also H+8 < 80.
+
+Write leaves only into air: check data at local coords (all within chunk due to margin).
+
+Cave noise: use fractal3? Spec: "3D version for caves" — noise3. Threshold 0.67. Use fractal3 with 2 octaves? Let's do: caveNoise = fractal3(x*0.09, y*0.09, z*0.09) with 3 octaves normalized. Hmm, fractal smooths values toward 0.5, threshold 0.67 gives decent caves. Plain noise3 at 0.09 scale is blocky per cell ~11 blocks. fractal3 with octaves at 0.09 and 0.18 is fine. Let's do fractal3 with 3 octaves starting at given frequency... but spec says "3D noise at position*0.09 exceeds 0.67". Let's do fractal3(x*0.09,y*0.09,z*0.09) with 3 octaves (freq 1,2,4, amp .5,.25,.125 /0.875). OK.
+
+Performance: genChunk is 16*80*16 = 20480 columns... 16*16=256 columns × 80 y. Each y does fractal3 call for caves — fractal3 = 3 noise3 calls = 24 hash calls each. 20480 * ~72 hashes = 1.5M ops per chunk, 4 chunks/frame = 6M. Might be a bit slow but OK in JS. Could optimize by only computing caves when y < H-1 and y>=3. Fine.
+
+Meshing: 20480 blocks × 6 neighbor getBlock calls (each with Map lookup + string key). String key creation is slow but tolerable. Optimization: inline neighbor check — if local neighbor is in chunk, use data directly; else getBlock. Let's write a per-chunk fast getter:
+
+```js
+function makeGetter(cx,cz){
+  const d = chunks.get(key(cx,cz)).data;
+  return (x,y,z)=>{ // world coords
+    if(y<0||y>=80) return 0;
+    const lx=x-(cx*16), lz=z-(cz*16);
+    if(lx>=0&&lx<16&&lz>=0&&lz<16) return d[lx + lz*16 + y*256];
+    return getBlock(x,y,z);
+  };
+}
+```
+Good.
+
+Index: idx = x + z*16 + y*256. Size 16*16*80 = 20480.
+
+genChunk:
+```js
+function genChunk(cx,cz){
+  const data = new Uint8Array(20480);
+  for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++){
+    const wx=cx*16+lx, wz=cz*16+lz;
+    const m = fractal2(wx*0.004, wz*0.004);
+    const h = fractal2(wx*0.02, wz*0.02);
+    const H = Math.floor(5 + m*m*58 + h*10);
+    let sub = 2, surf = 1;
+    if(H<=16){ sub=4; surf=4; }
+    else if(H>=37){ sub=3; surf = H>=46?7:3; }
+    for(let y=0;y<=H && y<80;y++){
+      let b;
+      if(y===H) b=surf;
+      else if(y>=H-2) b = (y>=0)?sub:3; // 3 layers below surface: y=H-1,H-2,H-3
+      else b=3;
+      ...
+    }
+  }
+}
+```
+Wait, "3 layers below surface": surface is y=H; layers below are H-1, H-2, H-3. "Below H−3 is stone". So y in [H-3, H-1] → sub. y < H-3 → stone. y=H → surface. y=0 → stone (unbreakable, but stored as stone; break code checks y>0).
+
+```js
+for(let y=0;y<=H;y++){
+  let b;
+  if(y===0) b=3;
+  else if(y===H) b=surf;
+  else if(y>=H-3) b=sub;
+  else b=3;
+  // caves
+  if(y>=3 && y<=H-2 && fractal3(wx*0.09, y*0.09, wz*0.09) > 0.67) b=0;
+  data[lx + lz*16 + y*256] = b;
+}
+```
+Note: if H < 4, the y>=H-3 range includes y=1,2 — sub applies, fine.
+
+Trees: after column fill, if surf===1 (grass) and hash(wx, 999, wz) < 0.02 and lx>=2&&lx<=13&&lz>=2&&lz<=13 and H+8<80:
+```js
+for(let i=1;i<=4;i++) data[idx(lx,lz,H+i)]=5;
+for(let dy=3;dy<=4;dy++) for(let ox=-2;ox<=2;ox++) for(let oz=-2;oz<=2;oz++){
+  const t=idx(lx+ox,lz+oz,H+dy); if(data[t]===0) data[t]=6;
+}
+for(let ox=-1;ox<=1;ox++)for(let oz=-1;oz<=1;oz++){const t=idx(lx+ox,lz+oz,H+5); if(data[t]===0)data[t]=6;}
+const t=idx(lx,lz,H+6); if(data[t]===0)data[t]=6;
+```
+Wait, trunk is H+1..H+4, leaves at H+3,H+4 (5x5), H+5 (3x3), H+6 (single). "4 wood blocks up, leaves as 5x5 layers twice, then 3x3, then 1 on top". OK.
+
+But surf===1 requires H>16 and H<37 (grass). Also caves might have carved out H? Caves only affect y<=H-2, so surface stays. But if a cave carved out under the tree... fine.
+
+Also tree trunk base: surface is grass at H, trunk starts at H+1. Good.
+
+buildMesh:
+```js
+function buildMesh(cx,cz){
+  const c = chunks.get(key(cx,cz));
+  const get = makeGetter(cx,cz);
+  const positions=[], normals=[], colors=[];
+  for(let y=0;y<80;y++)for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++){
+    const b = c.data[lx+lz*16+y*256];
+    if(!b) continue;
+    const wx=cx*16+lx, wz=cz*16+lz;
+    const col = COLORS[b];
+    const r=((col>>16)&255)/255, g=((col>>8)&255)/255, bl=(col&255)/255;
+    for(let f=0;f<6;f++){
+      const face=FACES[f];
+      if(get(wx+face.n[0], y+face.n[1], wz+face.n[2])) continue;
+      const bright = face.b;
+      for(let i=0;i<4;i++){
+        const v=face.v[i];
+        positions.push(wx+v[0], y+v[1], wz+v[2]);
+        normals.push(face.n[0],face.n[1],face.n[2]);
+        colors.push(r*bright,g*bright,bl*bright);
+      }
+      // triangles 0,1,2,0,2,3 — but we're pushing non-indexed; need to push in triangle order
+    }
+  }
+}
+```
+Non-indexed: push vertices in order [0,1,2] then [0,2,3]. So define face.v as 6-vertex array (two triangles) directly. Let's define each face with 6 vertices:
+
++X: (1,0,0),(1,1,0),(1,1,1), (1,0,0),(1,1,1),(1,0,1)
+-X: (0,0,1),(0,1,1),(0,1,0), (0,0,1),(0,1,0),(0,0,0)
++Y: (0,1,1),(1,1,1),(1,1,0), (0,1,1),(1,1,0),(0,1,0)
+-Y: (0,0,0),(1,0,0),(1,0,1), (0,0,0),(1,0,1),(0,0,1)
++Z: (0,0,1),(1,0,1),(1,1,1), (0,0,1),(1,1,1),(0,1,1)
+-Z: (1,0,0),(0,0,0),(0,1,0), (1,0,0),(0,1,0),(1,1,0)
+
+Brightness: +Y 1.0, sides 0.8, -Y 0.55.
+
+Use plain arrays then Float32Array. Geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3)) etc.
+
+Mesh: new THREE.Mesh(geo, mat); scene.add(mesh); meshList.push(mesh).
+
+Raycast: raycaster.setFromCamera({x:0,y:0}, camera) — in r128 setFromCamera takes a Vector2. Use a reused THREE.Vector2(0,0). raycaster.far=6. intersectObjects(meshList). First hit.
+
+Note: raycasting against many chunk meshes each frame — fine.
+
+Outline: LineSegments(EdgesGeometry(BoxGeometry(1.002,1.002,1.002)), LineBasicMaterial({color:0x000000})). Set visible false when no target.
+
+Break/place use hit.point and hit.face.normal. Note: face normal is in object space; mesh is at origin with no rotation, so object space == world space. Good.
+
+Physics details:
+
+```js
+function collides(){
+  const x0=Math.floor(pos.x-0.3), x1=Math.floor(pos.x+0.3);
+  const y0=Math.floor(pos.y), y1=Math.floor(pos.y+1.79);
+  const z0=Math.floor(pos.z-0.3), z1=Math.floor(pos.z+0.3);
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++)for(let z=z0;z<=z1;z++)
+    if(getBlock(x,y,z)) return true;
+  return false;
+}
+```
+y1: pos.y+1.8 is top; floor(pos.y+1.8) — if exactly on boundary, block above counts; use +1.799 to avoid sticking. Use pos.y+1.79.
+
+Movement:
+```js
+let vx=0, vz=0;
+const speed=5.5;
+const fx=-Math.sin(yaw), fz=-Math.cos(yaw);
+const rx=Math.cos(yaw), rz=-Math.sin(yaw);
+let mf=0, ms=0;
+if(keys['KeyW'])mf++; if(keys['KeyS'])mf--; if(keys['KeyD'])ms++; if(keys['KeyA'])ms--;
+pos.x += (fx*mf+rx*ms)*speed*dt; if(collides()) pos.x -= ...
+```
+Normalize diagonal? mf, ms each ±1; diagonal is faster. Normalize: len=Math.hypot(mf,ms); if len>0 divide. Let's do that.
+
+Y: vy -= 25*dt; pos.y += vy*dt; if(collides()){ pos.y -= vy*dt; if(vy<0) onGround=true; vy=0; }
+
+Jump: if space && onGround: vy=8.5; onGround=false.
+
+Falling below -20: reset pos to spawn, vy=0.
+
+Spawn: find ground at (8,8): scan y from 79 down for first solid, y = that+1. If none, y=60.
+
+Camera position: pos.x, pos.y+1.62, pos.z.
+
+Clouds: create 25 boxes: size random-ish — but no Math.random? "Terrain (deterministic, no Math.random)" — that constraint is for terrain. Clouds can use Math.random. Use Math.random for cloud placement. Fine.
+
+Cloud drift: cloud.position.x += dt*1.5; wrap: if(cloud.x - pos.x > 400) cloud.x -= 800; if < -400 += 800. Same for z.
+
+Water plane: PlaneGeometry(1200,1200), rotateX(-Math.PI/2), MeshLambertMaterial({color:0x4488ff, transparent:true, opacity:0.55}). Position (pos.x, 14.3, pos.z). depthWrite false maybe to avoid artifacts. Keep simple.
+
+Hotbar colors: [0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff] → block IDs 1..7.
+
+Place: selectedBlock = sel+1.
+
+Overlay controls list text.
+
+Pointer lock change: document.addEventListener('pointerlockchange', ...) — locked = document.pointerLockElement === canvas (or body). Show/hide overlay.
+
+Click on overlay: canvas.requestPointerLock(). Overlay click handler.
+
+Mousedown on document: if(!locked) return; e.button===0 break; e.button===2 place.
+
+Wheel on window: if locked, change selection.
+
+Keydown: track keys; digits via e.code 'Digit1'..; Space jump (set jump flag or check keys).
+
+Prevent contextmenu: document.addEventListener('contextmenu', e=>e.preventDefault()).
+
+Unload loop: iterate chunks Map; distance = max(|cx-pcx|,|cz-pcz|) > 7 → if mesh remove; chunks.delete.
+
+Also generation priority: generate nearest first (rings from r=0). Meshing also rings.
+
+One concern: meshing requires 4 neighbors to have data. Neighbor chunks at r+1 from player; chunks at r=4 need neighbors at r=5 — generated within 5. Good.
+
+Also when a chunk is generated later, meshing happens in subsequent frames. Fine.
+
+Rebuild on edit: rebuild(cx,cz) and neighbors if border. rebuild should only rebuild mesh if neighbors ready; if neighbor data missing (unlikely near player), skip.
+
+Also after setBlock to air at chunk edge, neighbor mesh rebuild needed to show faces. Handled.
+
+Break at y===0 not allowed.
+
+Place overlap check:
+```js
+function overlapsPlayer(bx,by,bz){
+  return bx+1 > pos.x-0.3 && bx < pos.x+0.3 &&
+         by+1 > pos.y && by < pos.y+1.8 &&
+         bz+1 > pos.z-0.3 && bz < pos.z+0.3;
+}
+```
+
+Also don't place inside existing block (check getBlock===0).
+
+Now let's write the HTML/CSS.
+
+CSS: body margin 0, overflow hidden. canvas block. #overlay fixed fullscreen, rgba dark, flex center, z-index 10. #crosshair: two bars or a "+" text. Use ::before/::after or two divs. Simple: #crosshair fixed, left 50% top 50%, width 2px height 20px translate(-50%,-50%) white background, plus horizontal. Use two child divs.
+
+Hotbar: fixed bottom 10px, left 50%, transform translateX(-50%), display flex, gap 4px, background rgba(0,0,0,0.5), padding 6px, border-radius 6px. Slots: 44px squares, border 2px solid #555, .sel border-color white. Number in corner.
+
+Now let's write the whole file. Also handle dt: performance.now.
+
+Also initial: generate spawn area before start? Game loop handles it progressively; player might fall through ungenerated chunks. To avoid: spawn player on ground — but ground data may not exist yet. Physics: if no chunk under player, getBlock returns 0 → falls. Mitigation: synchronously generate chunks around spawn (r<=2) before starting loop, and find spawn y from data. Also in physics, if block below feet is air because chunk missing... Simpler: pre-generate r<=2 chunks and mesh r<=1 at start. Also freeze physics until player chunk exists? Let's add: in update, if !chunks.has(playerChunkKey) skip gravity (hover). Actually simpler: pre-generate enough and rely on generation speed (4/frame) — player moves slower than generation. Add safety: if chunk under player missing, don't apply gravity. Let's add that.
+
+Spawn y: after pre-gen, scan y 79..0 for getBlock(8,y,8) solid → pos.y = y+1.
+
+Also water surface is visual only — player can walk on underwater terrain; can swim? Not needed.
+
+Edge: raycaster.far = 6.
+
+Let's write the code.
+
+Also `fractal2`:
+```js
+function fractal2(x,z){
+  let f=1,a=0.5,sum=0,norm=0;
+  for(let o=0;o<4;o++){ sum+=noise2(x*f,z*f)*a; norm+=a; f*=2; a*=0.5; }
+  return sum/norm;
+}
+```
+noise2 uses hash(xi,0,zi). fractal3 similarly with noise3.
+
+hash(x,y,z) with Math.imul as above.
+
+noise3: trilinear.
+
+```js
+function noise3(x,y,z){
+  const xi=Math.floor(x),yi=Math.floor(y),zi=Math.floor(z);
+  const xf=x-xi,yf=y-yi,zf=z-zi;
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf),w=zf*zf*(3-2*zf);
+  function h(a,b,c){return hash(xi+a,yi+b,zi+c);}
+  const c000=h(0,0,0),c100=h(1,0,0),c010=h(0,1,0),c110=h(1,1,0),c001=h(0,0,1),c101=h(1,0,1),c011=h(0,1,1),c111=h(1,1,1);
+  const x00=c000+(c100-c000)*u, x10=c010+(c110-c010)*u, x01=c001+(c101-c001)*u, x11=c011+(c111-c011)*u;
+  const y0=x00+(x10-x00)*v, y1=x01+(x11-x01)*v;
+  return y0+(y1-y0)*w;
+}
+```
+
+OK. Now let's assemble the file. Also handle wheel selection wrap: sel = (sel + (e.deltaY>0?1:6)) % 7.
+
+Update hotbar UI function.
+
+Keys: use e.code. Space: e.code==='Space'.
+
+Jump handling: in physics, if keys.Space && onGround → jump.
+
+Prevent scroll: preventDefault on wheel? Pointer is locked anyway.
+
+Let me write it all out. Also handle wheel selection wrap: sel = (sel + (e.deltaY>0?1:6)) % 7.
+
+Update hotbar UI function.
+
+Keys: use e.code. Space: e.code==='Space'.
+
+Jump handling: in physics, if keys.Space && onGround → jump.
+
+Prevent scroll: preventDefault on wheel? Pointer is locked anyway.
+
+Let me write it all out. Estimated ~450 lines.
+
+One more check: `new THREE.Fog(0x87ceeb, 40, 110)` and scene.background = new THREE.Color(0x87ceeb).
+
+Clouds at y ~90 — above fog far 110? Distance from player to clouds ~75 vertical + horizontal; fog fades them. Fine, spec says so.
+
+MeshLambertMaterial with vertexColors in r128: `vertexColors: true` works (boolean since r122+).
+
+Raycaster against BufferGeometry with many meshes — OK.
+
+Also make sure to suppress contextmenu.
+
+Also when pointer lock is lost, keys should be cleared.
+
+Let's write the final answer.

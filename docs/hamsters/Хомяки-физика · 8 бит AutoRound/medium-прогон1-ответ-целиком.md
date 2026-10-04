@@ -1,0 +1,678 @@
+
+
+# Клетка с хомяками — честная физика
+
+Готовый одностраничный файл. Все требования по физике соблюдены: колесо крутит только бегун (`ω = v/R`, расхождение ~0%), пустое колесо гаснет трением, радиус колеса вычислен от габаритов зверя, труба полая с входом только через торцы, у предметов тела столкновений, фаза лап от пройденного пути, вход/выход из колеса — плавным перемещением.
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Клетка с хомяками — честная физика</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#2b3038;font-family:Consolas,Menlo,monospace;}
+  canvas{display:block;}
+  .panel{position:fixed;background:rgba(20,24,30,.82);color:#e8ecf1;border:1px solid #4a5568;
+         border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.55;backdrop-filter:blur(3px);}
+  #states{top:12px;left:12px;min-width:250px;}
+  #states h3,#wheelDebug h3{margin:0 0 6px 0;font-size:14px;color:#ffd9a0;}
+  #states ul{list-style:none;margin:0;padding:0;}
+  #wheelDebug{top:12px;right:12px;}
+  #wheelDebug .ok{color:#8ce99a;} #wheelDebug .warn{color:#ff8787;}
+  #hint{bottom:12px;left:50%;transform:translateX(-50%);font-size:12px;color:#aab4c0;}
+</style>
+</head>
+<body>
+<div class="panel" id="states"><h3>Хомяки — кто чем занят</h3><ul id="stateList"></ul></div>
+<div class="panel" id="wheelDebug"><h3>Проверка колеса</h3><div id="wheelNums"></div></div>
+<div class="panel" id="hint">Клик по хомяку — подпрыгнет · ЛКМ — орбита · колесо — зум</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+'use strict';
+/* =====================================================================
+   ЧАСТЬ 1. ГАБАРИТЫ: размер колеса вычисляется ОТ размера хомяка
+   ===================================================================== */
+const ANIMAL_LENGTH = 0.5;   // длина зверя (константа проверки)
+const ANIMAL_HEIGHT = 0.35;  // высота зверя (константа проверки)
+const ANIMAL_WIDTH  = 0.3;   // ширина зверя
+
+const WHEEL_R      = Math.max(ANIMAL_LENGTH, ANIMAL_HEIGHT) * 1.6; // 0.8 — зверь целиком внутри с запасом
+const WHEEL_AXLE_W = Math.max(ANIMAL_LENGTH, ANIMAL_WIDTH) * 1.4;  // 0.7 — шире боков зверя (0.3)
+if (!(ANIMAL_HEIGHT < WHEEL_R - 0.1 && WHEEL_AXLE_W > ANIMAL_WIDTH + 0.1))
+  throw new Error('Колесо не соответствует габаритам хомяка');
+
+const STEP_LEN = 0.12; // длина одного шага (для фазы лап)
+
+/* Габариты сцены */
+const TABLE_TOP = 1.0, TRAY_H = 0.1, BED_H = 0.08;
+const FLOOR_Y   = TABLE_TOP + TRAY_H + BED_H;          // 1.18 — уровень подстилки
+const CAGE_W = 8, CAGE_D = 4.6, BAR_H = 1.5;
+
+/* Предметы — объекты с понятными полями (доступны снаружи) */
+const WHEEL = { x:-2.6, z:0.2, cy:FLOOR_Y + WHEEL_R + 0.15, R:WHEEL_R,
+                angle:0, omega:0, owner:null, friction:1.6 };
+const TUBE  = { cx:1.4, cz:-1.1, r:0.32, halfLen:1.4, cy:FLOOR_Y + 0.32, owner:null };
+const BOWL  = { x:2.7, z:1.4, r:0.4, owner:null };
+
+/* =====================================================================
+   СЦЕНА, КАМЕРА, СВЕТ, ТЕНИ
+   ===================================================================== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x39404d);
+scene.fog = new THREE.Fog(0x39404d, 18, 34);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(6.5, 4.6, 7.5);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.7, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.minDistance = 3; controls.maxDistance = 20;
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x556070, 0.55);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xfff1de, 0.95);
+dir.position.set(5, 9, 4);
+dir.castShadow = true;
+dir.shadow.mapSize.set(2048, 2048);
+dir.shadow.camera.left = -7; dir.shadow.camera.right = 7;
+dir.shadow.camera.top = 8;   dir.shadow.camera.bottom = -3;
+dir.shadow.camera.near = 1;  dir.shadow.camera.far = 25;
+scene.add(dir);
+
+/* =====================================================================
+   КОМНАТА И СТОЛ (сцена не висит в пустоте)
+   ===================================================================== */
+{
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(30,30),
+    new THREE.MeshStandardMaterial({color:0x8a8f98, roughness:0.95}));
+  floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+  const wallMat = new THREE.MeshStandardMaterial({color:0x6d7684, roughness:0.9});
+  const w1 = new THREE.Mesh(new THREE.PlaneGeometry(30,8), wallMat);
+  w1.position.set(0,4,-6.5); w1.receiveShadow = true; scene.add(w1);
+  const w2 = new THREE.Mesh(new THREE.PlaneGeometry(30,8), wallMat);
+  w2.rotation.y = Math.PI/2; w2.position.set(-8,4,0); w2.receiveShadow = true; scene.add(w2);
+  /* стол */
+  const wood = new THREE.MeshStandardMaterial({color:0x8b5a2b, roughness:0.8});
+  const top = new THREE.Mesh(new THREE.BoxGeometry(9,0.12,5.6), wood);
+  top.position.y = TABLE_TOP - 0.06; top.castShadow = top.receiveShadow = true; scene.add(top);
+  [[-4.2,-2.5],[4.2,-2.5],[-4.2,2.5],[4.2,2.5]].forEach(p=>{
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.16,TABLE_TOP-0.06,0.16), wood);
+    leg.position.set(p[0],(TABLE_TOP-0.06)/2,p[1]); leg.castShadow = true; scene.add(leg);
+  });
+}
+
+/* =====================================================================
+   КЛЕТКА: поддон, подстилка, стружка (InstancedMesh), прутья, рамки
+   ===================================================================== */
+{
+  const tray = new THREE.Mesh(new THREE.BoxGeometry(CAGE_W,TRAY_H,CAGE_D),
+    new THREE.MeshStandardMaterial({color:0x546e7a, roughness:0.7}));
+  tray.position.y = FLOOR_Y - BED_H - TRAY_H/2;
+  tray.castShadow = tray.receiveShadow = true; scene.add(tray);
+
+  const bed = new THREE.Mesh(new THREE.BoxGeometry(CAGE_W-0.3,BED_H,CAGE_D-0.3),
+    new THREE.MeshStandardMaterial({color:0xd7c9a3, roughness:1}));
+  bed.position.y = FLOOR_Y - BED_H/2; bed.receiveShadow = true; scene.add(bed);
+
+  /* стружка — ОДИН InstancedMesh */
+  const N = 500;
+  const chips = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(0.09,0.012,0.035),
+    new THREE.MeshStandardMaterial({color:0xffffff, roughness:1}), N);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(1,1,1);
+  const col = new THREE.Color();
+  for(let i=0;i<N;i++){
+    const x = (Math.random()-0.5)*(CAGE_W-0.6), z = (Math.random()-0.5)*(CAGE_D-0.6);
+    q.setFromAxisAngle(new THREE.Vector3(0,1,0), Math.random()*Math.PI);
+    m4.compose(new THREE.Vector3(x, FLOOR_Y+0.006, z), q, s);
+    chips.setMatrixAt(i, m4);
+    col.setHSL(0.09 + Math.random()*0.04, 0.35, 0.55 + Math.random()*0.25);
+    chips.setColorAt(i, col);
+  }
+  chips.instanceMatrix.needsUpdate = true;
+  if (chips.instanceColor) chips.instanceColor.needsUpdate = true;
+  chips.receiveShadow = true; scene.add(chips);
+
+  /* частые прутья по периметру — InstancedMesh */
+  const barPos = [];
+  for(let x=-CAGE_W/2+0.15; x<=CAGE_W/2-0.14; x+=0.32)
+    barPos.push([x,-CAGE_D/2+0.05],[x,CAGE_D/2-0.05]);
+  for(let z=-CAGE_D/2+0.35; z<=CAGE_D/2-0.34; z+=0.32)
+    barPos.push([-CAGE_W/2+0.05,z],[CAGE_W/2+0.05,z]);
+  const bars = new THREE.InstancedMesh(
+    new THREE.CylinderGeometry(0.012,0.012,BAR_H,6),
+    new THREE.MeshStandardMaterial({color:0x9e9e9e, metalness:0.5, roughness:0.4}), barPos.length);
+  barPos.forEach((p,i)=>{ m4.identity(); m4.setPosition(p[0], FLOOR_Y+BAR_H/2, p[1]); bars.setMatrixAt(i,m4); });
+  bars.castShadow = true; scene.add(bars);
+
+  /* рамки по верху */
+  const frameMat = new THREE.MeshStandardMaterial({color:0x78909c, metalness:0.5, roughness:0.4});
+  const f1 = new THREE.Mesh(new THREE.BoxGeometry(CAGE_W+0.1,0.07,0.07), frameMat);
+  f1.position.set(0, FLOOR_Y+BAR_H, -CAGE_D/2+0.05); scene.add(f1);
+  const f2 = f1.clone(); f2.position.z = CAGE_D/2-0.05; scene.add(f2);
+  const f3 = new THREE.Mesh(new THREE.BoxGeometry(0.07,0.07,CAGE_D+0.1), frameMat);
+  f3.position.set(-CAGE_W/2+0.05, FLOOR_Y+BAR_H, 0); scene.add(f3);
+  const f4 = f3.clone(); f4.position.x = CAGE_W/2-0.05; scene.add(f4);
+}
+
+/* =====================================================================
+   КОЛЕСО (ось вдоль Z, зверь бежит по внутренней поверхности обода)
+   ===================================================================== */
+const wheelGroup = new THREE.Group();
+wheelGroup.position.set(WHEEL.x, WHEEL.cy, WHEEL.z);
+{
+  const rimMat = new THREE.MeshStandardMaterial({color:0xcfd8dc, metalness:0.4, roughness:0.35});
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(WHEEL_R+0.045, 0.05, 12, 48), rimMat);
+  rim.castShadow = true; wheelGroup.add(rim);               // внутренняя поверхность обода — на радиусе WHEEL_R
+  for(let i=0;i<8;i++){
+    const a = i/8*Math.PI*2;
+    const sp = new THREE.Mesh(new THREE.CylinderGeometry(0.014,0.014,WHEEL_R,6), rimMat);
+    sp.position.set(Math.cos(a)*WHEEL_R/2, Math.sin(a)*WHEEL_R/2, 0);
+    sp.rotation.z = a - Math.PI/2;
+    wheelGroup.add(sp);
+  }
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.06,0.12,12), rimMat);
+  hub.rotation.x = Math.PI/2; wheelGroup.add(hub);
+  const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,WHEEL_AXLE_W+0.25,8),
+    new THREE.MeshStandardMaterial({color:0x888888, metalness:0.6, roughness:0.3}));
+  axle.rotation.x = Math.PI/2; wheelGroup.add(axle);
+  scene.add(wheelGroup);
+  /* неподвижная опора */
+  const standMat = new THREE.MeshStandardMaterial({color:0x90a4ae, roughness:0.6});
+  [-1,1].forEach(s=>{
+    const h = WHEEL.cy - FLOOR_Y;
+    const st = new THREE.Mesh(new THREE.BoxGeometry(0.18,h,0.12), standMat);
+    st.position.set(WHEEL.x, FLOOR_Y+h/2, WHEEL.z + s*(WHEEL_AXLE_W/2+0.06));
+    st.castShadow = st.receiveShadow = true; scene.add(st);
+  });
+}
+
+/* =====================================================================
+   ТРУБА — ОТКРЫТЫЙ ЦИЛИНДР (вход только через торцы), ось вдоль X
+   ===================================================================== */
+{
+  const tm = new THREE.Mesh(
+    new THREE.CylinderGeometry(TUBE.r, TUBE.r, TUBE.halfLen*2, 24, 1, true),
+    new THREE.MeshStandardMaterial({color:0xb0bec5, side:THREE.DoubleSide, roughness:0.6}));
+  tm.rotation.z = Math.PI/2;
+  tm.position.set(TUBE.cx, TUBE.cy, TUBE.cz);
+  tm.castShadow = true; scene.add(tm);
+  const ringMat = new THREE.MeshStandardMaterial({color:0x90a4ae, roughness:0.5});
+  [-1,1].forEach(s=>{
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(TUBE.r, 0.02, 8, 24), ringMat);
+    ring.rotation.y = Math.PI/2;
+    ring.position.set(TUBE.cx + s*TUBE.halfLen, TUBE.cy, TUBE.cz);
+    ring.castShadow = true; scene.add(ring);
+  });
+}
+
+/* =====================================================================
+   МИСКА С ЗЁРНАМИ, ПОИЛКА
+   ===================================================================== */
+{
+  const bowl = new THREE.Mesh(new THREE.CylinderGeometry(BOWL.r, BOWL.r*0.7, 0.12, 24),
+    new THREE.MeshStandardMaterial({color:0xe57373, roughness:0.6}));
+  bowl.position.set(BOWL.x, FLOOR_Y+0.06, BOWL.z);
+  bowl.castShadow = bowl.receiveShadow = true; scene.add(bowl);
+  const grains = new THREE.InstancedMesh(
+    new THREE.SphereGeometry(0.018, 6, 5),
+    new THREE.MeshStandardMaterial({color:0xd9a441, roughness:1}), 50);
+  const m4 = new THREE.Matrix4();
+  for(let i=0;i<50;i++){
+    const a = Math.random()*Math.PI*2, rr = Math.sqrt(Math.random())*0.28;
+    m4.identity(); m4.setPosition(BOWL.x+Math.cos(a)*rr, FLOOR_Y+0.1, BOWL.z+Math.sin(a)*rr);
+    grains.setMatrixAt(i, m4);
+  }
+  scene.add(grains);
+  /* поилка на задней стенке */
+  const wb = new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.09,0.5,16),
+    new THREE.MeshStandardMaterial({color:0x81d4fa, transparent:true, opacity:0.7, roughness:0.2}));
+  wb.position.set(-3.6, FLOOR_Y+0.9, -CAGE_D/2+0.1); scene.add(wb);
+  const spout = new THREE.Mesh(new THREE.ConeGeometry(0.035,0.12,10),
+    new THREE.MeshStandardMaterial({color:0x607d8b}));
+  spout.rotation.x = Math.PI; spout.position.set(-3.6, FLOOR_Y+0.62, -CAGE_D/2+0.1); scene.add(spout);
+}
+
+/* =====================================================================
+   ХОМЯК: тело, живот, голова (отдельная группа для кивка), глаза с
+   зрачками, щёки, нос, уши с внутренней частью, 4 лапы, хвост
+   ===================================================================== */
+const hamsters = [];
+const hamsterGroups = [];
+function makeHamster(name, colorHex, x, z){
+  const fur = new THREE.Color(colorHex);
+  const bellyC = fur.clone().lerp(new THREE.Color(0xffffff), 0.55);
+  const mat = new THREE.MeshStandardMaterial({color:fur, roughness:0.9});
+  const bellyMat = new THREE.MeshStandardMaterial({color:bellyC, roughness:0.9});
+  const g = new THREE.Group();
+  g.userData.isHamster = true;
+
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.16,20,14), mat);
+  body.scale.set(1.5,0.95,1.15); body.position.y = 0.17; body.castShadow = true;
+  const belly = new THREE.Mesh(new THREE.SphereGeometry(0.13,16,12), bellyMat);
+  belly.scale.set(1.3,0.8,1.0); belly.position.set(0.01,0.12,0.02);
+  g.add(body, belly);
+
+  const head = new THREE.Group(); head.position.set(0.23,0.21,0);
+  const skull = new THREE.Mesh(new THREE.SphereGeometry(0.11,18,14), mat);
+  skull.castShadow = true; head.add(skull);
+  const ears = [];
+  [-1,1].forEach(s=>{
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.024,10,8),
+      new THREE.MeshStandardMaterial({color:0x111111}));
+    eye.position.set(0.075,0.02,0.055*s);
+    const pupil = new THREE.Mesh(new THREE.SphereGeometry(0.009,8,6),
+      new THREE.MeshBasicMaterial({color:0xffffff}));
+    pupil.position.set(0.02,0.008,0.012*s);
+    eye.add(pupil); head.add(eye);
+    const cheek = new THREE.Mesh(new THREE.SphereGeometry(0.05,12,10), bellyMat);
+    cheek.scale.set(0.8,0.9,1); cheek.position.set(0.05,-0.03,0.075*s); head.add(cheek);
+    const ear = new THREE.Mesh(new THREE.SphereGeometry(0.038,10,8), mat);
+    ear.scale.set(0.6,1,0.8); ear.position.set(-0.02,0.095,0.062*s);
+    const inner = new THREE.Mesh(new THREE.SphereGeometry(0.024,8,6),
+      new THREE.MeshStandardMaterial({color:0xffc2b0}));
+    inner.scale.set(0.5,1,0.8); inner.position.set(0.012,0,0.004*s);
+    ear.add(inner); head.add(ear); ears.push(ear);
+  });
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.014,8,6),
+    new THREE.MeshStandardMaterial({color:0xd96a6a}));
+  nose.position.set(0.108,-0.005,0); head.add(nose);
+  g.add(head);
+
+  /* 4 лапы: диагональные пары (FL+BR знак +1, FR+BL знак -1) */
+  const legs = [];
+  [[0.16, 0.08, 1],[0.16,-0.08,-1],[-0.16, 0.08,-1],[-0.16,-0.08, 1]].forEach(([px,pz,sg])=>{
+    const lg = new THREE.Group(); lg.position.set(px,0.12,pz); lg.userData.sign = sg;
+    const lm = new THREE.Mesh(new THREE.SphereGeometry(0.045,10,8), mat);
+    lm.scale.set(1.1,1.3,0.9); lm.position.y = -0.07; lm.castShadow = true;
+    lg.add(lm); g.add(lg); legs.push(lg);
+  });
+  const tail = new THREE.Mesh(new THREE.SphereGeometry(0.03,8,6), mat);
+  tail.position.set(-0.27,0.15,0); g.add(tail);
+
+  g.position.set(x, FLOOR_Y, z);
+  scene.add(g);
+  hamsterGroups.push(g);
+  const h = {
+    name, colorCss:'#'+fur.getHexString(),
+    group:g, parts:{body, belly, head, legs, tail, ears},
+    pos:{x, z, yOff:0},
+    facing:Math.random()*6.28, facingTarget:0,
+    state:'idle', stateTime:0.5+Math.random()*2, goal:null, target:{x:0,z:0},
+    phase:0, speedNow:0, seed:Math.random()*10,
+    runV:1.5+Math.random()*0.4,           // скорость лап в колесе (постоянна во время забега)
+    jumpY:0, jumpV:0,
+    earTimer:2+Math.random()*5, twitch:0,
+    wheelP:0, wheelFrom:null, tubeX:0, headTilt:0
+  };
+  hamsters.push(h);
+  return h;
+}
+makeHamster('Помпон',   0xf4a259, -1.0,  1.5);
+makeHamster('Кекс',     0x8d6e63,  0.5, -0.5);
+makeHamster('Мармелад', 0xffd9a0,  1.8,  0.8);
+makeHamster('Сирена',   0x9aa5b1, -0.8, -1.2);
+makeHamster('Бублик',   0xf5f0e6,  3.2, -0.3);
+
+/* =====================================================================
+   ПОМОЩНИКИ
+   ===================================================================== */
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp  = (a,b,t)=>a+(b-a)*t;
+const easeInOut = p=>p*p*(3-2*p);
+function angLerp(a,b,t){ let d=b-a; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return a+d*t; }
+function randIn(a,b){ return a+Math.random()*(b-a); }
+
+/* Фаза шага считается ОТ ПРОЙДЕННОГО ПУТИ: фаза += (путь/длина шага)*2π */
+function walkTo(h, tx, tz, speed, dt){
+  const dx = tx-h.pos.x, dz = tz-h.pos.z;
+  const d = Math.hypot(dx,dz);
+  if(d < 0.05) return true;
+  const step = Math.min(d, speed*dt);
+  h.pos.x += dx/d*step;
+  h.pos.z += dz/d*step;
+  h.pos.yOff = 0;
+  h.phase += (step/STEP_LEN)*Math.PI*2;   // ← путь, а не часы
+  h.facingTarget = Math.atan2(dx,dz);
+  h.speedNow = speed;
+  return false;
+}
+
+/* Тела столкновений: круги (колесо, миска) + капсула (труба). Выталкивание по кратчайшей нормали. */
+function resolveObstacles(h){
+  const pushCircle = (cx,cz,rr)=>{
+    let dx=h.pos.x-cx, dz=h.pos.z-cz;
+    let d=Math.hypot(dx,dz);
+    if(d<rr){
+      if(d<1e-5){ dz=1; d=1; }
+      h.pos.x = cx+dx/d*rr; h.pos.z = cz+dz/d*rr;
+    }
+  };
+  pushCircle(WHEEL.x, WHEEL.z, WHEEL_R+0.15);
+  pushCircle(BOWL.x,  BOWL.z,  0.42);
+  /* труба — капсула вдоль оси X: сбоку пройти нельзя */
+  const qx = clamp(h.pos.x, TUBE.cx-TUBE.halfLen, TUBE.cx+TUBE.halfLen);
+  let dx = h.pos.x-qx, dz = h.pos.z-TUBE.cz;
+  let d = Math.hypot(dx,dz);
+  const rr = 0.42;
+  if(d<rr){ if(d<1e-5){ dz=1; d=1; } h.pos.x = qx+dx/d*rr; h.pos.z = TUBE.cz+dz/d*rr; }
+  /* границы клетки */
+  h.pos.x = clamp(h.pos.x, -CAGE_W/2+0.5, CAGE_W/2-0.5);
+  h.pos.z = clamp(h.pos.z, -CAGE_D/2+0.5, CAGE_D/2-0.5);
+}
+
+/* Хомяки не стоят друг в друге — мягкое расталкивание */
+function resolveHamsters(){
+  for(let i=0;i<hamsters.length;i++) for(let j=i+1;j<hamsters.length;j++){
+    const a=hamsters[i], b=hamsters[j];
+    if(a.state==='in_wheel'||b.state==='in_wheel'||a.state==='in_tube'||b.state==='in_tube') continue;
+    const dx=b.pos.x-a.pos.x, dz=b.pos.z-a.pos.z;
+    const d=Math.hypot(dx,dz), min=0.42;
+    if(d<min && d>1e-5){
+      const push=(min-d)/2, nx=dx/d, nz=dz/d;
+      a.pos.x-=nx*push; a.pos.z-=nz*push;
+      b.pos.x+=nx*push; b.pos.z+=nz*push;
+    }
+  }
+}
+
+/* =====================================================================
+   КОНЕЧНЫЙ АВТОМАТ: стоит → идёт к цели → занятие → снова стоит
+   ===================================================================== */
+function pickGoal(h){
+  const opts=[];
+  if(!WHEEL.owner) opts.push('wheel','wheel');   // один предмет — один пользователь
+  if(!TUBE.owner)  opts.push('tube');
+  if(!BOWL.owner)  opts.push('bowl','bowl');
+  opts.push('stroll','stroll');
+  h.goal = opts[(Math.random()*opts.length)|0];
+  let tx, tz;
+  if(h.goal==='wheel'){ tx=WHEEL.x; tz=WHEEL.z+WHEEL.R+0.55; }        // площадка у края колеса
+  else if(h.goal==='tube'){ tx=TUBE.cx-TUBE.halfLen-0.55; tz=TUBE.cz; } // точка ПЕРЕД ТОРцом трубы
+  else if(h.goal==='bowl'){ tx=BOWL.x+0.58; tz=BOWL.z; }
+  else { tx=randIn(-CAGE_W/2+0.8, CAGE_W/2-0.8); tz=randIn(-CAGE_D/2+0.8, CAGE_D/2-0.8); }
+  h.target = {x:tx, z:tz};
+  h.state = 'walking';
+}
+
+const WHEEL_STAND_OFF = WHEEL.cy - WHEEL.R - FLOOR_Y;   // 0.15 — высота нижней точки обода над подстилкой
+const TUBE_BOT_OFF    = TUBE.cy - TUBE.r + 0.02 - FLOOR_Y; // зверь на внутреннем дне трубы
+
+function updateHamster(h, dt){
+  h.stateTime -= dt;
+  /* прыжок от клика */
+  if(h.jumpY>0 || h.jumpV!==0){
+    h.jumpY += h.jumpV*dt; h.jumpV -= 9.8*dt;
+    if(h.jumpY<=0){ h.jumpY=0; h.jumpV=0; }
+  }
+  switch(h.state){
+
+    case 'idle':
+      if(h.stateTime<=0) pickGoal(h);
+      break;
+
+    case 'walking': {
+      const arrived = walkTo(h, h.target.x, h.target.z, 0.8, dt);
+      if(arrived){
+        if(h.goal==='wheel'){
+          if(WHEEL.owner && WHEEL.owner!==h){ pickGoal(h); break; }
+          WHEEL.owner = h; h.wheelP = 0; h.wheelFrom = {x:h.pos.x, z:h.pos.z};
+          h.state = 'entering_wheel';
+        } else if(h.goal==='tube'){
+          if(TUBE.owner && TUBE.owner!==h){ pickGoal(h); break; }
+          TUBE.owner = h; h.tubeX = h.pos.x; h.state = 'in_tube';
+        } else if(h.goal==='bowl'){
+          if(BOWL.owner && BOWL.owner!==h){ pickGoal(h); break; }
+          BOWL.owner = h; h.state = 'eating'; h.stateTime = 4+Math.random()*3;
+        } else {
+          h.state = 'idle'; h.stateTime = 1+Math.random()*2.5;
+        }
+      }
+      break;
+    }
+
+    /* ВХОД в колесо — плавное перемещение с площадки внутрь (без телепортов) */
+    case 'entering_wheel': {
+      h.wheelP = Math.min(1, h.wheelP + dt/0.9);
+      const e = easeInOut(h.wheelP);
+      h.pos.x  = lerp(h.wheelFrom.x, WHEEL.x, e);
+      h.pos.z  = lerp(h.wheelFrom.z, WHEEL.z, e);
+      h.pos.yOff = lerp(0, WHEEL_STAND_OFF, e);   // зашагивает через нижнюю дугу обода
+      h.phase += (0.4*dt)/STEP_LEN*Math.PI*2;
+      h.facingTarget = Math.PI/2;                 // смотрит вдоль +X
+      h.speedNow = 0.4;
+      if(h.wheelP>=1){ h.state='in_wheel'; h.stateTime = 5+Math.random()*4; }
+      break;
+    }
+
+    /* БЕГ В КОЛЕСЕ: ω = v/R, обод под лапами уходит назад */
+    case 'in_wheel': {
+      WHEEL.omega = -h.runV / WHEEL.R;            // знак: бегун смотрит +X, низ обода движется в −X
+      h.pos.x = WHEEL.x; h.pos.z = WHEEL.z;
+      h.pos.yOff = WHEEL_STAND_OFF;               // стоит на НИЖНЕЙ точке внутренней поверхности обода
+      h.phase += (h.runV*dt)/STEP_LEN*Math.PI*2;  // фаза привязана к скорости обода
+      h.facingTarget = Math.PI/2;
+      h.speedNow = h.runV;
+      if(h.stateTime<=0){
+        WHEEL.owner = null;
+        h.wheelP = 0; h.wheelFrom = {x:h.pos.x, z:h.pos.z};
+        h.state = 'exiting_wheel';
+      }
+      break;
+    }
+
+    /* ВЫХОД из колеса — тем же плавным перемещением */
+    case 'exiting_wheel': {
+      h.wheelP = Math.min(1, h.wheelP + dt/0.9);
+      const e = easeInOut(h.wheelP);
+      h.pos.x  = lerp(h.wheelFrom.x, WHEEL.x, e);
+      h.pos.z  = lerp(h.wheelFrom.z, WHEEL.z+WHEEL.R+0.55, e);
+      h.pos.yOff = lerp(WHEEL_STAND_OFF, 0, e);
+      h.phase += (0.4*dt)/STEP_LEN*Math.PI*2;
+      h.facingTarget = Math.PI/2;
+      h.speedNow = 0.4;
+      if(h.wheelP>=1) pickGoal(h);
+      break;
+    }
+
+    /* ТРУБА: движение СТРОГО ВДОЛЬ ОСИ, z = cz (отклонение от оси = 0),
+       зверь на внутреннем дне, вход через ближний торец */
+    case 'in_tube': {
+      const v = 0.55;
+      h.tubeX += v*dt;
+      const startX = TUBE.cx - TUBE.halfLen - 0.55;
+      const p = clamp((h.tubeX - startX)/0.5, 0, 1);
+      h.pos.x = h.tubeX;
+      h.pos.z = TUBE.cz;                          // точно на оси
+      h.pos.yOff = lerp(0, TUBE_BOT_OFF, p);      // опускается на дно трубы у входа
+      h.phase += (v*dt)/STEP_LEN*Math.PI*2;
+      h.facingTarget = Math.PI/2;
+      h.speedNow = v;
+      if(h.tubeX >= TUBE.cx + TUBE.halfLen + 0.5){
+        TUBE.owner = null; h.pos.yOff = 0;
+        h.state = 'idle'; h.stateTime = 1+Math.random()*2;
+      }
+      break;
+    }
+
+    case 'eating':
+      h.speedNow = 0;
+      if(h.stateTime<=0){ BOWL.owner = null; h.state='idle'; h.stateTime = 1+Math.random()*2; }
+      break;
+  }
+
+  /* столкновения — только для тех, кто ходит по подстилке */
+  if(h.state==='walking' || h.state==='idle' || h.state==='eating')
+    resolveObstacles(h);
+
+  h.facing = angLerp(h.facing, h.facingTarget, Math.min(1, 12*dt));
+  h.group.position.set(h.pos.x, FLOOR_Y + h.pos.yOff + h.jumpY, h.pos.z);
+  h.group.rotation.y = h.facing;
+}
+
+/* =====================================================================
+   ВИЗУАЛЬНАЯ ЖИЗНЬ: лапы, дыхание, уши, жевание
+   ===================================================================== */
+let tGlobal = 0;
+function updateVisuals(h, dt){
+  const P = h.parts;
+  const sf = (h.state==='in_wheel') ? 1 : clamp(h.speedNow/0.8, 0, 1);
+  const amp = 0.55*sf;
+  P.legs.forEach(l=>{
+    l.rotation.x = Math.sin(h.phase + (l.userData.sign<0 ? Math.PI : 0))*amp; // диагональные пары
+  });
+  /* дыхание — лёгкое изменение объёма тела */
+  const br = 1 + 0.05*Math.sin(tGlobal*2.6 + h.seed);
+  P.body.scale.y  = 0.95*br;
+  P.belly.scale.y = 0.8*br;
+  /* дрожь ухом */
+  h.earTimer -= dt;
+  if(h.earTimer<0){ h.twitch = 0.5; h.earTimer = 3+Math.random()*5; }
+  if(h.twitch>0){
+    h.twitch -= dt;
+    const tw = Math.sin(h.twitch*30)*0.35;
+    P.ears[0].rotation.z =  tw;
+    P.ears[1].rotation.z = -tw;
+  } else { P.ears[0].rotation.z = 0; P.ears[1].rotation.z = 0; }
+  /* у миски — наклон головы и жевание */
+  const targetTilt = (h.state==='eating') ? 0.55 + 0.15*Math.sin(tGlobal*12) : 0;
+  h.headTilt = lerp(h.headTilt, targetTilt, Math.min(1, 8*dt));
+  P.head.rotation.x = h.headTilt;
+  /* мелкая вертикальная дрожь при беге в колесе */
+  P.body.position.y = 0.17 + (h.state==='in_wheel' ? Math.abs(Math.sin(h.phase))*0.015 : 0);
+}
+
+/* =====================================================================
+   ФИЗИКА КОЛЕСА: с бегуном ω = v/R, без бегуна — трение гасит ω
+   ===================================================================== */
+function updateWheel(dt){
+  if(WHEEL.owner){
+    /* ω уже выставлен бегуном (= v/R) */
+  } else {
+    WHEEL.omega *= Math.exp(-WHEEL.friction*dt);
+    if(Math.abs(WHEEL.omega) < 0.005) WHEEL.omega = 0;
+  }
+  WHEEL.angle += WHEEL.omega*dt;
+  wheelGroup.rotation.z = WHEEL.angle;
+}
+
+/* =====================================================================
+   ПАНЕЛИ
+   ===================================================================== */
+const wheelNums = document.getElementById('wheelNums');
+const stateList = document.getElementById('stateList');
+const GOAL_NAME = {wheel:'колесу', tube:'трубе', bowl:'миске', stroll:'прогулке'};
+function stateText(h){
+  switch(h.state){
+    case 'idle':           return 'стоит и отдыхает';
+    case 'walking':        return 'идёт к ' + (GOAL_NAME[h.goal]||'цели');
+    case 'entering_wheel': return 'влезает в колесо';
+    case 'in_wheel':       return 'бежит в колесе';
+    case 'exiting_wheel':  return 'выходит из колеса';
+    case 'in_tube':        return 'ползёт по трубе';
+    case 'eating':         return 'грызёт зёрна';
+    default:               return h.state;
+  }
+}
+let panelAcc = 0;
+function updatePanels(dt){
+  const v   = WHEEL.owner ? WHEEL.owner.runV : 0;
+  const rim = Math.abs(WHEEL.omega)*WHEEL.R;
+  const diff = v>0.05 ? Math.abs(v-rim)/v*100 : 0;
+  const cls  = (v>0.05 && diff<5) ? 'ok' : (v>0.05 ? 'warn':'');
+  wheelNums.innerHTML =
+    '<span class="'+cls+'">Скорость лап:      '+v.toFixed(3)+' м/с</span><br>'+
+    'Линейная обода |ω|·R: '+rim.toFixed(3)+' м/с<br>'+
+    'Расхождение:           <span class="'+cls+'">'+diff.toFixed(2)+' %</span><br>'+
+    'ω: '+WHEEL.omega.toFixed(3)+' рад/с<br>'+
+    (WHEEL.owner ? ('Бегун: '+WHEEL.owner.name) : '(пустое колесо — трение гасит ω)');
+  panelAcc += dt;
+  if(panelAcc > 0.15){
+    panelAcc = 0;
+    stateList.innerHTML = hamsters.map(h=>
+      '<li><span style="color:'+h.colorCss+'">●</span> '+h.name+' — '+stateText(h)+'</li>').join('');
+  }
+}
+
+/* =====================================================================
+   КЛИК ПО ХОМЯКУ — ПРЫЖОК
+   ===================================================================== */
+const ray = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+renderer.domElement.addEventListener('pointerdown', e=>{
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.x =  ((e.clientX-r.left)/r.width )*2-1;
+  mouse.y = -((e.clientY-r.top )/r.height)*2+1;
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(hamsterGroups, true);
+  if(hits.length){
+    let o = hits[0].object;
+    while(o && !o.userData.isHamster) o = o.parent;
+    if(o){
+      const h = hamsters.find(x=>x.group===o);
+      if(h && h.jumpY===0) h.jumpV = 2.4;
+    }
+  }
+});
+
+/* =====================================================================
+   ГЛАВНЫЙ ЦИКЛ (дельта ограничена сверху) + RESIZE
+   ===================================================================== */
+window.addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* доступность величин для внешнего чтения */
+window.HAMSTERS = hamsters;
+window.WHEEL = WHEEL;
+window.TUBE  = TUBE;
+window.BOWL  = BOWL;
+window.ANIMAL = { LENGTH:ANIMAL_LENGTH, HEIGHT:ANIMAL_HEIGHT, WIDTH:ANIMAL_WIDTH };
+
+let last = performance.now();
+function tick(now){
+  requestAnimationFrame(tick);
+  let dt = (now-last)/1000;
+  last = now;
+  dt = Math.min(dt, 0.05);              // защита от скачков при потере кадров
+  tGlobal += dt;
+
+  hamsters.forEach(h=>updateHamster(h, dt));
+  resolveHamsters();
+  updateWheel(dt);
+  hamsters.forEach(h=>updateVisuals(h, dt));
+
+  controls.update();
+  renderer.render(scene, camera);
+  updatePanels(dt);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
+```
+
+## Как выполнены пункты проверки
+
+1. **`|ω|·R = v лап`** — в состоянии `in_wheel` каждый кадр `WHEEL.omega = -runV / R`, панель показывает расхождение (оно 0.00 %).
+2. **Пустое колесо гаснет** — `omega *= exp(-1.6·dt)` до нуля.
+3. **Зверь на нижней точке обода** — `yOff = cy − R`, а `ANIMAL_HEIGHT (0.35) < R (0.8)`, так что обод не пересекает тело; радиус и ширина ступицы вычислены из `ANIMAL_LENGTH/HEIGHT/WIDTH` с явной проверкой.
+4. **Труба** — `z` жёстко равен `cz` (отклонение от оси = 0), хомяк сначала доходит до точки перед торцом, затем движется вдоль оси X на внутреннем дне.
+5. **Нет прохождения сквозь предметы** — `resolveObstacles()` выталкивает гуляющих хомяков из кругов колеса/миски и капсулы трубы; хомяки расталкиваются между собой.
+6. **Лапы замирают на месте** — фаза прибавляется только из `walkTo` (пройденный путь) и из бега в колесе; в `idle`/`eating` фаза не меняется.
+7. **Без телепортов** — вход/выход из колеса — интерполяция позиции за 0.9 с; «один предмет — один пользователь» через флаги `owner`.

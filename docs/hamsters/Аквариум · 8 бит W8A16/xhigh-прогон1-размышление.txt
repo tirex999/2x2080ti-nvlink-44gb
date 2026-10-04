@@ -1,0 +1,1563 @@
+The user is asking for a complete interactive 3D aquarium using Three.js. The prompt is in Russian, so I should respond in Russian. I need to create a single HTML file that implements all the requirements:
+
+1. 15 colorful tropical fish with detailed anatomy (scaled-sphere body, eyes with pupils, animated tail, fins), 8 color schemes, size variation 0.6–1.2, smooth animation
+2. AI behavior: collision avoidance, wall reflection, random wandering, food chasing, growth when eating, individual parameters
+3. Environment: glass container with transmission, wireframe edges, 36x24x20, sandy floor with procedural bumps, 8 rocks (deformed dodecahedra), 12 seaweed clusters via TubeGeometry + CatmullRomCurve3, swaying animation
+4. Bubbles: 30 initially, transparent spheres, rising with wobble, reset at surface, can add more
+5. Feeding: click to spawn food, gravity, fish detect within radius 15, grow by 5% on eat, delete food on reaching bottom
+6. Lighting: ambient, directional with shadows 2048, PCFSoft, 2 point lights, toggleable light button
+7. OrbitControls: rotate, pan, zoom min 10 max 60, maxPolarAngle PI/1.8, damping
+8. UI: info panel top-left with gradient title, instructions, buttons; stats top-right with fish count, FPS; buttons "Add fish", "More bubbles", "Light"
+9. Visual effects: FogExp2, background gradient, glass UI panels with backdrop blur, gradient buttons with hover, shadows/glow, responsive
+10. Tech: specified CDN links (three r128), data structure, requestAnimationFrame, raycaster, delta time, low-poly
+
+Let me write this as a single self-contained HTML file. It's a 3D scene, so the page itself is the aquarium — full-screen canvas with UI panels overlaid. This is a great opportunity for a rich, polished result.
+
+Design considerations:
+- Typography: pair a distinctive display typeface with a legible body typeface. Since it's an underwater theme, something like "Marcellus" or... let me think. For Russian text, Cyrillic support is required! Important — the UI is in Russian, so I need fonts with Cyrillic subsets. Good Google Fonts options with Cyrillic support: "Unbounded" (display, very distinctive, has Cyrillic), "Manrope" (body, Cyrillic), "Rubik", "Play", "Exo 2", "Sofia Sans", "Golos Text". Let me use "Unbounded" for headings (very distinctive, aquatic/modern vibe) and "Manrope" or "Golos Text" for body. Unbounded is quite wide and bold — good for "AQUARIUM" title. Body: "Golos Text" is a nice Russian font. Let's go with Unbounded + Golos Text.
+
+- Glass UI is explicitly requested (backdrop-filter blur), so I'll use it.
+
+- Color palette: deep-sea blues, teal, coral/orange accents from the fish. Deep navy background with cyan/teal accents, warm coral for CTA.
+
+- Micro-interactions: button hover effects, ripple on click, toast notifications when feeding, FPS counter, etc.
+
+Let me carefully plan the code.
+
+Three.js r128 from cdnjs. OrbitControls from jsdelivr examples/js (non-module version). Note: r128's MeshPhysicalMaterial supports transmission. Yes, transmission was added around r110+.
+
+Important detail for r128: `renderer.outputEncoding = THREE.sRGBEncoding` is available. Shadows are fine too.
+
+Structure:
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aquarium 3D</title>
+<link fonts...>
+<style>...</style>
+</head>
+<body>
+<div id="ui">
+  <div class="panel info-panel">
+    <h1>...</h1>
+    <p>instructions</p>
+    <div class="buttons">...</div>
+  </div>
+  <div class="panel stats-panel">
+    fish count, bubble count, food count, fps
+  </div>
+</div>
+<canvas or container>
+<script src three></script>
+<script src OrbitControls></script>
+<script> main code </script>
+</body>
+</html>
+```
+
+Now the JS. Let me write it thoroughly.
+
+Constants:
+```js
+const TANK = { w: 36, h: 24, d: 20 }; // width(x), height(y), depth(z)
+```
+
+Renderer setup: antialias, shadowMap enabled, PCFSoftShadowMap, pixel ratio capped at 2, sRGB encoding, tone mapping probably ACESFilmic.
+
+Scene: background — the requirement says "gradient from dark blue to blue". A CSS gradient behind a transparent canvas would work, but FogExp2 needs a scene background color... Actually fog works with transparent backgrounds too (fog blends toward fog color regardless of background). Hmm, if the canvas is transparent and there's a CSS gradient behind, fog will still tint objects toward fog color, which may not perfectly match the gradient, but it looks OK. Alternatively, use a large gradient via scene.background color + a big background plane/shader. Simpler: renderer alpha:true, CSS radial/linear gradient on body, fog color matching mid-gradient. That satisfies "background: gradient from dark blue to blue" nicely, and adds caustics-like animated light rays? Could also add subtle animated CSS light streaks behind the canvas... but the canvas covers everything; with alpha true the gradient shows through.
+
+Actually better: keep alpha: true, body has a deep gradient (e.g., #02121f → #06304a → slightly brighter at top to simulate water light). Add subtle animated "god rays" in CSS as overlay? Rays would be above the canvas... could add a screen-space light-shaft overlay div with mix-blend-mode: screen, pointer-events none, animated slowly. That adds atmosphere. Subtle.
+
+Camera: PerspectiveCamera(55, aspect, 0.1, 300), position (0, 8, 42) or so. Tank center at origin? Put tank centered at origin: x ∈ [-18,18], y ∈ [-12,12], z ∈ [-10,10]. Sand at y = -12 (floor). Camera at (0, 6, 40).
+
+Controls: target (0, 0, 0), minDistance 10, maxDistance 60, maxPolarAngle Math.PI/1.8, enableDamping, dampingFactor 0.06.
+
+Lights:
+- AmbientLight(0x404040, 0.4) — hmm, that's dim; maybe add hemisphere too? Requirement specifies these exactly; I can follow them but can also add a subtle hemisphere for looks. Let me stick close to spec: ambient 0x404040 0.4, directional with shadows (position (12, 28, 14)), mapSize 2048, PCFSoft, plus 2 point lights: cyan (0x22ccff) and blue (0x2266ff), low intensity, positioned inside tank. Toggle button changes directional light intensity between e.g. 1.0 and 0.15, and maybe dims ambient too. Spec: "light — toggle directional light intensity". So toggle dirLight.intensity between 1.0 and 0.15, and adjust ambient accordingly.
+
+Tank glass: BoxGeometry(36,24,20), MeshPhysicalMaterial({ color: 0x88ccee, metalness:0, roughness:0.05, transmission: 0.95, transparent: true, opacity: ... }). In r128 transmission works with transparent? Transmission in r128: material.transmission makes it refractive; usually you set transparent: false for proper transmission, but combined with opacity... To be safe: `transparent: true, opacity: 1, transmission: 0.95, thickness: 1.5, roughness: 0.08, ior: 1.33, side: THREE.DoubleSide`. Actually DoubleSide with transmission can cause artifacts; use FrontSide? For a box viewed from outside, front faces suffice, but we want to see the back walls too — with transmission both show. Many demos use side: THREE.DoubleSide with transmission and it looks decent. Let me use DoubleSide, and set `depthWrite: false` to avoid sorting issues with fish? Hmm, fish inside glass: transmission renders what's behind in a transmission pass... In r128, transmission uses a render target of the scene without transmissive objects. Fish inside a box: front faces of the box are in front of fish, so fish show through via transmission. Should look fine.
+
+Edges: EdgesGeometry + LineSegments with cyan-ish color, low opacity.
+
+Sand: PlaneGeometry(TANK.w - 0.2?, TANK.d, 40, 24) rotated -PI/2, placed at y=-11.95. Procedural bumps: iterate geometry.attributes.position, displace z (which becomes y after rotation) with pseudo-noise: combination of sines. Then computeVertexNormals. Material: MeshStandardMaterial color 0xd9c08a / sandy, roughness 1. receiveShadow = true.
+
+Actually simpler: create plane in XY then rotate; displacement along local z before rotation. Use `geo.rotateX(-Math.PI/2)` first, then displace y attribute.
+
+Rocks: 8 DodecahedronGeometry(random radius 0.8–1.8, detail 0), randomly displace vertices (store base positions, push along normal by noise), computeVertexNormals, flatShading true, gray-brown colors, castShadow & receiveShadow, place on sand y ≈ -11.5 + radius*0.4, random x,z within bounds, random rotation.
+
+Seaweed: 12 clusters. Each cluster: several blades (2–4)? Spec says 12 bushes made with TubeGeometry + CatmullRomCurve3. Each bush = one tube along a curve with sway. Create 12 tubes: points from base upward with random lateral offsets, CatmullRomCurve3, TubeGeometry(curve, 24 segments, radius ~0.12–0.2 tapering? TubeGeometry doesn't taper; that's fine). Material MeshStandardMaterial greenish tones (vary hue 0.3–0.45), slight emissive. Animate sway: rotate group.rotation.x/z by sin(time * speed + phase) * small amount. Pivot at base: build the curve starting at (0,0,0) upward, put mesh in a group, position group at base. Sway by rotating the group.
+
+Bubbles: 30 spheres, SphereGeometry(0.15–0.45, 12, 12), MeshPhysicalMaterial({ color: 0xffffff, metalness:0, roughness:0, transmission:0.9, transparent:true, opacity:0.35, ... }) — many transmission materials can be heavy; 30 small ones is fine. Or use MeshPhongMaterial with transparency for perf... Spec says MeshPhysicalMaterial with glass effect. Keep physical but modest. Store per-bubble: baseX, baseZ, speed, wobblePhase, wobbleAmp. Update: y += speed*dt; x = baseX + sin(t*f+phase)*amp; reset to bottom when y > top-0.5. Bubbles don't cast shadows.
+
+Food: small sphere (radius 0.25), orange-brown MeshStandardMaterial, castShadow. Physics: vy -= g*dt (g ~ 6, underwater slow fall — "food falls with physics (gravity)" — underwater, so gentle). Terminal velocity? Just cap vy at -3. When y <= sandY + 0.3: mark landed; remove after a few seconds (spec: "delete food on reaching bottom") — hmm, delete immediately on reaching bottom? But fish might eat while falling. Spec says remove on bottom. Let's do: when reaches bottom, sink into sand and fade/remove after 1.5s (still "removed on reaching bottom" but with grace period so fish can grab it). Actually simpler and closer to spec: remove after short delay once landed (0.8s). Let's do: food.landed=true, scale down over 1s then remove. Good.
+
+Fish creation:
+
+Group per fish:
+- Body: SphereGeometry(1, 24, 16) scaled to (1.6, 0.9, 0.55)? "Elongated body (scaled sphere)". Let me make body length ~2.2 units. Body scale: (1.5, 0.85, 0.5).
+- Head bulge? Keep simple.
+- Eyes: two spheres at front sides: white sphere r=0.16, pupil black r=0.08 slightly forward. Position: x = ±0.35 (z side), y = 0.15, x = 1.1 (front). Fish orientation: let's define fish facing +X direction (nose at +X). Tail at -X.
+- Tail: cone or flattened sphere? "Animated tail (rotation about Z axis)". Build tail as a group at rear (x = -1.5), containing a shape (e.g., a flattened cone: ConeGeometry rotated to face -X, scaled flat in y? Actually fish tail fin: a triangle spreading backward. Use a custom shape: ConeGeometry(0.5, 0.8, 4)? Simpler: use a flattened sphere scaled (0.3, 0.8, 0.08) offset -0.3, or a triangle via Shape/ShapeGeometry extruded thin. Let me make a nice tail: THREE.Shape triangle: moveTo(0,0), lineTo(-0.7, 0.55), lineTo(-0.7,-0.55), close; ShapeGeometry, double-sided material, slightly extruded? ShapeGeometry is flat (XY plane) — good, tail is flat in Y (vertical), thin in Z. Position at x=-1.35. Put tail mesh in a pivot group at x=-1.3, animate pivot.rotation.y? Wait, spec says rotate about Z. If fish swims along X, tail wag is... real fish tails swing side-to-side (around vertical axis = Y if up is Y). But spec says "tail wagging" with "rotation about Z axis". Hmm — if the fish model is built with nose +Z and up +Y, then side-to-side tail swing is rotation about Y. Rotation about Z would be up-down flapping (like a ray). Spec explicitly says Z axis. Maybe they envision fish built with nose +X, up +Y, and tail wag is rotation about... Let me just follow spec: animate tailPivot.rotation.z? Hmm wait — maybe they think of the fish swimming along Z? Doesn't matter much visually. Let me design: fish group with nose pointing +Z (forward = +Z). Up = +Y. Then side-to-side tail swing = rotation about Y. Up-down flap = rotation about Z.
+
+Spec: "animated tail (rotation about Z axis)" and "tail wagging". Let me do a combined approach: primary tail swing about Y (side-to-side, anatomically correct) plus a small Z component? To honor the spec literally, I can orient the fish model so its tail flaps about Z. Honestly, simplest: follow spec — rotate tail about Z with sin. If fish nose is +X, up is +Y, then Z-rotation flaps tail up/down — looks like angelfish actually. Hmm.
+
+Alternative: build fish with nose +X, up +Y, tail fin in XZ plane? No...
+
+Let me decide: fish forward = +X (nose +X), up = +Y. Tail fin is a flat triangle in XY plane (vertical fin, like most fish caudal fins). Swing: rotation.y for side-to-side. But spec says Z... I'll animate tail.rotation.y as main wag AND a subtle tail.rotation.z? Hmm, overthinking. Let me just follow spec: tail.rotation.z = sin(t*tailSpeed + phase) * 0.5. With nose +X and tail fin in XY plane (vertical, spreading in Y), Z rotation tilts it left-right... no wait.
+
+OK, here's the cleanest interpretation: if the fish model is built with nose +Z (forward), up +Y, and the tail fin lies in the XZ plane?? No.
+
+Let me just think geometrically. A flat caudal fin lying in the vertical plane XY (i.e., fin extends in X and Y directions, thin in Z). Its hinge axis for side-to-side wag is Y (the vertical axis). For up-down flap, hinge is Z? No — the fin extends in -X (backward) and ±Y (up/down). Rotating about Z (horizontal axis perpendicular to X) swings the -X direction into Y — that's an up-down flap. Rotating about Y swings -X into Z — side-to-side.
+
+Spec says Z. So with nose +X, up +Y, tail fin in XY plane, Z rotation = up-down flap. That reads as "wagging" loosely. But side-to-side is more natural.
+
+You know what, many of these generative aquarium demos build the fish with nose +X and tail as a cone/sphere, and rotate about... I'll do: primary motion tail.rotation.y (side-to-side, natural) — wait, but the spec is explicit. The user gave a detailed spec; deviating from "rotation about Z axis" is minor but let me honor it: I'll animate the tail pivot's rotation.z with sin, and design the tail fin so it looks right. If the tail fin is in XY plane (vertical, extending backward-up-down), rotation about Z makes it flap up-down — like a pectoral-fin-driven swimmer. Combined with the body bobbing, it'll look alive. Also add subtle body yaw (rotation.y oscillation) for the undulating S-curve feel. That'll read as swimming.
+
+Hmm, actually let me reconsider: I can make the tail fin lie in the horizontal plane? No, caudal fins are vertical.
+
+Decision: tailPivot at rear; tail mesh (flat triangle in XY plane, extending -X and ±Y); animate tailPivot.rotation.y = sin(...)*0.6 (side-to-side, primary) AND tailPivot.rotation.z = sin(...*0.5)*0.15 (secondary). Spec mentions Z; I'll include Z rotation prominently. Honestly, either will look fine. Let me just do:
+
+```js
+tail.rotation.y = Math.sin(t*tailSpeed + phase) * 0.55;  // side-to-side
+tail.rotation.z = Math.sin(t*tailSpeed*0.7 + phase) * 0.18; // secondary
+```
+
+Wait, spec literally: "animated tail (rotation about Z axis)". To be safe, make Z the primary: tail.rotation.z = sin * 0.5, plus small y. With nose +X... let me just test in my head: triangle in XY plane at x≈-1.4, extending to x≈-2.2, y ±0.6. Rotate about Z by θ: points sweep in XY — the tip goes up/down. So tail flaps vertically. That's actually how some fish (and goldfish) move, and combined with forward motion it reads as swimming. OK — primary Z, secondary Y. Done deliberating.
+
+Fins: dorsal (top) — flat triangle on top (XY plane at y≈0.7, thin in Z... dorsal fin is in the sagittal plane: extends in X (fore-aft) and Y (up), thin in Z. Yes, XY plane). Pectoral fins (left/right) — spec calls them "side fins": small triangles on sides, in XZ plane (extends in X and Z, thin in Y), at x≈0.6, z≈±0.45. Animate with rotation: pectorals flap — rotate about X axis (for fin in XZ plane, rotation about X sweeps Z into Y — flapping). Animate leftFin.rotation.x = sin(t*speed+phase)*0.4 + 0.3, right mirrored.
+
+Materials: MeshStandardMaterial or MeshPhongMaterial with per-color-scheme color. Slight metalness 0.1, roughness 0.4. Add stripes? "Anatomically detailed" — could add lighter belly via a second smaller sphere? Keep it reasonable: body, 2 eyes (white+pupil = 4 meshes), tail, dorsal, 2 pectorals = 8 meshes per fish × 15 fish = 120 draw calls + environment. Fine for low-poly. Could merge but not necessary. Actually 15 fish × 8 = 120, plus bubbles 30, seaweed 12, rocks 8, food... ~180 draw calls, fine.
+
+Color schemes (8):
+```js
+const COLOR_SCHEMES = [
+  { name:'orange', body:0xff7a1a, fin:0xffb25e },
+  { name:'blue', body:0x2f7bff, fin:0x7fb8ff },
+  { name:'yellow-red', body:0xffd23f, fin:0xff5533 },
+  { name:'purple', body:0x9b4dff, fin:0xc99aff },
+  { name:'red', body:0xe8352e, fin:0xff8a7a },
+  { name:'green', body:0x2ecc71, fin:0x8fe8b0 },
+  { name:'pink', body:0xff6fa5, fin:0xffb8d1 },
+  { name:'gold', body:0xf5b63c, fin:0xffe08a },
+];
+```
+Maybe give gold a higher metalness for shimmer.
+
+Fish data structure per spec:
+```js
+{ mesh, tail, leftFin, rightFin, dorsalFin?, velocity: Vector3, speed, tailSpeed, phase, targetFood, avoidanceRadius, baseScale, size }
+```
+
+Behavior update per frame (dt):
+1. Wander: each fish has a wanderTimer; when it expires (random 2–6s), pick a new random direction bias: velocity.add(randomVec * 0.5) or set desired direction. Better approach: maintain a `desired` direction vector that gets randomized periodically; steer velocity toward it.
+
+Simple robust approach:
+- Each fish has velocity vector.
+- Wander: velocity += random jitter * dt * wanderStrength; occasionally (timer) stronger impulse.
+- Avoidance: for each other fish, if dist < avoidanceRadius (e.g. 3), push away: force += (diff/dist) * (1 - dist/r) * strength. O(n²) with 15–30 fish is fine (900 pairs).
+- Walls: margin m = 2 from each boundary; if pos.x > maxX - m: velocity.x -= (pos.x-(maxX-m)) * k * dt... or reflect: if beyond bound, clamp position and invert velocity component with damping. Smooth: apply spring force near walls: if pos.x > lim, vel.x -= (pos.x - lim) * 4 * dt. Plus hard clamp.
+- Food seeking: find nearest food within 15 (or assigned targetFood still valid); steer strongly: vel += normalize(foodPos - pos) * seekStrength * dt. If dist < 0.8: eat → remove food, fish grows by 5% (size *= 1.05, apply scale, cap at ~2.2×base).
+- Speed limit: clamp velocity magnitude to [minSpeed, maxSpeed] based on fish.speed.
+- Move: pos += vel * dt.
+- Orientation: smoothly rotate mesh to face velocity direction. Use quaternion slerp: build target quaternion from lookAt. Fish nose is +X. So I want mesh's +X axis aligned with normalized velocity. Use Matrix4.lookAt? THREE.Object3D.lookAt points -Z... hmm. Object3D.lookAt makes internal -Z point at target? Actually Object3D.lookAt rotates the object so that its internal +Z axis points toward the target? Let me recall: in Three.js, Object3D.lookAt makes the object's positive Z axis point toward the target? Docs: "Rotates the object to face a point in world space." For cameras, camera looks down -Z, and lookAt makes -Z point at target. For regular objects, lookAt makes +Z point at target. Yes: Object3D.lookAt orients the object's +Z toward the point (cameras are special-cased to -Z).
+
+So if I build the fish with nose +Z, I can just call mesh.lookAt(pos + vel). That's convenient! But I decided nose +X earlier. Let me switch: build fish with nose +Z. Then:
+- Eyes at z = +1.1 (front), x = ±0.35.
+- Tail at z = -1.4, extending to -2.2, flat in YZ plane (thin in X).
+- Tail wag about Z axis? Fin in YZ plane (extends in -Z and ±Y, thin in X). Hinge for side-to-side wag = Y axis. Hinge for up-down flap = Z axis? Rotation about Z sweeps Y→X: fin tip (at -Z?) hmm, points at -Z rotate about Z stay at -Z (Z-axis rotation moves X and Y components). Fin extends mostly in -Z direction with ±Y spread. Rotating about Z: -Z stays -Z, ±Y spreads rotate into X — so the fin's lobes sweep fore-aft — that's exactly the side-to-side tail swing seen from top!! Yes! If the fin is in the YZ plane (thin in X, extends in -Z and ±Y), rotation about Z axis sweeps the upper/lower lobes sideways (into X). That's the correct caudal-fin wag!
+
+So: nose +Z, tail fin in YZ plane, tailPivot.rotation.z = sin(...) * 0.6 → correct side-to-side wag. And spec's "rotation about Z axis" is satisfied perfectly.
+
+- Dorsal fin: on top, in XZ plane (extends in X? no—dorsal extends fore-aft = Z and up = Y, thin in X). So XY?? Sagittal plane is Y-Z (contains up and fore-aft). Thin in X. So dorsal triangle in YZ plane, at y≈0.75, extends -Z..+Z slightly and up. OK.
+- Pectoral fins: on sides (x = ±0.5), extend backward (-Z) and outward (±X), thin in Y → XZ plane. Animate rotation.x (flap up-down).
+
+Orientation: mesh.lookAt(target) where target = pos + velocity. But lookAt keeps up as +Y, good. Smoothness: instead of instant lookAt, use quaternion slerp:
+
+```js
+const targetQ = new THREE.Quaternion();
+_m.lookAt? 
+```
+Approach: use a temp object or compute:
+```js
+tmpMat.lookAt(new Vector3(0,0,0), velocityDir, up)  // hmm
+```
+Simpler: create a dummy Object3D? Per-frame per-fish:
+```js
+// target quaternion
+lookTarget.copy(fish.mesh.position).add(fish.velocity);
+tmpObj.position.copy(fish.mesh.position);
+tmpObj.lookAt(lookTarget);
+fish.mesh.quaternion.slerp(tmpObj.quaternion, Math.min(1, dt * 4));
+```
+Using one shared tmpObj per frame is fine.
+
+Also add a subtle bank/roll during turns? Skip; slerp gives smooth turning.
+
+Body bob: mesh.position.y already follows velocity; add a tiny sinusoidal bob in the mesh's local? Can add to group's rotation.x a small sin for undulation. Keep simple: add slight pitch oscillation: after slerp, multiply by a small quaternion? Skip — tail + fin animation is enough, plus maybe a slight scale pulse? Nah.
+
+Growth: fish.size *= 1.05 (cap at 1.2*... base scale 0.6–1.2, cap total at ~2.4). Apply mesh.scale.setScalar(fish.size).
+
+Feeding interaction: click on tank → raycast. Where to spawn food? Options: raycast against an invisible plane at z=0? Or spawn at intersection with tank volume: intersect ray with glass box; if hit, spawn slightly inside. Better UX: raycast against an invisible large plane facing camera? Common approach: raycast against glass mesh; if hit, take point, pull toward center along hit normal by a bit, clamp inside tank bounds, spawn food at that point (maybe raised a bit). Simpler and robust: raycast against glass box; use the intersection point; nudge inward: point.multiplyScalar? Let's do: on hit, take the point, clamp each coord to inner bounds minus 0.5, and if the point is below sand, lift it. Also allow spawning from top: if ray hits the top face, drop from there.
+
+Even simpler and reliable: unproject ray at fixed distance? No — raycast against glass is standard and works well since the tank is a closed box; any ray into the tank hits it. If no hit (clicked outside), ignore. Also distinguish click vs drag (OrbitControls uses left-drag for rotate): track pointerdown position, on pointerup if moved less than 5px → treat as click/feed. Important for UX.
+
+Food detection: fish scans foods array each frame for nearest within 15 (or targetFood). Foods ≤ ~20, fish ≤ ~30 → fine.
+
+Bubble addition: button adds 10.
+
+Add fish button: creates a fish at random position, pushes to array, updates counter. Cap at maybe 40.
+
+FPS counter: compute with rolling average every ~0.5s.
+
+Stats: fish count, bubble count, food count (bonus), FPS.
+
+UI layout:
+- Top-left panel: title "AQUARIUM" in Unbounded with gradient text (info panel title with gradient is requested — good, it's requested). Subtitle "Interactive 3D aquarium". Instructions list: 🖱️ left button — orbit, right — pan, wheel — zoom, click on water — feed. Buttons row: "+ Fish", "Bubbles +10", "☀ Light".
+- Top-right: stats panel: fish, bubbles, food, FPS with live numbers, small pulsing dot indicator.
+- Bottom-center hint? Maybe a small caption "Click on water to throw food" that fades after first feed. Nice touch: toast messages ("Fish ate the food! +5%") — fun micro-feedback. Toast system: small pill appears bottom-center, auto-hides. On feeding: "🍤 Food thrown!" On eating: "🐟 Fish grew!" — maybe throttle eat toasts. Keep subtle.
+
+Also loading state? Scene builds fast; skip loader, but add a fade-in of canvas + panels (staggered entrance animations). Yes: CSS keyframes, panels slide/fade in.
+
+Button style: gradient (cyan→blue, coral for feed?), hover lift + glow, active press. Different accent per button: add fish (coral/orange gradient — matches fish), bubbles (cyan), light (amber). Hover: translateY(-2px), box-shadow glow. focus-visible outline.
+
+Fonts:
+```html
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;900&family=Golos+Text:wght@400;500;600&display=swap" rel="stylesheet">
+```
+Both support Cyrillic. Unbounded is very distinctive (rounded wide techno).
+
+Background CSS:
+```css
+body { background: radial-gradient(1200px 800px at 50% -10%, #0e4d6e 0%, #083350 35%, #041c30 70%, #02101d 100%); }
+```
+Plus animated light shafts overlay:
+```css
+.rays { position:fixed; inset:0; pointer-events:none; background: repeating-linear-gradient(100deg, transparent 0 80px, rgba(120,220,255,0.05) 80px 140px, transparent 140px 260px); mix-blend-mode: screen; animation: raysDrift 18s linear infinite alternate; }
+```
+Hmm, repeating-linear-gradient with skewed bands, animating background-position. Subtle. Also a vignette overlay. These sit above canvas with pointer-events:none — but the panels must be above them. z-index order: canvas (0) → rays/vignette (1) → UI (2).
+
+Fog: scene.fog = new THREE.FogExp2(0x06304a, 0.012). With alpha renderer, fog color blends toward that color — matches background midtone. Good.
+
+Water surface: add a subtly animated plane at top? Could add a semi-transparent plane with a moving normal-ish shader at y = +11.9... Simpler: a plane with MeshBasicMaterial color 0x9fdcff, transparent opacity 0.15, and animate vertex waves? Might conflict with glass top face. Skip, or add gently. Actually a nice touch: caustics-like light on sand — a moving texture? Without textures, could fake with a spotlight moving? Keep scope controlled. Let me add a simple "surface" plane: PlaneGeometry(36,20, 24,16) at y=11.9, MeshPhongMaterial({color:0xbfeaff, transparent:true, opacity:0.18, side:DoubleSide}), animate vertices with sin waves each frame (cheap, 25×17 verts). Adds life. OK include.
+
+Caustics: skip.
+
+Performance: pixelRatio min(devicePixelRatio, 2).
+
+Delta time via THREE.Clock, clamp dt to 0.05.
+
+Now let me write out all the code carefully. Watch out for r128 API specifics:
+- THREE.SphereGeometry exists (r128 has Geometry removed? r125 removed Geometry; SphereGeometry is BufferGeometry-based alias — yes, in r128 `THREE.SphereGeometry` is the buffer version. Good.)
+- EdgesGeometry fine.
+- MeshPhysicalMaterial transmission fine in r128. `thickness` property? Added in r126? I believe `thickness` was added in r127/r128. To be safe, set it anyway (unknown properties are harmless).
+- outputEncoding = THREE.sRGBEncoding.
+- renderer.toneMapping = THREE.ACESFilmicToneMapping; toneMappingExposure 1.1.
+
+Shadow config: dirLight.shadow.camera left/right/top/bottom = ±28, near 1 far 80. bias -0.0005.
+
+Fish body geometry: shared geometry! Create once: bodyGeo = SphereGeometry(1, 20, 14) — but per-fish scale differs; use group scale. Shared geometries: body, eyeWhite, pupil, tail (shape), dorsal (shape), pectoral (shape). Materials per scheme — cache per scheme (bodyMat, finMat) so 8 schemes × 2 materials = 16 materials shared across all fish.
+
+Tail shape:
+```js
+const tailShape = new THREE.Shape();
+tailShape.moveTo(0, 0);
+tailShape.lineTo(-0.9, 0.65);
+tailShape.lineTo(-0.55, 0);   // notch
+tailShape.lineTo(-0.9, -0.65);
+tailShape.closePath();
+```
+That gives a forked tail (nice!). ShapeGeometry in XY plane, thin. But I wanted tail in YZ plane (thin in X). ShapeGeometry is in XY (thin in Z). Need to rotate the mesh: rotateY(90°) → plane becomes ZY (thin in X). Then extends in -X? Original shape extends in -X (lineTo -0.9). After rotateY(PI/2): x→ -z? Let me compute: rotateY(π/2): (x,y,z) → (z, y, -x). Point (-0.9, 0.65, 0) → (0, 0.65, 0.9). Hmm, that extends in +Z (toward nose). Use rotateY(-π/2): (x,y,z)→(-z, y, x). Point (-0.9,0.65,0) → (0,0.65,-0.9). Extends in -Z (backward).
+
+But wait — the tail pivot rotation about Z: if the fin is in YZ plane (thin in X), pivot.rotation.z sweeps Y into X → lobes move sideways. Correct.
+
+Alternatively, bake the rotation into the geometry with geo.rotateY(-Math.PI/2) once (shared geometry). Do that.
+
+Similarly dorsal: shape in XY: moveTo(0,0), lineTo(0.5, 0.55)? Dorsal sits on top of body: base along top of body (z from +0.3 to -0.9), apex up. In XY plane shape: moveTo(0.3, 0), lineTo(-0.9, 0), lineTo(-0.3, 0.6), close — a curved triangle. Then rotateY(-π/2) → extends in -Z, up Y, thin X. Place at y=0.75.
+
+Pectoral: shape in XY: small triangle moveTo(0,0), lineTo(-0.5,-0.1), lineTo(-0.35,0.25)? Then rotate to lie in XZ plane: rotateX(-π/2)? XY→XZ: rotateX(-π/2): (x,y,z)→(x, z, -y)? Let me verify: rotateX(θ): y' = y cosθ - z sinθ; z' = y sinθ + z cosθ. θ=-π/2: y' = y*0 - z*(-1) = z; z' = y*(-1)+z*0 = -y. So (x,y,0)→(x, 0, -y). Shape extending in -X and +Y → extends in -X and -Z. Good: fin extends backward (-Z) and laterally. Left fin (x=+0.45): extend outward +X? My shape extends -X. For left side, mirror with scale.x = -1? Negative scale flips normals... use DoubleSide material for fins, fine. Or just design both fins symmetric: left fin shape extends -X (inward? no...). Hmm: left fin at x=+0.45 should extend outward (+X) and backward (-Z). Right fin at x=-0.45 extends -X and -Z.
+
+Simplest: create pectoral geometry with shape extending +X (outward) and -Z (backward): shape points: moveTo(0,0), lineTo(0.45, -0.15), lineTo(0.15, -0.4), close (in XY: +X = outward, -Y = ?). After rotateX(-π/2): (x,y,0)→(x,0,-y): +X stays +X, -Y → +Z? Point (0.15, -0.4) → (0.15, 0, 0.4) — that's +Z (forward). I want backward -Z: so use +Y in shape: (0.15, 0.4)→(0.15,0,-0.4). OK, shape: moveTo(0,0), lineTo(0.45, 0.1), lineTo(0.1, 0.45), close → after rotateX(-π/2): extends +X, -Z. For left fin: place at (0.4, 0.05, 0.25), no flip. For right fin: scale.x = -1 (mirror) — with DoubleSide material, normals flip but lighting with DoubleSide is handled by three (it flips normal for back faces). Fine. Or use another geometry with rotateY(π)... negative scale is simpler; three handles it.
+
+Pectoral animation: rotation.x = base + sin(t*speed + phase)*0.35. For mirrored fin (scale.x=-1), rotation.x sign flips visually — acceptable, or set rightFin.rotation.x = -(left value). Let me mirror the values.
+
+Eye placement: nose at +Z. Body sphere scaled (0.75, 0.85, 1.5) → half-length 1.5, so nose at z≈1.5. Eyes at z=1.05, x=±0.38, y=0.18. Eye white r=0.16, pupil r=0.075 at z +0.1 relative to eye.
+
+Wait, body scale: base sphere radius 1 scaled by (0.75, 0.85, 1.5): dimensions x±0.75, y±0.85, z±1.5. Total length 3.0 units. Tank width 36 — fish length 3 is reasonable (smaller with 0.6 scale). Good.
+
+Tail pivot at z=-1.35 (slightly overlapping body end at -1.5... body end is at -1.5; put pivot at -1.3, tail shape extends -0.9 → tip at -2.2. Overlap avoids gap. Good.
+
+Now behavior constants:
+- fish.speed: base cruise 2.5–4.5 units/s (individual).
+- maxSpeed = speed * (chasing? 1.8 : 1).
+- minSpeed = speed*0.5.
+- wander: each fish has wanderT countdown; when <0, reset to 2+rand*4 and add impulse: vel.addScaledVector(randomUnit, speed*0.8)? That could be jerky; instead blend: keep a `wanderDir` unit vector updated randomly (small random walk each frame: wanderDir += rand*0.5, renormalize). Steering: vel += (wanderDir*speed - vel) * 0.6 * dt (seek own speed). Plus avoidance forces, wall springs, food seek overrides.
+
+Let me structure the update:
+
+```js
+function updateFish(f, dt, t){
+  const p = f.mesh.position;
+  // wander dir drift
+  f.wanderDir.x += (Math.random()-0.5)*2*dt*1.5; ... then normalize
+  // desired = wanderDir * cruise
+  _desired.copy(f.wanderDir).multiplyScalar(f.speed);
+  // food
+  f.targetFood = null;
+  let best = 15, bd = 1e9;
+  for (food of foods){ const d = p.distanceTo(food.mesh.position); if(d<bd){bd=d;best=food;} }
+  if(best){
+     f.targetFood = best;
+     _toFood.copy(best.mesh.position).sub(p).normalize();
+     _desired.copy(_toFood).multiplyScalar(f.speed*1.9);
+     if(bd < 0.9){ eat(f, best); }
+  }
+  // avoidance
+  for(other of fishArray) if(other!==f){
+    dx..., d = len; if(d < f.avoidanceRadius && d>0.0001){ push = (1 - d/f.avoidanceRadius); _desired.addScaledVector(diffNorm, push * f.speed * 3); }
+  }
+  // walls (spring)
+  const m = 2.2;
+  if(p.x > 18-m) _desired.x -= (p.x-(18-m))*6;
+  ... etc for 6 sides; y bounds: top 12-1.5, bottom -12+1.5 (above sand)
+  // steering
+  f.velocity.addScaledVector(_desired.sub(f.velocity), Math.min(1, dt*2.2));
+  // clamp speed
+  const sp = f.velocity.length(); const max = f.speed*(f.targetFood?2:1.15);
+  if(sp>max) f.velocity.multiplyScalar(max/sp);
+  else if(sp<f.speed*0.4) f.velocity.multiplyScalar((f.speed*0.4)/Math.max(sp,0.001));
+  // integrate
+  p.addScaledVector(f.velocity, dt);
+  // hard clamp
+  p.x = clamp(p.x, -17.2, 17.2); etc
+  // orient
+  ...
+  // animate tail/fins
+  const wag = Math.sin(t*f.tailSpeed + f.phase);
+  f.tail.rotation.z = wag*0.55;
+  f.tail.rotation.y = wag*0.12*Math.sin(t*0.7+f.phase);
+  f.leftFin.rotation.x = 0.35 + Math.sin(t*f.tailSpeed*0.8+f.phase)*0.3;
+  f.rightFin.rotation.x = -(0.35 + Math.sin(t*f.tailSpeed*0.8+f.phase)*0.3);
+  f.dorsalFin? small bend: rotation.x = sin*0.08;
+}
+```
+
+Wall spring with _desired modification: units — (penetration)*6 with penetration up to ~2 → 12, comparable to speed ~4. OK.
+
+Eat: remove food from array and scene, f.size = min(f.size*1.05, f.baseScale*2.6), f.mesh.scale.setScalar(f.size). Toast occasionally.
+
+Food update:
+```js
+food.vy -= 5*dt; if(food.vy < -3.5) food.vy=-3.5;
+food.mesh.position.y += food.vy*dt;
+if(y <= sandTop+0.35){ landed: y=sandTop+0.3; food.landed=true; food.landT=0 }
+if(landed){ landT+=dt; scale = max(0, 1-landT/1.2); if<=0 remove }
+```
+sandTop = -11.7 or so (sand at -11.95, bumps ±0.25). Set FOOD_FLOOR = -11.2.
+
+Food spawn position: raycast against glass mesh. Glass is a single box mesh — raycast returns the first intersection (front face). Point on front face. Nudge: subtract normal*1.2? Normal from intersection (world). foodPos = point.clone().sub(normal*1.5), then clamp inside [-17,17]×[-10.5,11]×[-9,9]. If spawn y < -10, lift to -10. Fine.
+
+But note: clicking on glass where UI overlaps — panels have pointer events; canvas is behind. Clicks on panels won't reach canvas. Good.
+
+Pointer events: use 'pointerdown' to record x,y,time; 'pointerup': if dist<6 and dt<400ms → feed.
+
+Raycaster from camera with pointer NDC.
+
+Bubbles:
+```js
+function spawnBubble(){
+  const r = 0.12+Math.random()*0.3;
+  mesh = Mesh(bubbleGeo (unit sphere), bubbleMat);
+  scale r;
+  baseX = rand(-16,16), baseZ = rand(-8.5,8.5), y = rand(-11, 10)
+  speed 1.5+rand*2.5, phase, amp 0.2+rand*0.5, freq 1+rand*2
+  store {mesh, baseX, baseZ, speed, phase, amp, freq}
+}
+update: b.mesh.position.y += b.speed*dt;
+ x = b.baseX + sin(t*b.freq+b.phase)*b.amp;
+ z = b.baseZ + cos(t*b.freq*0.8+b.phase)*b.amp*0.7;
+ if(y > 11.3){ y = -11.4; baseX=rand; baseZ=rand; }
+```
+Bubble material: MeshPhysicalMaterial({color:0xcfefff, metalness:0, roughness:0, transmission:0.85, transparent:true, opacity:0.4, clearcoat:1}) — hmm, transmission + opacity both... in r128, when transmission>0, opacity multiplies. Let me use transparent:true, opacity:0.35, transmission:0.9? Might look weird but OK. Alternative simpler: MeshPhongMaterial({color:0xffffff, transparent:true, opacity:0.25, shininess:100, specular:0xffffff}). Spec says MeshPhysicalMaterial with glass effect — use physical with transmission 0.9, opacity 0.5? Let me tune: `new THREE.MeshPhysicalMaterial({ color: 0xbfe8ff, roughness: 0, metalness: 0, transmission: 0.95, transparent: true, opacity: 0.5, clearcoat: 1, clearcoatRoughness: 0 })`. Should render as glassy orbs. 30–60 of them, fine.
+
+Seaweed:
+```js
+function createWeed(x, z){
+  const group = new THREE.Group();
+  const blades = 1 + floor(rand*2); // 1-2 tubes per bush? spec: 12 bushes made with TubeGeometry. Each bush can be 1-3 tubes.
+  for(blade){
+    const h = 3+rand*5;
+    pts = [];
+    for(i=0..4): y = h*i/4; lateral = sin/cos small increasing; pts.push(new Vector3(sin(i*1.3+seed)*0.3*(i/4), y, cos(i*1.7+seed)*0.3*(i/4)));
+    curve = new THREE.CatmullRomCurve3(pts);
+    geo = new THREE.TubeGeometry(curve, 16, 0.12+rand*0.1, 6, false);
+    mat = MeshStandardMaterial({color: hsl(0.35+rand*0.12, 0.6, 0.3+rand*0.15), roughness:0.8, side:DoubleSide? no});
+    mesh castShadow true;
+    group.add(mesh);
+  }
+  group.position.set(x, -11.8, z);
+  weeds.push({group, phase: rand*6.28, speed: 0.6+rand*0.8, swayX: 0.05+rand*0.05, swayZ:...});
+}
+update: g.rotation.x = sin(t*speed+phase)*sway; g.rotation.z = cos(t*speed*0.9+phase)*sway;
+```
+Blades share base point → looks like a clump. Good. 12 bushes × up to 3 tubes = ~30 tubes, 16 segments × 6 radial = fine.
+
+Rocks:
+```js
+for(i<8){
+  const r = 0.7+rand*1.1;
+  geo = new THREE.DodecahedronGeometry(r, 0);
+  pos = geo.attributes.position;
+  for(v): n = normalize(vertex); displace = 1 + (noise) — use deterministic pseudo-random per vertex: hash of coords. Simpler: precompute a random offset per unique vertex. Dodecahedron with detail 0 has 20 faces × 3 = 60 non-indexed vertices (positions duplicated). Random displacement per index would crack the mesh (non-manifold). To deform consistently, displace based on direction: d = 1 + 0.25*sin(dot(dir, seedVec)*3 + seedPhase) etc — a smooth function of direction → consistent across duplicates.
+  scale: (1, 0.75, 1) squish.
+  computeVertexNormals? For flat look, keep flatShading: true and call geo.computeVertexNormals() — with non-indexed, gives flat facets. Good.
+  mat: MeshStandardMaterial({color: gray-brown variations, roughness:0.95, flatShading:true});
+  castShadow, receiveShadow;
+  position: x rand(-15,15), z rand(-7.5,7.5), y = -11.8 + r*0.35;
+  random rotation.
+}
+```
+Avoid placing rocks directly under seaweed? Not critical; random is fine.
+
+Sand:
+```js
+const sandGeo = new THREE.PlaneGeometry(35.6, 19.6, 48, 32);
+sandGeo.rotateX(-Math.PI/2);
+pos attr; for each v: y = 0.28*Math.sin(x*0.5+1.3)*Math.cos(z*0.6+2.1) + 0.15*Math.sin(x*1.7+z*1.3) + 0.1*Math.sin(z*2.3);
+set y; computeVertexNormals();
+mat MeshStandardMaterial({color:0xd8bd85, roughness:1});
+receiveShadow = true;
+position.y = -11.9;
+```
+Wait, plane is 35.6×19.6 centered → covers tank interior (36×20 minus glass). y=-11.9, bumps ±0.5 → top around -11.3.
+
+Sand color under blue water will appear bluish — fine, realistic.
+
+Glass:
+```js
+const glassGeo = new THREE.BoxGeometry(36,24,20);
+const glassMat = new THREE.MeshPhysicalMaterial({ color:0xaadfff, metalness:0, roughness:0.05, transmission:0.95, transparent:true, opacity:1, ior:1.33, thickness:1.2, side:THREE.DoubleSide, envMapIntensity:1 });
+glass.castShadow = false; receiveShadow=false;
+edges: new THREE.LineSegments(new THREE.EdgesGeometry(glassGeo), new THREE.LineBasicMaterial({color:0x9fdcff, transparent:true, opacity:0.5}));
+```
+Note: transmission + DoubleSide can double-refract; acceptable.
+
+Hmm, one concern: r128 transmission renders scene into a WebGLRenderTarget when there are transmissive materials — that includes the glass box and bubbles. Performance OK.
+
+Surface water plane at y=11.85:
+```js
+surfGeo = PlaneGeometry(35.5, 19.5, 28, 18); rotateX(-PI/2);
+mat = MeshPhongMaterial({color:0x8fd8ff, transparent:true, opacity:0.15, side:DoubleSide, shininess:90});
+animate: for each vertex: y = 0.12*sin(x*0.6 + t*1.2) + 0.1*cos(z*0.8 + t*0.9); computeVertexNormals each frame? 29×19=551 verts — fine.
+```
+Store original x,z.
+
+Light toggle:
+```js
+let lightOn = true;
+btn.onclick: lightOn=!lightOn; dirLight.intensity = lightOn?1.15:0.12; ambLight.intensity = lightOn?0.4:0.15; point lights maybe dim too; btn.classList.toggle('off'); toast.
+```
+Spec: ambient 0x404040 @0.4, dir with shadows. Set dir intensity 1.15? Spec doesn't specify dir intensity; pick 1.1.
+
+Point lights: p1 = PointLight(0x35d0ff, 0.6, 60) at (-10, 6, 5); p2 = PointLight(0x2f6bff, 0.5, 60) at (10, -4, -5). Underwater glow.
+
+Also add a subtle SpotLight from top? Not in spec; skip.
+
+FPS: frames++, every 0.5s: fps = frames/elapsed, update DOM.
+
+UI DOM:
+
+```html
+<div class="scene-wrap"><canvas id="scene"? (three creates its own; append renderer.domElement to #app)</div>
+<div class="rays"></div><div class="vignette"></div>
+<header class="panel panel-info">
+  <div class="brand">
+    <span class="brand-icon">🐠</span>? 
+    <h1>AQUARIUM<span>3D</span></h1>
+  </div>
+  <p class="tagline">Interactive aquarium with living fish</p>
+  <ul class="help">
+    <li><kbd>Left button</kbd> orbit</li>
+    <li><kbd>Right button</kbd> pan</li>
+    <li><kbd>Wheel</kbd> zoom</li>
+    <li><kbd>Click</kbd> throw food</li>
+  </ul>
+  <div class="actions">
+    <button id="btn-fish" class="btn btn-coral">+ Fish</button>
+    <button id="btn-bubbles" class="btn btn-cyan">Bubbles +10</button>
+    <button id="btn-light" class="btn btn-amber">☀ Light</button>
+  </div>
+</header>
+<aside class="panel panel-stats">
+  <div class="stat"><span class="stat-label">Fish</span><span class="stat-value" id="stat-fish">15</span></div>
+  ... bubbles, food
+  <div class="stat fps"><span>FPS</span><span id="stat-fps">60</span></div>
+  <div class="live-dot"></div>? 
+</aside>
+<div id="toast"></div>
+```
+
+Title gradient: "AQUARIUM" with linear-gradient text (cyan→teal→coral?). Title with gradient is requested. Use background-clip:text.
+
+Panel styling: rgba(6, 30, 48, 0.55), backdrop-filter blur(14px), border 1px rgba(140,220,255,0.25), border-radius 18px (not uniform 2xl everywhere — vary: info panel 18px, stats 14px, buttons pill). Shadow: 0 12px 40px rgba(0,10,25,0.5), inner top highlight.
+
+Buttons:
+- .btn base: font Golos 600, padding 10px 16px, border-radius 999px, border 1px solid rgba(255,255,255,.18), cursor pointer, transition transform .18s, box-shadow.
+- .btn-coral: linear-gradient(135deg,#ff9a5a,#ff5e62); hover: translateY(-2px), box-shadow 0 8px 24px rgba(255,94,98,.45).
+- .btn-cyan: linear-gradient(135deg,#37d5ff,#2f7bff); hover glow cyan.
+- .btn-amber: linear-gradient(135deg,#ffd76a,#ff9d3c); when .off → grayscale/dimmed.
+- active: translateY(0) scale(.97).
+
+Toast: fixed bottom-center, pill, transform translateY(20px) opacity 0 → .show class transitions. JS showToast(msg) with timeout, reuse.
+
+Entrance animations: .panel { animation: panelIn .8s cubic-bezier(.2,.9,.3,1.2) backwards } with delays (info .15s, stats .3s). Canvas fade-in: #app canvas { animation: fadeIn 1.2s }.
+
+Responsive: media query max-width 720px: shrink panels, info panel maybe collapses help list (hide kbd details?), stack buttons. Keep simple: reduce font sizes, panel widths, hide .help on very small? Keep but compact.
+
+Cursor: crosshair over canvas? Custom: cursor: pointer? For feeding affordance, crosshair is nice: #app canvas { cursor: crosshair }.
+
+Now, also handle resize.
+
+Edge cases: OrbitControls left-drag rotate + our click-feed: use movement threshold. Good.
+
+Prevent context menu? Right-drag pans; browser context menu on right-click — OrbitControls prevents default on contextmenu on its dom element? It does (adds contextmenu listener preventing default). Yes, OrbitControls handles it.
+
+Initial fish spawn: random positions within central area, random velocity direction, random scheme, scale 0.6–1.2.
+
+Wander initialization: random unit vector.
+
+Also ensure fish don't all clump: avoidanceRadius ~2.5–3.5 individual.
+
+Food detection radius 15 per spec.
+
+Max fish cap 40; button disabled at cap? Just cap + toast "Maximum 40 fish".
+
+Let me also add a small "click ripple" effect on the canvas at feed point — a DOM circle at screen position that scales and fades. Nice micro-interaction: on feed, project 3D point to screen, spawn a div.ripple, animate, remove. Cheap and fun.
+
+Let me now write the final code. Careful with r128 details:
+
+- `new THREE.WebGLRenderer({antialias:true, alpha:true})`
+- `renderer.setClearColor(0x000000, 0)` for alpha.
+- `renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;`
+- `renderer.outputEncoding = THREE.sRGBEncoding;`
+- `renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.15;`
+
+Fog with alpha background: FogExp2(0x0a3a58, 0.011). Objects far away blend toward that color; background gradient behind is similar tones. OK.
+
+OrbitControls: `controls = new THREE.OrbitControls(camera, renderer.domElement); controls.enableDamping = true; controls.dampingFactor = 0.06; controls.minDistance = 10; controls.maxDistance = 60; controls.maxPolarAngle = Math.PI/1.8; controls.target.set(0,0,0);`
+
+Auto-rotate initially? Could add a gentle autoRotate until first interaction — nice touch: controls.autoRotate = true, autoRotateSpeed 0.5; disable on first pointerdown. Adds a bit of life on load. Yes, include, stop on first user pointerdown/wheel.
+
+Fish orientation helper:
+```js
+const _orient = new THREE.Object3D();
+...
+_orient.position.copy(p);
+_orient.lookAt(p.x + v.x, p.y + v.y, p.z + v.z);
+f.mesh.quaternion.slerp(_orient.quaternion, 1 - Math.pow(0.001, dt)); // framerate-independent smoothing
+```
+Hmm, slerp factor: use `Math.min(1, dt*5)`.
+
+But note: if velocity is nearly zero or fish moves straight up, lookAt with default up (0,1,0) degenerates. Velocity is mostly horizontal; clamp velocity.y to ±0.6*len? Add a mild horizontal bias: when computing orientation target, use v but if |v.y| > 0.8*len, damp y. Fine: `_look.copy(p).add(v); if(Math.abs(v.y) > 0.5*Math.max(len,0.001)) _look.y = p.y + v.y*0.5;` whatever, minor.
+
+Also fish shouldn't dive too deep: wall spring on y handles.
+
+Eat check: distance to food < 0.9 (food radius 0.25 + mouth). Grow: f.size *= 1.05; cap at f.maxSize = f.baseScale*2.5.
+
+Update stats DOM only when changed (or every 0.25s). Simple: update on change events + fps twice per second.
+
+Toast messages (Russian):
+- Feed: "🍤 Food thrown into the water"
+- Eat: "🐟 Fish ate and grew!" (throttle: at most once per 1.5s)
+- Add fish: "🐠 New fish joined the school"
+- Bubbles: "💧 +10 bubbles"
+- Light on/off: "☀ Light on" / "🌙 Dimmed the light"
+
+Ripple:
+```js
+function ripple(clientX, clientY){ const el=document.createElement('div'); el.className='ripple'; el.style.left=clientX+'px'; el.style.top=clientY+'px'; document.body.appendChild(el); setTimeout(()=>el.remove(), 700); }
+```
+CSS: .ripple { position:fixed; width:14px;height:14px;border:2px solid rgba(160,230,255,.8); border-radius:50%; transform:translate(-50%,-50%) scale(1); animation: ripple .7s ease-out forwards; pointer-events:none; z-index:5; }
+@keyframes ripple { to { transform: translate(-50%,-50%) scale(6); opacity:0; } }
+
+Now, the "rays" overlay:
+```css
+#rays{position:fixed;inset:-20%;pointer-events:none;z-index:2;mix-blend-mode:screen;opacity:.5;
+background:
+ linear-gradient(115deg, transparent 42%, rgba(140,220,255,.10) 47%, transparent 52%),
+ linear-gradient(105deg, transparent 60%, rgba(120,200,255,.08) 66%, transparent 72%),
+ linear-gradient(125deg, transparent 30%, rgba(150,230,255,.07) 38%, transparent 44%);
+animation: raysShift 14s ease-in-out infinite alternate;}
+@keyframes raysShift { from{transform:translateX(-3%) } to{transform:translateX(3%)} }
+```
+Subtle drifting shafts. Vignette:
+```css
+#vignette{position:fixed;inset:0;pointer-events:none;z-index:2;background:radial-gradient(ellipse at 50% 45%, transparent 55%, rgba(1,8,16,.55) 100%);}
+```
+
+Panels z-index 10.
+
+Title:
+```css
+h1 { font-family:'Unbounded'; font-weight:900; font-size:clamp(22px, 3vw, 34px); letter-spacing:.04em;
+ background: linear-gradient(92deg, #7fe3ff 0%, #4da3ff 45%, #ff9d6c 100%);
+ -webkit-background-clip:text; background-clip: text; color:transparent; }
+```
+Hmm, cyan→blue→coral gradient text. Fine.
+
+Small caps subtitle in Golos, letter-spacing.
+
+Help list: kbd styled chips: background rgba(255,255,255,.08), border, radius 6px, font-size 11px.
+
+Stats: label uppercase 10px letterspace, value Unbounded 700 20px cyan-white. FPS value color shifts? Could color-code: green ≥50, amber 30–50, red <30. Nice detail, cheap: set className.
+
+Live dot: pulsing cyan dot next to "LIVE" label? Add small "● live" indicator with pulse animation in stats header. Cute.
+
+Mobile:
+```css
+@media (max-width: 760px){
+ .panel-info{ left:12px; top:12px; right:12px? } 
+```
+Simpler: shrink padding, hide help list on <560px, stats panel smaller. Let me write reasonable rules.
+
+Also `user-select:none` on UI.
+
+Now let me assemble the full JS. Write it in one IIFE with sections commented (comments in Russian for readability).
+
+One more check — OrbitControls CDN for r128 non-module: https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js — defines THREE.OrbitControls. Good.
+
+Potential pitfall: transmission material in r128 requires `transparent: true`? In r128, transmissive materials are automatically rendered in a separate pass; setting transparent true also adds to transparent pass — can cause double rendering? Common usage in r128 examples (webgl_materials_transmission) uses:
+```js
+new THREE.MeshPhysicalMaterial({ transmission: 1, transparent: true, ... })
+```
+Yes, their example sets transparent: true. OK.
+
+Also `material.side = THREE.DoubleSide` for glass — their example uses FrontSide for bottles. DoubleSide for a box gives refraction on both walls; may look busy but pretty. Keep DoubleSide? Risk: seeing fish through two refraction layers = fish appears doubled? Transmission pass captures the scene without transmissive objects; the back wall is rendered (as part of the box, same material — but the whole box is one transmissive object; when rendering the transmission RT, the entire box is excluded, so the back wall isn't in the RT; then the box renders front+back faces with refraction of the RT). So fish appear once, refracted through the combined glass. OK, fine.
+
+Set glass `depthWrite: false`? If depthWrite true, glass writes depth; fish behind glass (inside) — glass front face is closer, drawn... transparent objects are sorted back-to-front by distance; glass center is at origin, fish inside — sort order may glitch. Safer: glass.depthWrite = false so fish always visible. Transparent pass sorts by distance: fish (opaque, drawn first) then glass. Glass is transparent → drawn after opaque fish → blends/refracts on top. Good, keep depthWrite:false.
+
+Edges lines: opaque-ish, fine.
+
+Bubbles are transparent: drawn in transparent pass with glass; sort order between bubbles and glass by distance — occasional artifact acceptable.
+
+Food: opaque, castShadow.
+
+Shadow camera range: tank is 36 wide → left -24 right 24 top 20 bottom -20, dir light at (14, 30, 16) targeting origin.
+
+dirLight.shadow.bias = -0.0004; normalBias = 0.02 (r128 supports normalBias? Yes, since r112 or so).
+
+Sand receiveShadow, rocks cast+receive, fish cast? Fish casting shadows on sand adds realism: body castShadow true (and tail/fins too). 15 fish × several meshes casting — fine.
+
+Also let me think about initial camera framing: tank 36 wide, 24 tall, 20 deep. Camera fov 55, position (0, 4, 40): distance 40, vertical view height at target = 2*40*tan(27.5°)=41.7 — tank 24 tall fits with room. Horizontal: aspect-dependent; on widescreen fine; portrait mobile: width = 41.7*aspect; aspect 0.5 → 20.8 < 36 — tank cut off horizontally. Mobile: start further: if aspect < 1, camera z = 52. Compute: needed distance for width: d = (36/2)/(tan(hfov/2))... simpler: d = 40 / Math.min(1, aspect*1.1)? Let's do: `const d = Math.max(40, 30 / Math.min(1, aspect));` aspect 0.5 → 60 (max zoom 60 ok). aspect 1 → 40. aspect 1.7 → 40. Cap at 58. Position (0, 5, d).
+
+Now let me write the final HTML. Also `<html lang="ru">`, title "AQUARIUM 3D — Interactive Aquarium".
+
+Meta description too.
+
+Let me write the fish creation function in full:
+
+```js
+const SCHEMES = [
+  { body: 0xff7a1a, fin: 0xffc46b, metal: 0.15 },  // orange
+  { body: 0x2f7bff, fin: 0x8fd0ff, metal: 0.15 },  // blue
+  { body: 0xffcf3f, fin: 0xff5533, metal: 0.15 },  // yellow-red
+  { body: 0x9b4dff, fin: 0xd3a6ff, metal: 0.2 },   // purple
+  { body: 0xe8352e, fin: 0xff9d8a, metal: 0.15 },  // red
+  { body: 0x2ecc71, fin: 0xa7f3c9, metal: 0.15 },  // green
+  { body: 0xff6fa5, fin: 0xffc2d9, metal: 0.15 },  // pink
+  { body: 0xf5b63c, fin: 0xffe9a8, metal: 0.55 },  // gold
+];
+const schemeCache = {};
+function getSchemeMats(s){
+  if(schemeCache[s.body]) return schemeCache[s.body];
+  const m = {
+    body: new THREE.MeshStandardMaterial({ color:s.body, roughness:0.45, metalness:s.metal }),
+    fin: new THREE.MeshStandardMaterial({ color:s.fin, roughness:0.6, metalness:s.metal*0.5, transparent:true, opacity:0.9, side:THREE.DoubleSide }),
+  };
+  schemeCache[s.body]=m; return m;
+}
+```
+
+Shared geometries:
+```js
+const GEO = {
+  body: new THREE.SphereGeometry(1, 22, 16),
+  eye: new THREE.SphereGeometry(0.16, 12, 10),
+  pupil: new THREE.SphereGeometry(0.075, 10, 8),
+  tail: (()=>{ const sh=new THREE.Shape(); sh.moveTo(0,0); sh.lineTo(-0.95,0.7); sh.lineTo(-0.55,0); sh.lineTo(-0.95,-0.7); sh.closePath(); const g=new THREE.ShapeGeometry(sh, 6); g.rotateY(-Math.PI/2); return g; })(),
+  dorsal: (()=>{ const sh=new THREE.Shape(); sh.moveTo(0.45,0); sh.quadraticCurveTo(0.1,0.55,-0.75,0.28); sh.lineTo(-0.75,0); sh.closePath(); const g=new THREE.ShapeGeometry(sh, 8); g.rotateY(-Math.PI/2); return g; })(),
+  fin: (()=>{ const sh=new THREE.Shape(); sh.moveTo(0,0); sh.lineTo(0.5,0.12); sh.lineTo(0.18,0.5); sh.closePath(); const g=new THREE.ShapeGeometry(sh,4); g.rotateX(-Math.PI/2); return g; })(),
+};
+```
+Verify dorsal: shape in XY: base from (0.45,0) to (-0.75,0) along x, apex up via quadratic. After rotateY(-π/2): (x,y,z)→(-z,y,x): base along x → along z (0.45→ z=0.45? Point (0.45,0,0)→(0,0,0.45); (-0.75,0,0)→(0,0,-0.75)). So base spans z 0.45..-0.75, apex up y≈0.5. Thin in x. Place at y=0.8, z=-0.1. Good.
+
+Pectoral: shape (0,0),(0.5,0.12),(0.18,0.5) in XY → rotateX(-π/2): (x,y,0)→(x,0,-y): (0,0,0), (0.5,0,-0.12), (0.18,0,-0.5). Extends +x (outward), -z (backward). Left fin at (0.55, 0.0, 0.35)? Body half-width x=0.75 at middle; at z=0.35 the width is less. Place at (0.42, -0.05, 0.35). Right fin: same geometry, mesh.scale.x = -1, position (-0.42, -0.05, 0.35).
+
+Tail: after rotateY(-π/2): (x,y,0)→(0,y,-x): point (-0.95,0.7,0)→(0,0.7,0.95)?? Wait: rotateY(-π/2): x' = x cosθ + z sinθ? Let me redo properly. Rotation about Y by angle θ: x' = x cosθ + z sinθ; z' = -x sinθ + z cosθ. θ = -π/2: cos=0, sin=-1. x' = x*0 + z*(-1) = -z. z' = -x*(-1) + z*0 = x. So (x,y,z)→(-z, y, x). Point (-0.95, 0.7, 0) → (0, 0.7, -0.95). Extends -z (backward) ✓, ±y ✓, thin in x ✓.
+
+Tail pivot group at (0, 0.05, -1.25); tail mesh child at (0,0,0) with geometry extending to -0.95 → tip at z=-2.2 relative to fish origin. Body end at -1.5. Pivot at -1.25 means the base of the tail is inside the body. Good.
+
+Eyes: eyeWhite at (±0.34, 0.22, 1.05); pupil at (±0.36, 0.22, 1.18)? Pupil slightly forward and outward: pupil position (±0.37, 0.22, 1.16), radius 0.075, z=1.16 vs eye front at 1.05+0.16=1.21 — pupil center at 1.16 is inside eye front (eye front 1.21), pupil front 1.235 — protrudes 0.025. Good.
+
+Body mesh scale: (0.72, 0.85, 1.5).
+
+Fish group:
+```js
+function createFish(){
+  const scheme = SCHEMES[Math.floor(Math.random()*SCHEMES.length)];
+  const mats = getSchemeMats(scheme);
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(GEO.body, mats.body);
+  body.scale.set(0.72, 0.85, 1.5);
+  body.castShadow = true;
+  g.add(body);
+  // eyes
+  const eyeMat = white standard, pupilMat black;
+  const eyeL = new THREE.Mesh(GEO.eye, EYE_MAT); eyeL.position.set(0.34,0.22,1.05);
+  const eyeR = ...(-0.34,...)
+  const pupL = new THREE.Mesh(GEO.pupil, PUPIL_MAT); pupL.position.set(0.37,0.22,1.14);
+  ...
+  // tail
+  const tailPivot = new THREE.Group(); tailPivot.position.set(0,0.05,-1.25);
+  const tail = new THREE.Mesh(GEO.tail, mats.fin); tail.castShadow=true;
+  tailPivot.add(tail); g.add(tailPivot);
+  // dorsal
+  const dorsal = new THREE.Mesh(GEO.dorsal, mats.fin); dorsal.position.set(0,0.78,-0.15);
+  g.add(dorsal);
+  // pectorals
+  const finL = new THREE.Mesh(GEO.fin, mats.fin); finL.position.set(0.42,-0.08,0.35);
+  const finR = new THREE.Mesh(GEO.fin, mats.fin); finR.scale.x=-1; finR.position.set(-0.42,-0.08,0.35);
+  g.add(finL, finR);
+  ...
+}
+```
+Spec's data structure uses `tail`, `leftFin`, `rightFin` — I'll name accordingly (tail = tailPivot or mesh? Store tailPivot as f.tail and rotate it; spec says tail: Mesh — store the pivot group; close enough, or store the mesh and rotate the mesh directly — the mesh's origin is at the base (0,0) since the shape starts at (0,0)! Shape's first point (0,0) is the hinge. So the tail mesh's local origin IS the hinge → I can rotate the mesh directly without a pivot.
+
+So: tail mesh position (0, 0.05, -1.25), rotate tail.rotation.z.
+
+f = { mesh:g, tail, leftFin:finL, rightFin:finR, dorsalFin:dorsal, velocity, speed, tailSpeed, phase, targetFood:null, avoidanceRadius, baseScale, size, wanderDir }
+
+Random initial position: x∈[-14,14], y∈[-8,7], z∈[-7,7].
+
+Velocity: random unit × speed.
+
+Now the main loop:
+
+```js
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  updateFishAll(dt, t);
+  updateFoods(dt);
+  updateBubbles(dt, t);
+  updateWeeds(t);
+  updateSurface(t);
+  controls.update();
+  renderer.render(scene, camera);
+  // fps
+  frames++;
+  if(t - lastFpsT >= 0.5){ fpsEl.textContent = Math.round(frames/(t-lastFpsT)); frames=0; lastFpsT=t; color...}
+}
+```
+
+Note: clock.elapsedTime is updated by getDelta call. Fine.
+
+FPS color classes: .good (≥48) #7dffb0, .mid #ffd76a, .low #ff7a7a.
+
+Stats update: call updateStats() on changes (fish add/remove, bubble add, food add/remove).
+
+Food removal: scene.remove, dispose? Geometries shared (FOOD_GEO), material shared — no need to dispose per item.
+
+Now the feed raycast:
+
+```js
+const raycaster = new THREE.Raycaster();
+const pointerNDC = new THREE.Vector2();
+renderer.domElement.addEventListener('pointerdown', e => { downX=e.clientX; downY=e.clientY; downT=performance.now(); controls.autoRotate=false; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if(e.button !== 0) return;
+  const dx = e.clientX-downX, dy=e.clientY-downY;
+  if(dx*dx+dy*dy > 36 || performance.now()-downT > 450) return;
+  pointerNDC.set((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1);
+  raycaster.setFromCamera(pointerNDC, camera);
+  const hit = raycaster.intersectObject(glassMesh, false)[0];
+  if(!hit) return;
+  const p = hit.point.clone().sub(hit.face.normal.clone().applyQuaternion(glassMesh.quaternion).multiplyScalar(1.5));
+  p.x = clamp(p.x, -16.5, 16.5); p.y = clamp(p.y, -10.5, 11); p.z = clamp(p.z, -8.5, 8.5);
+  spawnFood(p);
+  ripple(e.clientX, e.clientY);
+  showToast('🍤 Food thrown into the water');
+});
+```
+Glass mesh has no rotation → face normal is local = world. Just use hit.face.normal. But BoxGeometry face normals are axis-aligned; fine.
+
+Wait — hit.point is on the outer surface; normal points outward; subtract normal*1.5 → inside. Good.
+
+spawnFood:
+```js
+const food = { mesh:new THREE.Mesh(FOOD_GEO, FOOD_MAT), vy:0, landed:false, landT:0 };
+food.mesh.position.copy(p); food.mesh.castShadow=true; scene.add(food.mesh); foods.push(food); updateStats();
+```
+FOOD_GEO = SphereGeometry(0.28, 10, 8); FOOD_MAT = MeshStandardMaterial({color:0xd9832f, roughness:0.7, emissive:0x40200a}).
+
+updateFoods:
+```js
+for(let i=foods.length-1;i>=0;i--){
+  const f = foods[i]; const p = f.mesh.position;
+  if(!f.landed){
+    f.vy = Math.max(f.vy - 5*dt, -3.2);
+    p.y += f.vy*dt;
+    if(p.y <= FOOD_FLOOR){ p.y = FOOD_FLOOR; f.landed = true; }
+  } else {
+    f.landT += dt;
+    const s = Math.max(0.001, 1 - f.landT/1.4);
+    f.mesh.scale.setScalar(s);
+    if(f.landT > 1.4) removeFood(i);
+  }
+}
+```
+FOOD_FLOOR = -11.1.
+
+Eat in fish update: if distance < 0.9 → removeFood(index of f.targetFood), grow, toast throttled.
+
+removeFood: splice, scene.remove, updateStats.
+
+Careful: fish iterate and eat → modify foods array during iteration of fish — fine as long as we index properly. In updateFish, we search foods by reference; on eat, find index via foods.indexOf(food).
+
+Growth toast throttle: lastEatToast timestamp.
+
+Now the seaweed curves: make sure the base point is at (0,0,0) so group rotation pivots at base. Points:
+```js
+const pts = [];
+const segs = 5;
+for(let i=0;i<=segs;i++){
+  const h = (i/segs)*height;
+  const sway = i/segs;
+  pts.push(new THREE.Vector3(Math.sin(seed*3+i*1.4)*0.35*sway, h, Math.cos(seed*5+i*1.1)*0.35*sway));
+}
+```
+TubeGeometry(curve, 14, 0.14, 6, false). Radius constant; tip is blunt — fine, low-poly.
+
+Weed placement: random x∈[-15,15], z∈[-7.5,7.5], avoid center? Anywhere fine.
+
+Rock deformation:
+```js
+const seedV = new THREE.Vector3(rand.., rand.., rand..).normalize();
+const seedV2 = ...;
+for each vertex i:
+  const v = new THREE.Vector3().fromBufferAttribute(pos, i).normalize();
+  const d = 1 + 0.22*Math.sin(v.dot(seedV)*4 + i*0.0) ... 
+```
+Use only dot-based (consistent across duplicated verts): d = 1 + 0.25*Math.sin(v.dot(seedV)*5) * 0.5 + 0.2*Math.sin(v.dot(seedV2)*7 + 1.7). Multiply position by d*r? Position = dir * (r*d). Then scale y by 0.8. computeVertexNormals. flatShading true.
+
+Colors: 0x8a8f98, 0x7d7468, 0x6f7a80, 0x95897a variations with slight randomness via HSL:
+```js
+const c = new THREE.Color().setHSL(0.08+Math.random()*0.05, 0.08+Math.random()*0.1, 0.35+Math.random()*0.15);
+```
+
+Now the UI wiring:
+
+```js
+btnFish.onclick: if(fishArray.length>=40){toast('🐠 Maximum 40 fish');return;} createFishAtRandom(); toast('🐠 New fish joined the school');
+btnBubbles: for 10 spawnBubble(); toast('💧 +10 bubbles');
+btnLight: toggle; classList.toggle('is-off'); update label? Keep icon swap: btn.innerHTML = lightOn ? '☀ Light' : '🌙 Light'. Toast.
+```
+
+Initial: 15 fish, 30 bubbles.
+
+Panel content (Russian):
+
+Info panel:
+- h1: AQUARIUM·3D? Let me do "AQUARIUM" big + small badge "3D".
+- tagline: "Interactive aquarium with living fish"
+- help:
+  - "Left button" — orbit
+  - "Right button" — pan
+  - "Wheel" — zoom
+  - "Click on water" — feed fish
+- buttons.
+
+Stats panel:
+- Header: "Telemetry" + live dot
+- Rows: Fish / Bubbles / Food / FPS
+
+Bottom hint bar? Add small footer bottom-left: "Three.js r128 · WebGL" tiny. Optional. Add a small credit bottom-right: "Three.js · WebGL". Subtle.
+
+Now CSS in full. Font stack: body: 'Golos Text', system-ui...; display: 'Unbounded'.
+
+Let me write the CSS:
+
+```css
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{
+  font-family:'Golos Text',system-ui,sans-serif;
+  color:#dff2ff;
+  background:
+    radial-gradient(120% 90% at 50% -10%, #0f5c86 0%, #0a3f63 30%, #062a46 55%, #03182b 80%, #020f1d 100%);
+}
+#app{position:fixed;inset:0;z-index:1}
+#app canvas{display:block;cursor:crosshair;animation:fadein 1.4s ease both}
+```
+Wait, z-index: canvas z1, rays z2, vignette z2, UI z10, ripple z20, toast z30.
+
+Panels:
+```css
+.panel{position:fixed;z-index:10;background:rgba(7,29,47,.55);border:1px solid rgba(126,214,255,.22);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 18px 50px rgba(1,10,22,.55), inset 0 1px 0 rgba(180,235,255,.12);}
+.panel-info{top:20px;left:20px;width:290px;padding:20px 20px 18px;border-radius:20px;animation:slideInR .9s cubic-bezier(.16,1,.3,1) .15s both}
+.panel-stats{top:20px;right:20px;width:210px;padding:16px 18px;border-radius:16px;animation:slideInL .9s cubic-bezier(.16,1,.3,1) .3s both}
+```
+
+Brand row: fish emoji in a circular chip + title.
+```css
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:6px}
+.brand-badge{width:44px;height:44px;display:grid;place-items:center;font-size:24px;border-radius:14px;background:linear-gradient(135deg,rgba(55,213,255,.25),rgba(47,123,255,.15));border:1px solid rgba(126,214,255,.3);animation:bob 3s ease-in-out infinite}
+h1{font-family:'Unbounded';font-size:24px;font-weight:900;letter-spacing:.03em;background:linear-gradient(92deg,#8fe8ff,#4da3ff 55%,#ffb37c);-webkit-background-clip:text;background-clip:text;color:transparent;line-height:1}
+h1 sup/span.badge3d{...}
+```
+Add "3D" as a separate small span with different style:
+```html
+<h1>AQUARIUM <span>3D</span></h1>
+```
+span: font-size 12px, color #7fe3ff, -webkit-text-fill-color:#7fe3ff (to override transparent), vertical-align: super? Use inline-block transform. Simpler: span{font-size:.45em;-webkit-text-fill-color:#ffb37c;letter-spacing:.15em}.
+
+@keyframes bob { 50%{transform:translateY(-4px) rotate(-6deg)} }
+
+Tagline: font-size 12.5px, color #9fc6dd, margin-bottom 14px.
+
+Help list:
+```css
+.help{list-style:none;display:grid;gap:7px;margin-bottom:16px}
+.help li{display:flex;align-items:center;gap:8px;font-size:12px;color:#bfe0f2}
+kbd{font-family:'Golos Text';font-size:10.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:rgba(126,214,255,.12);border:1px solid rgba(126,214,255,.25);color:#cfeeff;white-space:nowrap}
+```
+
+Actions:
+```css
+.actions{display:flex;flex-wrap:wrap;gap:8px}
+.btn{appearance:none;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:9px 14px;font-family:'Golos Text';font-size:12.5px;font-weight:600;color:#fff;cursor:pointer;transition:transform .18s ease, box-shadow .18s ease, filter .18s ease;letter-spacing:.02em}
+.btn:hover{transform:translateY(-2px)}
+.btn:active{transform:translateY(0) scale(.96)}
+.btn:focus-visible{outline:2px solid #7fe3ff;outline-offset:2px}
+.btn-coral{background:linear-gradient(135deg,#ff9a5a,#ff5e62)}
+.btn-coral:hover{box-shadow:0 10px 26px rgba(255,94,98,.45)}
+.btn-cyan{background:linear-gradient(135deg,#37d5ff,#2f7bff)}
+.btn-cyan:hover{box-shadow:0 10px 26px rgba(47,150,255,.45)}
+.btn-amber{background:linear-gradient(135deg,#ffd76a,#ff9d3c);color:#3a2405}
+.btn-amber:hover{box-shadow:0 10px 26px rgba(255,180,60,.4)}
+.btn-amber.is-off{filter:grayscale(.7) brightness(.75)}
+```
+
+Stats:
+```css
+.stats-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.stats-head h2{font-family:'Unbounded';font-size:11px;font-weight:700;letter-spacing:.22em;text-transform:uppercase;color:#8fd0ef}
+.live{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.1em;color:#7dffb0;text-transform:uppercase}
+.live i{width:7px;height:7px;border-radius:50%;background:#7dffb0;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25;transform:scale(.7)}}
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0;border-top:1px dashed rgba(126,214,255,.15)}
+.stat span:first-child{font-size:11.5px;color:#9fc6dd;letter-spacing:.03em}
+.stat b{font-family:'Unbounded';font-size:17px;font-weight:700;color:#eaf7ff}
+#stat-fps.good{color:#7dffb0} .mid{color:#ffd76a} .low{color:#ff8585}
+```
+Use <b> for values.
+
+Toast:
+```css
+#toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,16px);z-index:30;padding:10px 20px;border-radius:999px;background:rgba(7,29,47,.8);border:1px solid rgba(126,214,255,.35);backdrop-filter:blur(10px);font-size:13px;font-weight:500;opacity:0;pointer-events:none;transition:opacity .3s ease, transform .3s cubic-bezier(.16,1,.3,1);box-shadow:0 12px 30px rgba(1,10,22,.5)}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+```
+
+Credit:
+```css
+.credit{position:fixed;right:18px;bottom:14px;z-index:10;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:rgba(159,198,221,.5)}
+```
+
+Keyframes: fadein, slideInR (from translateX(-24px) opacity 0), slideInL, ripple, raysShift, bob, pulse.
+
+Media queries:
+```css
+@media (max-width:820px){
+ .panel-info{width:calc(100vw - 40px);max-width:320px;top:14px;left:14px;padding:16px}
+ .panel-stats{top:auto;bottom:14px;right:14px;width:170px;padding:12px 14px}
+ .help li:nth-child(n+3){display:none}? 
+```
+Hmm, hiding zoom help is fine on mobile (touch). Actually OrbitControls on touch: 1-finger rotate, 2-finger zoom/pan. Help text mentions mouse; on mobile show fewer. Hide .help entirely below 560px, keep buttons.
+
+```css
+@media (max-width:560px){
+ .help{display:none}
+ h1{font-size:20px}
+ .credit{display:none}
+}
+```
+
+Now let me finalize the JS numbers and write it all out. Also remember `updateStats()` to set textContent of stat-fish, stat-bubbles, stat-food.
+
+Auto-rotate: controls.autoRotate=true; autoRotateSpeed=0.6; stop on pointerdown and wheel on canvas.
+
+Another consideration: `renderer.domElement` appended to #app div.
+
+Resize handler updates camera aspect + renderer size.
+
+Initial camera:
+```js
+const aspect = innerWidth/innerHeight;
+const dist = Math.min(58, Math.max(42, 34/Math.min(1, aspect*1.05)));
+camera.position.set(0, 5, dist);
+```
+aspect 1.7 → 42; aspect 1 → 42; aspect 0.6 → 34/0.63=54; ok.
+
+Hmm wait, 34/(aspect*1.05) with aspect 1.7 → 34/1.785=19 → max(42,...) = 42. Good.
+
+Light toggle also affects point lights: p1.intensity = lightOn?0.7:0.35; p2 similarly. And exposure? Keep simple.
+
+Toast function:
+```js
+let toastTimer;
+function showToast(msg){ toastEl.textContent=msg; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>toastEl.classList.remove('show'), 1800); }
+```
+
+Ripple CSS as planned.
+
+Surface wave update:
+```js
+const surfPos = surfGeo.attributes.position;
+const surfBase = surfPos.array.slice(); // copy of original x,y,z (y=0 after rotate)
+function updateSurface(t){
+  const arr = surfPos.array;
+  for(let i=0;i<arr.length;i+=3){
+    const x = surfBase[i], z = surfBase[i+2];
+    arr[i+1] = 0.14*Math.sin(x*0.55+t*1.3) + 0.1*Math.cos(z*0.75+t*0.9);
+  }
+  surfPos.needsUpdate = true;
+  surfGeo.computeVertexNormals();
+}
+```
+Plane rotated -π/2: local x stays x, local y→? After rotateX(-π/2), the plane's original (x,y,0) → (x, 0, y)? rotateX(-π/2): y'=y cos(-90)-z sin(-90)= z... for z=0: y' = 0*? Let me compute: cos(-90)=0, sin(-90)=-1. y' = y*0 - 0*(-1) = 0. z' = y*(-1) + 0*0 = -y. So (x,y,0)→(x,0,-y). Plane lies in XZ. Displacing arr[i+1] (y) is vertical.
+
+computeVertexNormals each frame on 29×18 grid = 551 verts — fine.
+
+Bubble geometry: unit sphere SphereGeometry(1, 10, 8), scale per bubble.
+
+Weed count 12, each 1–3 blades.
+
+Also add small "pebbles" scattered on sand? Not in spec; skip — rocks + sand + seaweed + bubbles is enough.
+
+Fish eye material: EYE_MAT = MeshStandardMaterial({color:0xf4f9ff, roughness:0.25}); PUPIL_MAT = MeshStandardMaterial({color:0x0a0f14, roughness:0.2}).
+
+Verify fish update orientation: velocity used for lookAt; ensure not zero.
+
+Wander dir update:
+```js
+f.wanderDir.x += (Math.random()-0.5)*dt*3;
+f.wanderDir.y += (Math.random()-0.5)*dt*1.2;
+f.wanderDir.z += (Math.random()-0.5)*dt*3;
+f.wanderDir.normalize();
+```
+Continuous random walk — smooth enough. Plus periodic impulse:
+```js
+f.wanderT -= dt;
+if(f.wanderT<=0){ f.wanderT = 2+Math.random()*4; f.wanderDir.set(Math.random()-0.5, (Math.random()-0.5)*0.5, Math.random()-0.5).normalize(); }
+```
+
+Steering coefficient: `f.velocity.lerp(desired, 1 - Math.exp(-dt*2.5))` — smoother framerate-independent. Use that.
+
+Then clamp speed.
+
+Wall spring applied to desired before lerp:
+```js
+const BX=16.5, BY_TOP=10.5, BY_BOT=-10.5, BZ=8.5;
+if(p.x > BX-2) desired.x -= (p.x-(BX-2))*5;
+if(p.x < -(BX-2)) desired.x += ((-BX+2)-p.x)*5;
+```
+Cleaner:
+```js
+const mx = BX-2, mz=BZ-2, myT=BY_TOP-1.5, myB=BY_BOT+1.5;
+if(p.x> mx) desired.x -= (p.x-mx)*6;
+if(p.x<-mx) desired.x += (-mx-p.x)*6;
+if(p.z> mz) desired.z -= (p.z-mz)*6;
+if(p.z<-mz) desired.z += (-mz-p.z)*6;
+if(p.y> myT) desired.y -= (p.y-myT)*6;
+if(p.y< myB) desired.y += (-myB-p.y)*6;
+```
+Then hard clamp position to [−BX,BX] etc.
+
+Desired baseline: wanderDir*speed. Food: toFood*speed*2.
+
+Combine: desired = base; then add avoidance & walls; then lerp velocity toward desired; then clamp to [0.4*speed, (food?2:1.2)*speed].
+
+Growth: f.size=min(f.size*1.05, f.baseScale*2.4); f.mesh.scale.setScalar(f.size).
+
+Tail speed: 6+rand*6 rad/s; phase rand*6.28.
+
+I think the code is ready to write. Length will be substantial (~600-700 lines). That's fine — a complete, polished single file.
+
+Response language: Russian. Brief intro, then a single HTML code block, then short notes (how to run, what's inside, tips). Keep prose concise; the deliverable is the file.
+
+Let me double-check r128 OrbitControls path: three@0.128.0/examples/js/controls/OrbitControls.js — exists on jsdelivr. Yes.
+
+One risk: cdnjs three r128 min — fine.
+
+Also guard: if WebGL unavailable — try/catch showing message. Minor; add a simple check.
+
+Also `THREE.ColorManagement`? Not in r128 (that's r139+). Skip.
+
+sRGBEncoding + ACES: colors will be a bit darker; bump light intensities: dir 1.2, ambient 0.4 (spec), points 0.7/0.55. Fish colors with standard material under ACES will be fine.
+
+Hmm, actually with ACES tonemapping, saturated fish colors desaturate slightly; acceptable, filmic look.
+
+Shadow: dirLight position (16, 30, 18); shadow.camera: left -26, right 26, top 22, bottom -22, near 5, far 80.
+
+Glass box: does it cast shadow? No (castShadow false) — otherwise the whole tank is in shadow.
+
+Sand receiveShadow — light comes from top-right; fish shadows on sand.
+
+Weed castShadow true (tubes) — nice.
+
+Also let me re-verify the transmission pass in r128 with alpha:true renderer — transmission RT has transparent background; glass over CSS gradient: refraction samples the RT (which contains fish, sand, etc., with transparent bg → premultiplied?). There might be a slight edge artifact where the glass shows blackish through transmission where nothing is behind (through the glass to the open background beyond the tank's back wall). Hmm! The transmission RT captures the scene excluding transmissive objects — the background beyond the tank is the scene background (alpha 0 → black in RT?). In r128, the transmission render target is cleared with renderer clear color (black, alpha 0?). Then glass shows darkened background through it. Since the tank is a box and we're looking through the front wall into the tank interior, we mostly see fish/sand inside; the region beyond the tank edges (glass corners vs interior) — the glass is exactly the tank boundary; looking at the glass, behind it is the tank interior (sand fills the bottom, water volume is empty → background). So the upper region of the glass would show darkened background rather than the CSS gradient. With opacity/transmission mix, it'll look like a darker water volume — actually that's desirable! It reads as "water". But might look too dark/black. Mitigation: add a large translucent "water volume" box inside the glass: BoxGeometry(35.4, 23.4, 19.4) MeshBasicMaterial({color:0x1a6d9e, transparent:true, opacity:0.18, side:BackSide? or FrontSide, depthWrite:false}). This tints the interior so glass transmission picks up bluish water rather than black. Yes — add water volume mesh (renderOrder before glass). Use side: THREE.BackSide so we see the back faces (interior) — combined with front? Use DoubleSide with low opacity, depthWrite false. This will also improve fog blending. Good idea.
+
+Also scene.background = null (alpha). Fog color 0x0a3d5e density 0.011.
+
+Actually wait: FogExp2 with alpha background: distant objects fade to fog color (solid), while the page background is a gradient — the horizon mismatch is hidden because the tank occupies the view center. Fine.
+
+Render order: water volume (transparent, renderOrder 1), glass (renderOrder 3), bubbles (renderOrder 2)? Transparent sorting is by distance anyway; explicit renderOrder helps: set waterVol.renderOrder=1; bubbles default 0... distance sort dominates unless renderOrder differs. Let me set: waterVol.renderOrder = 1; glass.renderOrder = 2; surface.renderOrder = 1; bubbles leave default (sorted among themselves). Edge lines are opaque (LineBasicMaterial transparent true opacity 0.5 → transparent pass, renderOrder 3).
+
+Good enough.
+
+Now, "growth" visibility: base 0.6–1.2, cap 2.4× → max absolute scale ~2.9 → fish length ~8.7 units. Reasonable.
+
+Initial stats: fish 15, bubbles 30, food 0.
+
+Let me write the final answer: brief Russian intro, code block, short usage/features note. Format: minimal headers, code-heavy. The deliverable is a single file — present it as `aquarium.html`.
+
+Let me now write the complete code carefully, checking syntax as I go.
+
+Also: pointerup feed — should ignore if pointerup happens outside canvas? Listener is on renderer.domElement, fine.
+
+Touch: pointerup with button 0 works for touch too (pointerType touch, button 0). Movement threshold OK.
+
+Disable autoRotate on 'wheel' event on canvas too.
+
+Let me write out the fish update function fully:
+
+```js
+const _desired = new THREE.Vector3();
+const _diff = new THREE.Vector3();
+const _orient = new THREE.Object3D();
+const UP = new THREE.Vector3(0,1,0);
+
+function updateFish(f, dt, t){
+  const p = f.mesh.position;
+  // wander
+  f.wanderT -= dt;
+  if(f.wanderT <= 0){
+    f.wanderT = 2 + Math.random()*4;
+    f.wanderDir.set(Math.random()-0.5, (Math.random()-0.5)*0.6, Math.random()-0.5).normalize();
+  }
+  f.wanderDir.x += (Math.random()-0.5)*dt*2.5;
+  f.wanderDir.y += (Math.random()-0.5)*dt*1.2;
+  f.wanderDir.z += (Math.random()-0.5)*dt*2.5;
+  f.wanderDir.normalize();
+
+  _desired.copy(f.wanderDir).multiplyScalar(f.speed);
+
+  // food
+  f.targetFood = null;
+  let bestD = 15;
+  for(const fd of foods){
+    const d = p.distanceTo(fd.mesh.position);
+    if(d < bestD){ bestD = d; f.targetFood = fd; }
+  }
+  if(f.targetFood){
+    _diff.copy(f.targetFood.mesh.position).sub(p).normalize();
+    _desired.copy(_diff).multiplyScalar(f.speed*2.1);
+    if(bestD < 0.95) eatFood(f, f.targetFood);
+  }
+
+  // collision avoidance
+  for(const o of fishArray){
+    if(o === f) continue;
+    _diff.copy(p).sub(o.mesh.position);
+    const d = _diff.length();
+    if(d < f.avoidanceRadius && d > 0.001){
+      _diff.multiplyScalar((1 - d/f.avoidanceRadius) * f.speed * 2.6 / d);
+      _desired.add(_diff);
+    }
+  }
+
+  // walls
+  const MX=14.5, MZ=6.5, MYT=9, MYB=-9.5;
+  if(p.x >  MX) _desired.x -= (p.x-MX)*6;
+  if(p.x < -MX) _desired.x += (-MX-p.x)*6;
+  if(p.z >  MZ) _desired.z -= (p.z-MZ)*6;
+  if(p.z < -MZ) _desired.z += (-MZ-p.z)*6;
+  if(p.y >  MYT) _desired.y -= (p.y-MYT)*6;
+  if(p.y < MYB) _desired.y += (MYB-p.y)*6;
+
+  // steering
+  f.velocity.lerp(_desired, 1 - Math.exp(-2.5*dt));
+  const sp = f.velocity.length() || 0.001;
+  const maxS = f.speed * (f.targetFood ? 2.1 : 1.25);
+  const minS = f.speed * 0.45;
+  if(sp > maxS) f.velocity.multiplyScalar(maxS/sp);
+  else if(sp < minS) f.velocity.multiplyScalar(minS/sp);
+
+  p.addScaledVector(f.velocity, dt);
+  p.x = THREE.MathUtils.clamp(p.x, -16.8, 16.8);
+  p.y = THREE.MathUtils.clamp(p.y, -10.8, 11);
+  p.z = THREE.MathUtils.clamp(p.z, -8.8, 8.8);
+
+  // orientation
+  _orient.position.copy(p);
+  _orient.lookAt(p.x + f.velocity.x, p.y + f.velocity.y*0.6, p.z + f.velocity.z);
+  f.mesh.quaternion.slerp(_orient.quaternion, Math.min(1, dt*5));
+
+  // animation
+  const wag = Math.sin(t*f.tailSpeed + f.phase);
+  const wag2 = Math.sin(t*f.tailSpeed*0.5 + f.phase*1.7);
+  f.tail.rotation.z = wag*0.55 + wag2*0.1;
+  f.tail.rotation.y = wag*0.15;
+  const flap = Math.sin(t*f.tailSpeed*0.85 + f.phase)*0.35 + 0.25;
+  f.leftFin.rotation.x = flap;
+  f.rightFin.rotation.x = flap;
+  f.dorsalFin.rotation.x = Math.sin(t*f.tailSpeed*0.5 + f.phase)*0.08;
+}
+```
+
+Wait, rightFin has scale.x=-1; rotation.x with negative x-scale: rotation applies in local space; the mirror flips the visual direction of x-rotation? Rotation about X axis with scale.x=-1: the fin extends -z and +x (local, mirrored to -x). Rotation about X rotates Y/Z — unaffected by x-mirror. So both fins flap identically (both tips go up together) — actually that's correct symmetric flapping! Good, no need to negate.
+
+Hmm, but the fin geometry extends +x (outward) and -z. Left fin at x=+0.42 extends +x (outward) ✓. Right fin mirrored extends -x (outward) ✓. Flap rotation.x positive rotates -z toward +y? Rotation about X by θ: z' = -sinθ*y... point (0,0,-1) rotated about X by θ: y' = -(-1)sinθ? Formula: y' = y cosθ - z sinθ = 0 - (-1)sinθ = sinθ; z' = y sinθ + z cosθ = -cosθ. So tip goes up (y'=sinθ>0 for θ>0) and stays -z. Positive flap lifts fin tip up. Oscillates ±0.35 around 0.25 → 0.25±0.35 ∈ [-0.1, 0.6] — mostly up, sometimes neutral. Fine.
+
+eatFood:
+```js
+function eatFood(fish, food){
+  const i = foods.indexOf(food);
+  if(i === -1) return;
+  foods.splice(i,1);
+  scene.remove(food.mesh);
+  fish.size = Math.min(fish.size*1.05, fish.baseScale*2.4);
+  fish.mesh.scale.setScalar(fish.size);
+  updateStats();
+  if(performance.now() - lastEatToast > 1500){
+    lastEatToast = performance.now();
+    showToast('🐟 Fish ate and grew!');
+  }
+}
+```
+
+createFish:
+```js
+function createFish(){
+  const scheme = SCHEMES[(Math.random()*SCHEMES.length)|0];
+  const mats = getSchemeMats(scheme);
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(GEO.body, mats.body);
+  body.scale.set(0.72, 0.85, 1.5);
+  body.castShadow = true;
+  g.add(body);
+  const eyeL = new THREE.Mesh(GEO.eye, EYE_MAT); eyeL.position.set(0.34, 0.22, 1.05);
+  const eyeR = new THREE.Mesh(GEO.eye, EYE_MAT); eyeR.position.set(-0.34, 0.22, 1.05);
+  const pupL = new THREE.Mesh(GEO.pupil, PUPIL_MAT); pupL.position.set(0.37, 0.22, 1.15);
+  const pupR = new THREE.Mesh(GEO.pupil, PUPIL_MAT); pupR.position.set(-0.37, 0.22, 1.15);
+  g.add(eyeL, eyeR, pupL, pupR);
+  const tail = new THREE.Mesh(GEO.tail, mats.fin);
+  tail.position.set(0, 0.05, -1.25);
+  tail.castShadow = true;
+  g.add(tail);
+  const dorsalFin = new THREE.Mesh(GEO.dorsal, mats.fin);
+  dorsalFin.position.set(0, 0.78, -0.15);
+  g.add(dorsalFin);
+  const leftFin = new THREE.Mesh(GEO.fin, mats.fin);
+  leftFin.position.set(0.42, -0.08, 0.35);
+  const rightFin = new THREE.Mesh(GEO.fin, mats.fin);
+  rightFin.scale.x = -1;
+  rightFin.position.set(-0.42, -0.08, 0.35);
+  g.add(leftFin, rightFin);
+
+  const baseScale = 0.6 + Math.random()*0.6;
+  g.scale.setScalar(baseScale);
+  g.position.set((Math.random()-0.5)*28, (Math.random()-0.5)*14, (Math.random()-0.5)*14);
+  scene.add(g);
+
+  const speed = 2.2 + Math.random()*2.2;
+  const fish = {
+    mesh: g, tail, leftFin, rightFin, dorsalFin,
+    velocity: new THREE.Vector3(Math.random()-0.5, (Math.random()-0.5)*0.4, Math.random()-0.5).normalize().multiplyScalar(speed),
+    speed,
+    tailSpeed: 6 + Math.random()*6,
+    phase: Math.random()*Math.PI*2,
+    targetFood: null,
+    avoidanceRadius: 2.4 + Math.random()*1.4,
+    baseScale,
+    size: baseScale,
+    wanderDir: new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize(),
+    wanderT: Math.random()*3,
+  };
+  fishArray.push(fish);
+  updateStats();
+  return fish;
+}
+```
+
+Position ranges: x ±14, y ±7, z ±7.
+
+Bubble spawn:
+```js
+function spawnBubble(initial){
+  const r = 0.1 + Math.random()*0.28;
+  const m = new THREE.Mesh(BUBBLE_GEO, BUBBLE_MAT);
+  m.scale.setScalar(r);
+  const b = {
+    mesh: m,
+    baseX: (Math.random()-0.5)*32,
+    baseZ: (Math.random()-0.5)*17,
+    y: initial ? (Math.random()-0.5)*22 : -11.2,
+    speed: 1.2 + Math.random()*2.2,
+    amp: 0.15 + Math.random()*0.45,
+    freq: 0.8 + Math.random()*1.8,
+    phase: Math.random()*Math.PI*2,
+  };
+  m.position.set(b.baseX, b.y, b.baseZ);
+  scene.add(m);
+  bubbles.push(b);
+}
+function updateBubbles(dt, t){
+  for(const b of bubbles){
+    b.y += b.speed*dt;
+    if(b.y > 11.2){ b.y = -11.3; b.baseX=(Math.random()-0.5)*32; b.baseZ=(Math.random()-0.5)*17; }
+    b.mesh.position.set(
+      b.baseX + Math.sin(t*b.freq + b.phase)*b.amp,
+      b.y,
+      b.baseZ + Math.cos(t*b.freq*0.8 + b.phase)*b.amp*0.7
+    );
+  }
+}
+```
+
+Weeds:
+```js
+function createWeeds(){
+  for(let i=0;i<12;i++){
+    const group = new THREE.Group();
+    const blades = 1 + (Math.random()*3|0);
+    const seed = Math.random()*10;
+    for(let j=0;j<blades;j++){
+      const h = 2.5 + Math.random()*5;
+      const pts = [];
+      for(let k=0;k<=4;k++){
+        const s = k/4;
+        pts.push(new THREE.Vector3(
+          Math.sin(seed*3.1 + j*2.2 + k*1.3)*0.4*s,
+          h*s,
+          Math.cos(seed*5.7 + j*1.7 + k*1.1)*0.4*s
+        ));
+      }
+      const curve = new THREE.CatmullRomCurve3(pts);
+      const geo = new THREE.TubeGeometry(curve, 14, 0.1 + Math.random()*0.12, 6, false);
+      const col = new THREE.Color().setHSL(0.32 + Math.random()*0.14, 0.55 + Math.random()*0.2, 0.28 + Math.random()*0.15);
+      const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:col, roughness:0.85}));
+      mesh.castShadow = true;
+      group.add(mesh);
+    }
+    group.position.set((Math.random()-0.5)*30, -11.7, (Math.random()-0.5)*16);
+    scene.add(group);
+    weeds.push({group, phase:Math.random()*6.28, speed:0.5+Math.random()*0.9, amp:0.04+Math.random()*0.06});
+  }
+}
+function updateWeeds(t){
+  for(const w of weeds){
+    w.group.rotation.x = Math.sin(t*w.speed + w.phase)*w.amp;
+    w.group.rotation.z = Math.cos(t*w.speed*0.8 + w.phase)*w.amp;
+  }
+}
+```
+
+Rocks:
+```js
+function createRocks(){
+  for(let i=0;i<8;i++){
+    const r = 0.7 + Math.random()*1.2;
+    const geo = new THREE.DodecahedronGeometry(r, 0);
+    const s1 = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+    const s2 = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+    const pos = geo.attributes.position;
+    const v = new THREE.Vector3();
+    for(let k=0;k<pos.count;k++){
+      v.fromBufferAttribute(pos,k).normalize();
+      const d = 1 + 0.28*Math.sin(v.dot(s1)*4.2) + 0.18*Math.sin(v.dot(s2)*6.7 + 1.7);
+      pos.setXYZ(k, v.x*d, v.y*d*0.8, v.z*d);
+    }
+    geo.computeVertexNormals();
+    const col = new THREE.Color().setHSL(0.07+Math.random()*0.06, 0.07+Math.random()*0.1, 0.32+Math.random()*0.18);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:col, roughness:0.95, flatShading:true}));
+    mesh.castShadow = mesh.receiveShadow = true;
+    mesh.position.set((Math.random()-0.5)*30, -11.8 + r*0.3, (Math.random()-0.5)*16);
+    mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+    scene.add(mesh);
+  }
+}
+```
+Note: DodecahedronGeometry detail 0 — PolyhedronGeometry with detail 0, non-indexed? PolyhedronGeometry produces non-indexed with duplicated vertices (subdivided). Dot-based displacement is consistent. Good.
+
+Sand:
+```js
+function createSand(){
+  const geo = new THREE.PlaneGeometry(35.4, 19.4, 44, 30);
+  geo.rotateX(-Math.PI/2);
+  const pos = geo.attributes.position;
+  for(let i=0;i<pos.count;i++){
+    const x = pos.getX(i), z = pos.getZ(i);
+    pos.setY(i, 0.26*Math.sin(x*0.5+1.3)*Math.cos(z*0.62+2.1) + 0.12*Math.sin(x*1.9+z*1.4) + 0.08*Math.sin(z*2.6+0.5));
+  }
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:0xd9c08a, roughness:1}));
+  mesh.receiveShadow = true;
+  mesh.position.y = -11.9;
+  scene.add(mesh);
+}
+```
+
+Surface:
+```js
+let surfGeo, surfBase;
+function createSurface(){
+  surfGeo = new THREE.PlaneGeometry(35.2, 19.2, 26, 16);
+  surfGeo.rotateX(-Math.PI/2);
+  surfBase = Float32Array.from(surfGeo.attributes.position.array);
+  const mesh = new THREE.Mesh(surfGeo, new THREE.MeshPhongMaterial({color:0x9fdcff, transparent:true, opacity:0.14, side:THREE.DoubleSide, shininess:120, specular:0x9fdcff, depthWrite:false}));
+  mesh.position.y = 11.8;
+  mesh.renderOrder = 1;
+  scene.add(mesh);
+}
+```
+
+Water volume:
+```js
+const vol = new THREE.Mesh(new THREE.BoxGeometry(35.2, 23.2, 19.2), new THREE.MeshBasicMaterial({color:0x146a9c, transparent:true, opacity:0.16, side:THREE.DoubleSide, depthWrite:false}));
+vol.renderOrder = 0;
+scene.add(vol);
+```
+
+Glass:
+```js
+const glassGeo = new THREE.BoxGeometry(36,24,20);
+const glassMat = new THREE.MeshPhysicalMaterial({
+  color:0xbfe6ff, metalness:0, roughness:0.06,
+  transmission:0.95, ior:1.33, thickness:1.4,
+  transparent:true, opacity:1, side:THREE.DoubleSide, depthWrite:false
+});
+const glassMesh = new THREE.Mesh(glassGeo, glassMat);
+glassMesh.renderOrder = 3;
+scene.add(glassMesh);
+const edges = new THREE.LineSegments(new THREE.EdgesGeometry(glassGeo), new THREE.LineBasicMaterial({color:0x9fdcff, transparent:true, opacity:0.55}));
+edges.renderOrder = 4;
+scene.add(edges);
+```
+
+Lights:
+```js
+scene.add(new THREE.AmbientLight(0x404040, 0.4));
+const hemi = new THREE.HemisphereLight(0x7ec8ff, 0x0a2a44, 0.35); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff2df, 1.15);
+sun.position.set(16, 30, 18);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left=-26; right=26; top=22; bottom=-22; near=5; far=80;
+sun.shadow.bias = -0.0004;
+scene.add(sun);
+const p1 = new THREE.PointLight(0x35d0ff, 0.7, 70); p1.position.set(-11, 5, 4);
+const p2 = new THREE.PointLight(0x2f6bff, 0.55, 70); p2.position.set(11, -5, -5);
+scene.add(p1, p2);
+```
+Hemisphere is an extra beyond spec but improves the look; spec lists minimum. OK.
+
+Toggle:
+```js
+let lightOn = true;
+btnLight.addEventListener('click', () => {
+  lightOn = !lightOn;
+  sun.intensity = lightOn ? 1.15 : 0.12;
+  hemi.intensity = lightOn ? 0.35 : 0.18;
+  p1.intensity = lightOn ? 0.7 : 0.35;
+  p2.intensity = lightOn ? 0.55 : 0.3;
+  btnLight.classList.toggle('is-off', !lightOn);
+  btnLight.innerHTML = lightOn ? '☀️ Light' : '🌙 Light';
+  showToast(lightOn ? '☀️ Main light on' : '🌙 Dimmed the light');
+});
+```
+
+Stats:
+```js
+function updateStats(){
+  elFish.textContent = fishArray.length;
+  elBubbles.textContent = bubbles.length;
+  elFood.textContent = foods.length;
+}
+```
+
+FPS:
+```js
+let frames=0, lastFps=performance.now();
+in loop: frames++;
+const now = performance.now();
+if(now - lastFps >= 500){
+  const fps = Math.round(frames*1000/(now-lastFps));
+  elFps.textContent = fps;
+  elFps.className = fps>=48 ? 'good' : fps>=28 ? 'mid' : 'low';
+  frames=0; lastFps=now;
+}
+```
+elFps is <b id="stat-fps">. Class on b.
+
+Feed raycast — glassMesh is transparent; raycast works regardless.
+
+Also make sure clicks on UI don't feed: listener is only on canvas, panels are above → good.
+
+Ripple: on feed, at pointer position.
+
+Auto-rotate stop:
+```js
+['pointerdown','wheel'].forEach(ev => renderer.domElement.addEventListener(ev, () => controls.autoRotate = false, {passive:true}));
+```
+
+Init sequence:
+```js
+createSand(); createRocks(); createWeeds(); createSurface();
+// glass, lights, water volume
+for(let i=0;i<15;i++) createFish();
+for(let i=0;i<30;i++) spawnBubble(true);
+updateStats();
+animate();
+```
+
+WebGL check:
+```js
+try { renderer = new THREE.WebGLRenderer(...) } catch(e){ show fallback div }
+```
+Keep simple: wrap renderer creation in try/catch, on failure display a message in #app.
+
+I think I'm ready. Also add `aria-label` to buttons for accessibility.
+
+One more: prevent text selection on double-click on canvas: body user-select none except where needed. Add `#app canvas{user-select:none}`.
+
+Title font size: Unbounded 900 at 24px is wide; "AQUARIUM" 8 chars × ~0.75em ≈ 144px + "3D" — fits in 290px panel. OK.
+
+Also add a small divider between help and actions? Actions have margin-top. Fine.
+
+Edge case: `controls.maxPolarAngle = Math.PI/1.8` ≈ 100° — allows slightly below horizon. Good.
+
+Also `controls.enablePan = true` (default), screenSpacePanning default true in r128? OrbitControls.screenSpacePanning defaults to true. Fine.
+
+Now let me write the final HTML. Include comments in Russian in the code, organized in sections.
+
+Length check: it's going to be long, but that's expected for a complete file.
+
+Response format: brief intro line, code block, then compact "what's inside / how to run" section with a few bullets. In Russian. No heavy headers; maybe small bold labels. Keep tight.

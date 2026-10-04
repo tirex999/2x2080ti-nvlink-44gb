@@ -1,0 +1,353 @@
+Let me carefully build this Minecraft-style voxel game in a single HTML file. I need to implement:
+
+1. **Three.js setup** - Scene, camera, renderer, lights
+2. **Terrain generation** - Value noise with fractal octaves, deterministic hash-based
+3. **Chunk system** - 16x16x80 chunks stored in a Map, with generation and meshing
+4. **Meshing** - One BufferGeometry per chunk with vertex colors, face culling against neighbors
+5. **Player physics** - WASD movement, jumping, gravity, collision detection
+6. **Block interaction** - Raycasting, break/place with proper offsets
+7. **Hotbar UI** - 7 slots, keyboard/mouse wheel selection
+8. **Sky/clouds/water** - Background color, fog, cloud boxes, water plane
+
+Let me think through each part carefully:
+
+**Noise function:**
+- Integer hash: mix coordinates with primes and xor-shift to get 0-1
+- 2D noise: bilinear interpolation of grid values with smoothstep
+- 3D noise for caves: trilinear interpolation
+- Fractal: 4 octaves combined
+
+**Terrain rules:**
+- m = fractal(x*0.004, z*0.004) - large-scale mountain shape
+- h = fractal(x*0.02, z*0.02) - medium detail
+- H = floor(5 + m*m*58 + h*10)
+- Fill: y=0 unbreakable stone, below H-3 stone, 3 layers under surface (dirt/sand/stone based on H), surface block based on H
+- Caves: y between 3 and H-2, 3D noise > 0.67 = air
+- Trees: hash < 0.02 on grass, 4 wood + leaves
+
+**Chunk system:**
+- Map with key "cx,cz"
+- Each entry has Uint8Array (16*16*80) and mesh reference
+- Generation within 5 chunks, max 4 per frame
+- Meshing within 4 chunks if neighbors exist, max 2 per frame
+- Cleanup beyond 7 chunks
+
+**Meshing:**
+- For each non-air block, check 6 neighbors
+- If neighbor is air (or out of bounds), add face
+- Use world coordinates for vertices
+- Vertex colors with lighting multipliers (top=1.0, sides=0.8, bottom=0.55)
+
+**Player:**
+- Half-width 0.3, height 1.8, eye 1.62
+- Spawn at x=8, z=8, find terrain height
+- Gravity 25/s², jump velocity 8.5, speed 5.5 m/s
+- Axis-separated collision
+
+**Raycasting:**
+- Raycaster from camera center, max distance 6
+- From hit point p and normal n: break = floor(p - n*0.5), place = floor(p + n*0.5)
+
+**Hotbar:**
+- CSS fixed at bottom center
+- 7 slots with block colors and numbers
+- Keys 1-7, mouse wheel
+
+Let me write this carefully now.
+
+For the hash function, I'll use something like:
+```js
+function hash(x, y, z) {
+    let h = x * 374761393 + y * 668265263 + z * 1274126177;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h = h ^ (h >> 16);
+    return (h & 0x7fffffff) / 0x7fffffff;
+}
+```
+
+For 2D noise:
+```js
+function noise2D(x, y) {
+    let x0 = Math.floor(x), x1 = x0 + 1;
+    let y0 = Math.floor(y), y1 = y0 + 1;
+    let sx = smoothstep(x - x0);
+    let sy = smoothstep(y - y0);
+    let v00 = hash(x0, y0, 0), v10 = hash(x1, y0, 0);
+    let v01 = hash(x0, y1, 0), v11 = hash(x1, y1, 0);
+    return lerp(lerp(v00, v10, sx), lerp(v01, v11, sx), sy);
+}
+```
+
+For 3D noise (caves):
+```js
+function noise3D(x, y, z) {
+    // trilinear interpolation of hash values at grid corners
+}
+```
+
+Fractal:
+```js
+function fractal2D(x, y) {
+    let val = 0, amp = 0.5, freq = 1;
+    for (let i = 0; i < 4; i++) {
+        val += amp * noise2D(x * freq, y * freq);
+        amp *= 0.5;
+        freq *= 2;
+    }
+    return val;
+}
+```
+
+For the chunk generation, I need to be careful about the order: generate blocks first, then mesh when all neighbors are ready.
+
+Let me think about the collision system more carefully:
+- Player AABB: [x-0.3, x+0.3] × [y, y+1.8] × [z-0.3, z+0.3] where y is feet position
+- Eye at y + 1.62
+- For each axis move, check if any solid block overlaps the new position
+
+For the raycast offset:
+- Hit point p on face, normal n pointing outward from the hit block
+- Break target: floor(p - n*0.5) gives the block that was hit
+- Place target: floor(p + n*0.5) gives the cell adjacent to the hit face
+
+Wait, let me reconsider. If a block at (1,1,1) has its top face at y=2, and we raycast hitting it, p would be something like (1.5, 2.0, 1.5) with normal (0,1,0). Then:
+- break = floor(p - n*0.5) = floor(1.5, 1.5, 1.5) = (1,1,1) ✓
+- place = floor(p + n*0.5) = floor(1.5, 2.5, 1.5) = (1,2,1) ✓
+
+That looks correct.
+
+Now let me think about the mesh building more carefully. For each block at world position (bx, by, bz):
+- Check neighbor in direction (dx, dy, dz). If neighbor is air or out of bounds, add face.
+- Face vertices for +Y face: (bx, by+1, bz), (bx+1, by+1, bz), (bx+1, by+1, bz+1), (bx, by+1, bz+1) - two triangles
+
+Let me define all 6 faces:
+- +X: normal (1,0,0), neighbor at (bx+1, by, bz)
+- -X: normal (-1,0,0), neighbor at (bx-1, by, bz)
+- +Y: normal (0,1,0), neighbor at (bx, by+1, bz)
+- -Y: normal (0,-1,0), neighbor at (bx, by-1, bz)
+- +Z: normal (0,0,1), neighbor at (bx, by, bz+1)
+- -Z: normal (0,0,-1), neighbor at (bx, by, bz-1)
+
+For each face, I need 4 vertices forming a quad (2 triangles).
+
+Let me define the faces carefully with proper winding order for front-facing triangles:
+
++X face (looking from +X direction):
+Vertices: (bx+1, by, bz), (bx+1, by, bz+1), (bx+1, by+1, bz+1), (bx+1, by+1, bz)
+Triangles: (v0,v1,v2), (v0,v2,v3)
+
+-X face:
+Vertices: (bx, by, bz+1), (bx, by, bz), (bx, by+1, bz), (bx, by+1, bz+1)
+
++Y face:
+Vertices: (bx, by+1, bz+1), (bx, by+1, bz), (bx+1, by+1, bz), (bx+1, by+1, bz+1)
+
+-Y face:
+Vertices: (bx, by, bz), (bx, by, bz+1), (bx+1, by, bz+1), (bx+1, by, bz)
+
++Z face:
+Vertices: (bx+1, by, bz+1), (bx, by, bz+1), (bx, by+1, bz+1), (bx+1, by+1, bz+1)
+
+-Z face:
+Vertices: (bx, by, bz), (bx+1, by, bz), (bx+1, by+1, bz), (bx, by+1, bz)
+
+Actually, let me use a more systematic approach. For each face direction, I'll define the 4 corners relative to the block origin:
+
+For +X (face at x=1):
+corners: (1,0,0), (1,0,1), (1,1,1), (1,1,0)
+triangles: [0,1,2], [0,2,3]
+
+For -X (face at x=0):
+corners: (0,0,1), (0,0,0), (0,1,0), (0,1,1)
+triangles: [0,1,2], [0,2,3]
+
+For +Y (face at y=1):
+corners: (0,1,1), (0,1,0), (1,1,0), (1,1,1)
+triangles: [0,1,2], [0,2,3]
+
+For -Y (face at y=0):
+corners: (0,0,0), (0,0,1), (1,0,1), (1,0,0)
+triangles: [0,1,2], [0,2,3]
+
+For +Z (face at z=1):
+corners: (1,0,1), (0,0,1), (0,1,1), (1,1,1)
+triangles: [0,1,2], [0,2,3]
+
+For -Z (face at z=0):
+corners: (0,0,0), (1,0,0), (1,1,0), (0,1,0)
+triangles: [0,1,2], [0,2,3]
+
+These should all be counter-clockwise when viewed from outside. Let me verify +X:
+Looking from +X: we see the face at x=1. The vertices in order are (1,0,0), (1,0,1), (1,1,1), (1,1,0). From +X looking toward -X, x-axis goes into the screen, y goes up, z goes... hmm. Actually with Three.js default coordinate system (right-handed), looking from +X toward origin: Y is up, Z is to the left. So (1,0,0) is bottom-right, (1,0,1) is bottom-left, (1,1,1) is top-left, (1,1,0) is top-right. Triangle 0-1-2 goes bottom-right → bottom-left → top-left which is CCW when viewed from +X. ✓
+
+Now for the lighting colors:
+- Block color (e.g., grass = 0x4caf50)
+- Top face (normal.y > 0): multiply by 1.0
+- Side faces (normal.y == 0): multiply by 0.8
+- Bottom face (normal.y < 0): multiply by 0.55
+
+I'll compute the color for each vertex based on the face normal.
+
+Let me also think about performance. With 16x16x80 = 20480 blocks per chunk, and potentially many faces, I need to be efficient. The meshing loop iterates all blocks and checks 6 neighbors each time. This should be fine for a few chunks per frame.
+
+For the cloud system: ~25 flat boxes at height ~90, drifting slowly. I'll create them as simple BoxGeometry meshes with white semi-transparent material.
+
+For water: a large plane at y=14.3, re-centered on player each frame. Semi-transparent blue.
+
+Let me now write the complete code. I need to be very careful about:
+1. Negative coordinates in chunk lookups
+2. Proper face culling (checking neighbors across chunk boundaries)
+3. Collision detection with AABB vs voxel grid
+4. Pointer lock handling
+5. Proper cleanup of old chunks
+
+Let me also think about the "unbreakable" block at y=0 - I'll just prevent breaking blocks at y=0 in the break handler.
+
+One more thing - the spec says "Reading a missing chunk or y outside 0–79 returns air." So getBlock should return 0 for out-of-bounds.
+
+For the chunk data structure, I'll use:
+```js
+const chunks = new Map(); // key: "cx,cz", value: { data: Uint8Array(16*16*80), mesh: null }
+```
+
+Index into the array: idx = x + z*16 + y*256 (where x,z are local 0-15, y is 0-79)
+
+Actually let me use idx = (y * 16 + z) * 16 + x for better cache locality when iterating y first... but actually the spec says loop all non-air blocks and check 6 sides. Let me just use idx = x + z*16 + y*256.
+
+Wait, 16*16*80 = 20480. So idx = x + z*16 + y*256 where x is 0-15, z is 0-15, y is 0-79. Max idx = 15 + 15*16 + 79*256 = 15 + 240 + 20224 = 20479. ✓
+
+For getBlock(worldX, worldY, worldZ):
+- If worldY < 0 or worldY > 79, return 0
+- cx = Math.floor(worldX / 16), cz = Math.floor(worldZ / 16)
+- key = cx + "," + cz
+- chunk = chunks.get(key)
+- If no chunk, return 0
+- lx = worldX - cx*16, lz = worldZ - cz*16 (these will be 0-15 for negative coords too since floor handles it)
+- Return chunk.data[lx + lz*16 + worldY*256]
+
+For setBlock: similar but also need to mark chunks as dirty for remeshing.
+
+Actually, I realize I should think about when to remesh. After a block edit, I need to rebuild the chunk mesh and potentially neighbor chunks. The spec says "After an edit rebuild the chunk, and also the neighbor chunk if the block sits on a chunk border."
+
+Let me think about the overall game loop:
+1. Update player physics
+2. Generate chunks (max 4 per frame)
+3. Build meshes (max 2 per frame)
+4. Cleanup far chunks
+5. Raycast for targeting
+6. Update clouds, water
+7. Render
+
+Now let me write the complete file. This is going to be long but I need to get every detail right.
+
+Actually, let me reconsider the face definitions more carefully. I want to make sure normals are correct for the Lambert material shading.
+
+For MeshLambertMaterial with vertex colors, the lighting comes from the scene lights. But the spec says "Fake lighting: multiply the block color by 1.0 on top faces, 0.8 on sides, 0.55 on bottoms." So I'm baking the lighting into vertex colors and using an unlit or minimally-lit material? 
+
+Actually re-reading: "ONE shared MeshLambertMaterial" with vertex colors. And also "Ambient light 0.65 plus one directional light 0.8." So the Lambert material will respond to lights, AND I'm baking fake lighting into the vertex colors. That seems like double lighting. 
+
+Hmm, let me re-read: "Unit cubes, rendered with vertex colors and ONE shared MeshLambertMaterial. Fake lighting: multiply the block color by 1.0 on top faces, 0.8 on sides, 0.55 on bottoms."
+
+I think the intent is that the vertex colors already encode the lighting variation (top brighter than sides, etc.), and the Lambert material with lights adds some additional subtle shading. Or maybe the "fake lighting" IS the lighting and the ambient/directional lights are just for the clouds/water. Let me use MeshLambertMaterial but set it so it mostly uses vertex colors. Actually MeshLambertMaterial will multiply vertex colors by light contributions. If I have ambient 0.65 and directional 0.8, the total light is about 1.45 which would wash things out. 
+
+Let me use a lower ambient like 0.4 and directional 0.5, or better yet, let me use MeshBasicMaterial... but the spec says MeshLambertMaterial. 
+
+Actually I think the approach should be: use vertex colors that encode the fake lighting (top=1.0 multiplier, sides=0.8, bottom=0.55), and then have lights that don't over-brighten. With MeshLambertMaterial, the final color = vertexColor * (ambient + directional*dot(normal, lightDir)). If ambient is 0.65 and directional is 0.8, for a top face with normal (0,1,0) and a downward-pointing light, dot would be... 
+
+Actually let me just set up the lights so they work reasonably:
+- AmbientLight intensity 0.4
+- DirectionalLight intensity 0.6, pointing roughly downward
+
+Then vertex colors encode additional per-face variation. The combined effect should look good.
+
+Hmm but the spec explicitly says "Ambient light 0.65 plus one directional light 0.8". Let me just follow the spec exactly and see how it looks. With MeshLambertMaterial, the shading formula is roughly: color = vertexColor * (ambient + directional * max(0, dot(N, L))). If ambient=0.65 and directional=0.8 with a light pointing somewhat downward, top faces get ~1.45 multiplier on their already-bright colors... that might be too bright. 
+
+Let me use the spec values but set vertex color multipliers lower: top=0.7, sides=0.56, bottom=0.385 (i.e., 0.7 * {1.0, 0.8, 0.55}). Then with lights adding ~1.45x on top, the effective range would be ~1.0 to ~0.56. That might work.
+
+Actually you know what, let me just follow the spec literally: vertex color multipliers are 1.0/0.8/0.55, and lights are ambient 0.65 + directional 0.8. The MeshLambertMaterial will compute: finalColor = vertexColor * (ambientIntensity + directionalIntensity * dot(normal, lightDirection)). For a top face with a downward-pointing directional light (direction pointing from light to scene, so L direction is (0,-1,0) normalized... wait no).
+
+In Three.js, DirectionalLight has a position and the light direction is from position toward origin. If I set position (0.3, 1, 0.5), the direction the light travels is from that point toward origin, so the illumination direction is roughly (-0.3, -1, -0.5) normalized. For a face with normal (0,1,0), dot(N, -L) where L is light travel direction... 
+
+Actually in Three.js Lambert: intensity = ambient + directional * max(0, dot(faceNormal, lightPosition_normalized)). Wait no, I think it's dot(normal, directionTowardLight). Let me just set the directional light position to (1, 2, 1) which means light comes from upper-right-front. Then for a top face (normal 0,1,0), dot with normalized(1,2,1) ≈ 2/√6 ≈ 0.82. So top face gets 0.65 + 0.8*0.82 = 1.31. For a side face (normal 1,0,0), dot ≈ 1/√6 ≈ 0.41. Side gets 0.65 + 0.8*0.41 = 0.98.
+
+With vertex color multipliers of 1.0 for top, 0.8 for sides:
+- Top effective: 1.0 * 1.31 = 1.31 (slightly overbright but OK)
+- Side effective: 0.8 * 0.98 = 0.78
+- Bottom: normal (0,-1,0), dot ≈ -0.82, clamped to 0. Bottom gets 0.65. Vertex multiplier 0.55. Effective: 0.36.
+
+That actually gives a nice range! Let me go with this approach.
+
+OK let me write the full code now. I'll be very careful and systematic.
+
+One more consideration: the raycaster. THREE.Raycaster works on meshes. I need to maintain an array of all chunk meshes for raycasting. After rebuilding a chunk, I replace its mesh in the scene and in the array.
+
+Let me also handle the outline box - a simple BoxGeometry with EdgesGeometry and LineBasicMaterial, positioned at the target block center.
+
+For pointer lock: I'll use document.body.requestPointerLock() on click of the overlay. When pointer lock is lost, show the overlay again. Mouse movement only rotates camera when locked.
+
+Let me also think about the cloud system more carefully. 25 clouds as flat boxes. Each cloud could be a group of a few boxes or just one box. Let me make each cloud a single wide flat box (e.g., 10x1x8). They drift in one direction and wrap around when they get too far from the player.
+
+Water plane: a PlaneGeometry rotated to horizontal, positioned at y=14.3, following the player. Semi-transparent blue material.
+
+Alright, I think I have enough understanding to write the complete code. Let me do it now.
+
+Let me also double-check the collision system:
+- Player position is feet position (px, py, pz)
+- Player AABB: x from px-0.3 to px+0.3, y from py to py+1.8, z from pz-0.3 to pz+0.3
+- Eye at (px, py+1.62, pz)
+- For movement on each axis:
+  - Apply velocity to that axis
+  - Check if new AABB overlaps any solid block
+  - If yes, revert that axis movement and zero velocity for that axis
+  - If moving down and collision occurs, set onGround = true
+
+To check overlap with blocks:
+- For the AABB [minX, maxX] × [minY, maxY] × [minZ, maxZ]
+- Check all blocks from floor(minX) to floor(maxX - epsilon) (or just floor(maxX) since a block at position bx occupies [bx, bx+1])
+- Actually a block at grid position (bx, by, bz) occupies the space [bx, bx+1] × [by, by+1] × [bz, bz+1]
+- Player AABB overlaps this if: minX < bx+1 && maxX > bx && minY < by+1 && maxY > by && minZ < bz+1 && maxZ > bz
+
+So I iterate over all grid cells that could potentially overlap:
+- x from floor(minX) to floor(maxX) (inclusive, since if maxX = 3.0 and block at x=2 occupies [2,3], we need to check x=2; but if maxX=3.0, does it overlap block at x=3 which is [3,4]? 3.0 > 3 is false with strict inequality, so no. So floor(maxX) is correct for the upper bound if we use strict > comparison... let me use Math.ceil(maxX) - 1 to be safe, or just floor(maxX) and handle edge cases)
+
+Actually let me be more careful:
+- Block at bx occupies [bx, bx+1) (half-open)
+- Player AABB is [minX, maxX] (closed)
+- Overlap if minX < bx+1 AND maxX > bx
+- So bx ranges from floor(minX) to ceil(maxX) - 1... 
+
+Hmm let me just use: for bx from Math.floor(minX) to Math.floor(maxX), check overlap. If maxX is exactly at a boundary (e.g., 3.0), block at bx=3 occupies [3,4], overlap requires maxX > 3 which is 3.0 > 3 = false. So Math.floor(maxX) = 3 is included but won't match. That's fine, just one extra check.
+
+Wait, if minX = 2.7 and maxX = 3.3:
+- floor(minX) = 2, floor(maxX) = 3
+- Block at 2: [2,3], overlap requires 2.7 < 3 ✓ and 3.3 > 2 ✓ → YES
+- Block at 3: [3,4], overlap requires 2.7 < 4 ✓ and 3.3 > 3 ✓ → YES
+Good.
+
+If minX = 2.0 and maxX = 3.0:
+- floor(minX) = 2, floor(maxX) = 3
+- Block at 2: [2,3], 2.0 < 3 ✓ and 3.0 > 2 ✓ → YES (touching edge counts as overlap)
+- Block at 3: [3,4], 2.0 < 4 ✓ and 3.0 > 3 ✗ → NO
+Good.
+
+OK so iterating from floor(minX) to floor(maxX) inclusive works fine.
+
+Let me write the code now. I'll structure it as:
+
+1. Constants and globals
+2. Noise functions
+3. Chunk generation
+4. Chunk meshing
+5. Chunk management (generate, mesh, cleanup)
+6. Player physics
+7. Block interaction (raycast, break, place)
+8. Game loop
+9. UI setup
+
+Let me write it all out now carefully.
+
+Actually one more thing about the hotbar selection and block placement. The spec says "right click places the selected block if the cell is air and does not overlap the player." I need to check if placing a block at the target cell would intersect with the player's AABB.
+
+Also for breaking: "left click sets the target to air (not at y 0)" - so if the target block's world y is 0, don't break it.
+
+Let me finalize my approach and write the code.

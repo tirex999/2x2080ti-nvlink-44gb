@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MC</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#87ceeb;font-family:sans-serif}
+canvas{display:block}
+#crosshair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:20px;height:20px;pointer-events:none;z-index:10}
+#crosshair::before,#crosshair::after{content:'';position:absolute;background:rgba(0,0,0,.7)}
+#crosshair::before{top:50%;left:0;width:100%;height:2px;transform:translateY(-50%)}
+#crosshair::after{left:50%;top:0;height:100%;width:2px;transform:translateX(-50%)}
+#hotbar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);display:flex;gap:4px;padding:6px;background:rgba(0,0,0,.55);border-radius:6px;z-index:10;pointer-events:none}
+.slot{width:46px;height:46px;border:2px solid rgba(255,255,255,.35);border-radius:4px;position:relative;display:flex;align-items:center;justify-content:center;background:#000}
+.slot .num{position:absolute;top:1px;left:3px;color:#fff;font-size:12px;font-weight:bold;text-shadow:1px 1px 2px #000}
+.slot.sel{border-color:#fff;box-shadow:0 0 8px #fff}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:20;text-align:center}
+#overlay h1{font-size:52px;letter-spacing:3px;margin-bottom:22px;text-shadow:2px 2px 0 #000}
+#overlay ul{text-align:left;font-size:16px;line-height:1.9;margin-bottom:26px;list-style:none}
+#overlay li::before{content:'» '}
+#overlay .play{font-size:22px;padding:12px 30px;border:2px solid #fff;border-radius:8px;cursor:pointer;background:rgba(255,255,255,.08)}
+#overlay .play:hover{background:rgba(255,255,255,.2)}
+</style>
+</head>
+<body>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<div id="overlay">
+  <h1>MC</h1>
+  <ul>
+    <li>WASD — move</li>
+    <li>Mouse — look around</li>
+    <li>Space — jump</li>
+    <li>Left click — break block</li>
+    <li>Right click — place block</li>
+    <li>Keys 1–7 or wheel — select block</li>
+  </ul>
+  <div class="play">Click to play</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+
+/* ---------------- noise ---------------- */
+function smoothstep(t){return t*t*(3-2*t);}
+function lerp(a,b,t){return a+(b-a)*t;}
+function hash(ix,iy){
+  var h=(ix*374761393+iy*668265263)|0;
+  h=Math.imul(h^(h>>>13),2246822507);
+  h=Math.imul(h^(h>>>16),3266489909);
+  return (h>>>0)/4294967296;
+}
+function hash3(ix,iy,iz){
+  var h=(ix*374761393+iy*668265263+iz*1523486461)|0;
+  h=Math.imul(h^(h>>>13),2246822507);
+  h=Math.imul(h^(h>>>16),3266489909);
+  return (h>>>0)/4294967296;
+}
+function noise2(x,y){
+  var xi=Math.floor(x),yi=Math.floor(y);
+  var xf=x-xi,yf=y-yi;
+  var u=smoothstep(xf),v=smoothstep(yf);
+  var a=hash(xi,yi),b=hash(xi+1,yi),c=hash(xi,yi+1),d=hash(xi+1,yi+1);
+  return lerp(lerp(a,b,u),lerp(c,d,u),v);
+}
+function fractal2(x,y,o){
+  var amp=0.5,freq=1,sum=0,norm=0;
+  for(var i=0;i<o;i++){sum+=amp*noise2(x*freq,y*freq);norm+=amp;amp*=0.5;freq*=2;}
+  return sum/norm;
+}
+function noise3(x,y,z){
+  var xi=Math.floor(x),yi=Math.floor(y),zi=Math.floor(z);
+  var xf=x-xi,yf=y-yi,zf=z-zi;
+  var u=smoothstep(xf),v=smoothstep(yf),w=smoothstep(zf);
+  var c00=hash3(xi,yi,zi),c10=hash3(xi+1,yi,zi),c01=hash3(xi,yi+1,zi),c11=hash3(xi+1,yi+1,zi);
+  var x0=lerp(c00,c10,u),x1=lerp(c01,c11,u);
+  var y0=lerp(x0,x1,v),y1=lerp(x01||0,x11||0,w);
+  var c00b=hash3(xi,yi,zi+1),c10b=hash3(xi+1,yi,zi+1),c01b=hash3(xi,yi+1,zi+1),c11b=hash3(xi+1,yi+1,zi+1);
+  var xb0=lerp(c00b,c10b,u),xb1=lerp(c01b,c11b,u);
+  var yb0=lerp(x0,xb0,v),yb1=lerp(x1,xb1,v);
+  return lerp(yb0,yb1,w);
+}
+
+/* ---------------- terrain ---------------- */
+function columnHeight(cx,cz){
+  var m=fractal2(cx*0.004,cz*0.004,4);
+  var h=fractal2(cx*0.02,cz*0.02,4);
+  return Math.floor(5 + m*m*58 + h*10);
+}
+function blockType(y,H){
+  if(y<H-3) return 3;
+  if(y<=H-1){
+    if(H<=16) return 4;
+    if(H>=37) return 3;
+    return 2;
+  }
+  if(H>=46) return 7;
+  if(H>=37) return 3;
+  if(H<=16) return 4;
+  return 1;
+}
+function generateChunkData(cx,cz){
+  var data=new Uint8Array(16*16*80);
+  var x0=cx*16,z0=cz*16;
+  for(var lz=0;lz<16;lz++){
+    for(var lx=0;lx<16;lx++){
+      var wx=x0+lx,wz=z0+lz;
+      var H=columnHeight(wx,wz);
+      for(var y=0;y<80;y++){
+        var id;
+        if(y===0) id=3;
+        else if(y>=3 && y<=H-2){
+          id=(noise3(wx*0.09,y*0.09,wz*0.09)>0.67)?0:blockType(y,H);
+        } else {
+          id=blockType(y,H);
+        }
+        data[(y*16+lz)*16+lx]=id;
+      }
+      if(blockType(H,H)===1 && H>=4 && H<=71 && lx>=2 && lx<=13 && lz>=2 && lz<=13){
+        if(hash(wx,wz)<0.02){
+          for(var t=1;t<=4;t++){var ty=H+t;if(ty<80)data[(ty*16+lz)*16+lx]=5;}
+          var specs=[{dy:5,r:2},{dy:6,r:2},{dy:7,r:1},{dy:8,r:0}];
+          for(var s=0;s<specs.length;s++){
+            var sp=specs[s];
+            for(var dx=-sp.r;dx<=sp.r;dx++){
+              for(var dz=-sp.r;dz<=sp.r;dz++){
+                var ly=H+sp.dy,lx2=lx+dx,lz2=lz+dz;
+                if(lx2<0||lx2>=16||lz2<0||lz2>=16||ly>=80)continue;
+                var li=(ly*16+lz2)*16+lx2;
+                if(data[li]===0)data[li]=6;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return data;
+}
+
+/* ---------------- chunk storage / access ---------------- */
+var chunkMap=new Map();
+var chunkMeshList=[];
+var blockMaterial=new THREE.MeshLambertMaterial({vertexColors:true});
+
+function getBlock(x,y,z){
+  if(y<0||y>=80)return 0;
+  var cx=Math.floor(x/16),cz=Math.floor(z/16);
+  var e=chunkMap.get(cx+","+cz);
+  if(!e||!e.data)return 0;
+  return e.data[(y*16+(z-cz*16))*16+(x-cx*16)];
+}
+function setBlock(x,y,z,id){
+  if(y<0||y>=80)return;
+  var cx=Math.floor(x/16),cz=Math.floor(z/16);
+  var e=chunkMap.get(cx+","+cz);
+  if(!e||!e.data)return;
+  e.data[(y*16+(z-cz*16))*16+(x-cx*16)]=id;
+}
+
+/* ---------------- meshing ---------------- */
+var FACES=[
+  {n:[1,0,0],v:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]},
+  {n:[-1,0,0],v:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]]},
+  {n:[0,1,0],v:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]},
+  {n:[0,-1,0],v:[[0,0,0],[1,0,0],[1,0,1],[0,0,1]]},
+  {n:[0,0,1],v:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]]},
+  {n:[0,0,-1],v:[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]}
+];
+var BLOCK_COLORS=[0,0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff];
+
+function buildChunkMesh(cx,cz){
+  var e=chunkMap.get(cx+","+cz);
+  if(!e||!e.data)return;
+  var pos=[],nor=[],col=[],idx=[];
+  var vi=0;
+  var x0=cx*16,z0=cz*16;
+  for(var lz=0;lz<16;lz++){
+    for(var lx=0;lx<16;lx++){
+      for(var y=0;y<80;y++){
+        var id=e.data[(y*16+lz)*16+lx];
+        if(id===0)continue;
+        var wx=x0+lx,wz=z0+lz;
+        var bc=BLOCK_COLORS[id];
+        var cr=((bc>>16)&255)/255, cg=((bc>>8)&255)/255, cb=(bc&255)/255;
+        for(var f=0;f<6;f++){
+          var face=FACES[f];
+          if(getBlock(wx+face.n[0],y+face.n[1],wz+face.n[2])!==0)continue;
+          var light=(f===2)?1.0:(f===3)?0.55:0.8;
+          for(var k=0;k<4;k++){
+            var vp=face.v[k];
+            pos.push(wx+vp[0],y+vp[1],wz+vp[2]);
+            nor.push(face.n[0],face.n[1],face.n[2]);
+            col.push(cr*light,cg*light,cb*light);
+          }
+          idx.push(vi,vi+1,vi+2,vi,vi+2,vi+3);
+          vi+=4;
+        }
+      }
+    }
+  }
+  if(pos.length===0){
+    if(e.mesh){
+      scene.remove(e.mesh);
+      var ci=chunkMeshList.indexOf(e.mesh);
+      if(ci>=0)chunkMeshList.splice(ci,1);
+      if(e.geom)e.geom.dispose();
+      e.mesh=null;e.geom=null;
+    }
+    return;
+  }
+  var geom=e.geom||(e.geom=new THREE.BufferGeometry());
+  geom.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+  geom.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));
+  geom.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+  geom.setIndex(idx);
+  geom.computeBoundingSphere();
+  geom.computeBoundingBox();
+  if(!e.mesh){
+    e.mesh=new THREE.Mesh(geom,blockMaterial);
+    e.mesh.frustumCulled=false;
+    scene.add(e.mesh);
+    chunkMeshList.push(e.mesh);
+  }
+}
+
+function ensureChunkData(cx,cz){
+  var key=cx+","+cz;
+  if(!chunkMap.has(key))chunkMap.set(key,{data:generateChunkData(cx,cz),mesh:null,geom:null});
+}
+function rebuildMesh(cx,cz){
+  var e=chunkMap.get(cx+","+cz);
+  if(e&&e.data)buildChunkMesh(cx,cz);
+}
+function rebuildChunkAt(x,y,z){
+  var cx=Math.floor(x/16),cz=Math.floor(z/16);
+  rebuildMesh(cx,cz);
+  var lx=x-cx*16,lz=z-cz*16;
+  if(lx===0)ensureChunkData(cx-1,cz);
+  if(lx===15)ensureChunkData(cx+1,cz);
+  if(lz===0)ensureChunkData(cx,cz-1);
+  if(lz===15)ensureChunkData(cx,cz+1);
+}
+
+function updateWorld(){
+  var pcx=Math.floor(camera.position.x/16),pcz=Math.floor(camera.position.z/16);
+  var gen=0;
+  for(var dz=-5;dz<=5;dz++){
+    for(var dx=-5;dx<=5;dx++){
+      if(gen>=4)break;
+      if(Math.abs(dx)>5||Math.abs(dz)>5)continue;
+      var cx=pcx+dx,cz=pcz+dz;
+      if(!chunkMap.has(cx+","+cz)){
+        chunkMap.set(cx+","+cz,{data:generateChunkData(cx,cz),mesh:null,geom:null});
+        gen++;
+      }
+    }
+  }
+  var mes=0;
+  for(var dz2=-4;dz2<=4;dz2++){
+    for(var dx2=-4;dx2<=4;dx2++){
+      if(mes>=2)break;
+      if(Math.abs(dx2)>4||Math.abs(dz2)>4)continue;
+      var mx=pcx+dx2,mz=pcz+dz2;
+      var ee=chunkMap.get(mx+","+mz);
+      if(!ee||ee.mesh)continue;
+      if(chunkMap.get((mx+1)+","+mz)&&chunkMap.get((mx-1)+","+mz)&&
+         chunkMap.get(mx+","+(mz+1))&&chunkMap.get(mx+","+(mz-1))){
+        buildChunkMesh(mx,mz);
+        mes++;
+      }
+    }
+  }
+  for(var kv of chunkMap){
+    var k=kv[0],en=kv[1];
+    var pp=k.split(","),rcx=+pp[0],rcz=+pp[1];
+    if(Math.abs(rcx-pcx)>7||Math.abs(rcz-pcz)>7){
+      if(en.mesh){
+        scene.remove(en.mesh);
+        var ci2=chunkMeshList.indexOf(en.mesh);
+        if(ci2>=0)chunkMeshList.splice(ci2,1);
+        if(en.geom)en.geom.dispose();
+      }
+      chunkMap.delete(k);
+    }
+  }
+}
+
+/* ---------------- player ---------------- */
+var EYE=1.62,SPEED=5.5,GRAVITY=25,JUMP=8.5;
+var yaw=0,pitch=0,vy=0,onGround=false;
+var keys={};
+function collides(px,feet,pz){
+  var hw=0.3,h=1.8,E=1e-3;
+  var minX=Math.floor(px-hw),maxX=Math.floor(px+hw);
+  var minY=Math.floor(feet),maxY=Math.floor(feet+h-E);
+  var minZ=Math.floor(pz-hw),maxZ=Math.floor(pz+hw);
+  for(var x=minX;x<=maxX;x++)
+    for(var y=minY;y<=maxY;y++)
+      for(var z=minZ;z<=maxZ;z++)
+        if(getBlock(x,y,z)!==0)return true;
+  return false;
+}
+function terrainHeightAt(x,z){return columnHeight(Math.round(x),Math.round(z));}
+function updatePlayer(dt){
+  var fx=-Math.sin(yaw),fz=-Math.cos(yaw);
+  var rx=Math.cos(yaw),ry=-Math.sin(yaw);
+  var mx=0,mz=0;
+  if(keys['w']){mx+=fx;mz+=fz;}
+  if(keys['s']){mx-=fx;mz-=fz;}
+  if(keys['d']){mx+=rx;mz+=ry;}
+  if(keys['a']){mx-=rx;mz-=ry;}
+  var len=Math.hypot(mx,mz);
+  if(len>0){mx/=len;mz/=len;}
+  var px=camera.position.x,pz=camera.position.z,feet=camera.position.y-EYE;
+  var nx=px+mx*SPEED*dt;
+  if(!collides(nx,feet,pz))camera.position.x=nx;
+  var nz=pz+mz*SPEED*dt;
+  if(!collides(camera.position.x,feet,nz))camera.position.z=nz;
+  vy-=GRAVITY*dt;
+  if(keys[' ']&&onGround){vy=JUMP;onGround=false;}
+  if(vy<-50)vy=-50;
+  var ny=feet+vy*dt;
+  if(collides(camera.position.x,ny,camera.position.z)){
+    if(vy<0){
+      var s=ny;
+      for(var i=0;i<24&&collides(camera.position.x,s,camera.position.z);i++)s+=0.1;
+      camera.position.y=s+EYE;onGround=true;vy=0;
+    } else {vy=0;}
+  } else {
+    camera.position.y=ny+EYE;onGround=false;
+  }
+  if(camera.position.y<-20){
+    var sh=terrainHeightAt(8,8)+3;
+    while(sh>0&&getBlock(8,sh,8)!==0)sh--;
+    camera.position.set(8,sh+1,8);vy=0;onGround=true;
+  }
+}
+
+/* ---------------- targeting / editing ---------------- */
+var raycaster=new THREE.Raycaster();
+var hitPoint=new THREE.Vector3(),hitNormal=new THREE.Vector3();
+var hasTarget=false;
+function updateTarget(){
+  raycaster.set(camera.position,new THREE.Vector3(-Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),-Math.cos(yaw)*Math.cos(pitch)));
+  raycaster.far=6;
+  var hs=raycaster.intersectObjects(chunkMeshList,false);
+  if(hs.length>0){hitPoint.copy(hs[0].point);hitNormal.copy(hs[0].face.normal);hasTarget=true;}
+  else hasTarget=false;
+}
+var selectedBlock=1;
+function breakBlock(){
+  if(!hasTarget)return;
+  var x=Math.floor(hitPoint.x-hitNormal.x*0.5);
+  var y=Math.floor(hitPoint.y-hitNormal.y*0.5);
+  var z=Math.floor(hitPoint.z-hitNormal.z*0.5);
+  if(y===0)return;
+  setBlock(x,y,z,0);
+  rebuildChunkAt(x,y,z);
+}
+function placeBlock(){
+  if(!hasTarget)return;
+  var x=Math.floor(hitPoint.x+hitNormal.x*0.5);
+  var y=Math.floor(hitPoint.y+hitNormal.y*0.5);
+  var z=Math.floor(hitPoint.z+hitNormal.z*0.5);
+  if(getBlock(x,y,z)!==0)return;
+  var feet=camera.position.y-EYE,hw=0.32,h=1.8;
+  if(x+1>camera.position.x-hw&&x<camera.position.x+hw&&
+     y+1>feet&&y<feet+h&&
+     z+1>camera.position.z-hw&&z<camera.position.z+hw)return;
+  setBlock(x,y,z,selectedBlock);
+  rebuildChunkAt(x,y,z);
+}
+
+/* ---------------- scene setup ---------------- */
+var scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87ceeb);
+scene.fog=new THREE.Fog(0x87ceeb,40,110);
+var camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,400);
+camera.rotation.order="YXZ";
+var renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+document.body.appendChild(renderer.domElement);
+var canvas=renderer.domElement;
+scene.add(new THREE.AmbientLight(0xffffff,0.65));
+var sun=new THREE.DirectionalLight(0xffffff,0.8);
+sun.direction.set(0.5,1,0.3).normalize();
+scene.add(sun);
+
+var outline=new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(1.01,1.01,1.01)),
+  new THREE.LineBasicMaterial({color:0x000000})
+);
+outline.visible=false;
+scene.add(outline);
+
+var water=new THREE.Mesh(new THREE.PlaneGeometry(200,200),
+  new THREE.MeshLambertMaterial({color:0x3388ff,transparent:true,opacity:0.6,depthWrite:false}));
+water.rotation.x=-Math.PI/2;
+water.position.y=14.3;
+scene.add(water);
+
+var clouds=[];
+for(var i=0;i<25;i++){
+  var cw=6+(i%4)*3,cd=6+(i%3)*2;
+  var cm=new THREE.Mesh(new THREE.BoxGeometry(cw,1.5,cd),
+    new THREE.MeshLambertMaterial({color:0xffffff,transparent:true,opacity:0.9,depthWrite:false}));
+  cm.userData={rx:((i*131.7)%120)-60,rz:((i*217.3)%120)-60,speed:2+(i%4)*0.5,t:0};
+  cm.position.set(0,92,0);
+  scene.add(cm);
+  clouds.push(cm);
+}
+
+var HOT=[0x4caf50,0x795548,0x9e9e9e,0xe7d9a8,0x8d6e63,0x2e7d32,0xffffff];
+var hotbarEl=document.getElementById('hotbar');
+for(var j=0;j<7;j++){
+  var s=document.createElement('div');
+  s.className='slot';
+  s.style.background='#'+HOT[j].toString(16).padStart(6,'0');
+  s.innerHTML='<span class="num">'+(j+1)+'</span>';
+  hotbarEl.appendChild(s);
+}
+function updateHotbar(){var ch=hotbarEl.children;for(var k=0;k<7;k++)ch[k].classList.toggle('sel',k===selectedBlock-1);}
+updateHotbar();
+
+var sy=terrainHeightAt(8,8)+3;
+while(sy>0&&getBlock(8,sy,8)!==0)sy--;
+camera.position.set(8,sy+1,8);
+
+/* ---------------- input ---------------- */
+var pointerLocked=false;
+var overlay=document.getElementById('overlay');
+overlay.addEventListener('click',function(){canvas.requestPointerLock();});
+document.addEventListener('pointerlockchange',function(){
+  pointerLocked=(document.pointerLockElement===canvas);
+  overlay.style.display=pointerLocked?'none':'flex';
+});
+document.addEventListener('mousemove',function(e){
+  if(!pointerLocked)return;
+  yaw-=e.movementX*0.002;
+  pitch-=e.movementY*0.002;
+  if(pitch>Math.PI/2-0.01)pitch=Math.PI/2-0.01;
+  if(pitch<-Math.PI/2+0.01)pitch=-Math.PI/2+0.01;
+});
+document.addEventListener('mousedown',function(e){
+  if(!pointerLocked)return;
+  if(e.button===0)breakBlock();
+  else if(e.button===2)placeBlock();
+});
+document.addEventListener('keydown',function(e){
+  var k=e.key.toLowerCase();
+  keys[k]=true;
+  if(e.key.length===1&&e.key>='1'&&e.key<='7'){selectedBlock=parseInt(e.key,10);updateHotbar();}
+  if(k===' '||e.key==='ArrowUp'||e.key==='ArrowDown'||e.key==='ArrowLeft'||e.key==='ArrowRight')e.preventDefault();
+});
+document.addEventListener('keyup',function(e){keys[e.key.toLowerCase()]=false;});
+document.addEventListener('wheel',function(e){
+  if(!pointerLocked)return;
+  selectedBlock+=e.deltaY>0?1:-1;
+  if(selectedBlock<1)selectedBlock=7;
+  if(selectedBlock>7)selectedBlock=1;
+  updateHotbar();
+},{passive:true});
+document.addEventListener('contextmenu',function(e){e.preventDefault();});
+
+/* ---------------- initial world ---------------- */
+for(var gz=-3;gz<=3;gz++)for(var gx=-3;gx<=3;gx++)ensureChunkData(gx,gz);
+for(var mz=-2;mz<=2;mz++)for(var mx2=-2;mx2<=2;mx2++){
+  if(chunkMap.get((mx2+1)+","+mz)&&chunkMap.get((mx2-1)+","+mz)&&
+     chunkMap.get(mx2+","+(mz+1))&&chunkMap.get(mx2+","+(mz-1)))buildChunkMesh(mx2,mz);
+}
+
+/* ---------------- loop ---------------- */
+var last=performance.now();
+function animate(){
+  requestAnimationFrame(animate);
+  var now=performance.now();
+  var dt=(now-last)/1000;last=now;
+  if(dt>0.05)dt=0.05;
+  if(pointerLocked)updatePlayer(dt);
+  updateWorld();
+  updateTarget();
+  if(pointerLocked&&hasTarget){
+    var bx=Math.floor(hitPoint.x-hitNormal.x*0.5);
+    var by=Math.floor(hitPoint.y-hitNormal.y*0.5);
+    var bz=Math.floor(hitPoint.z-hitNormal.z*0.5);
+    outline.position.set(bx+0.5,by+0.5,bz+0.5);
+    outline.visible=true;
+  } else outline.visible=false;
+  for(var c=0;c<clouds.length;c++){
+    var cl=clouds[c],u=cl.userData;
+    u.t+=dt;
+    var lx=u.rx+u.speed*u.t;
+    lx=((lx+60)%120+120)%120-60;
+    var lz2=u.rz;
+    lz2=((lz2+60)%120+120)%120-60;
+    cl.position.x=camera.position.x+lx;
+    cl.position.z=camera.position.z+lz2;
+  }
+  water.position.x=camera.position.x;
+  water.position.z=camera.position.z;
+  renderer.render(scene,camera);
+}
+animate();
+
+window.addEventListener('resize',function(){
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+})();
+</script>
+</body>
+</html>

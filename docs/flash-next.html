@@ -1,0 +1,2229 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3.8-Flash-Next на 2×2080Ti — наш рецепт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f6f3ee;--panel:#fffdfa;--fg:#1c1a17;--mut:#6b6459;--line:#e0d9cd;
+  --acc:#b4531b;--acc-soft:#f3e3d6;--ok:#2f6b3f;--bad:#8c2f2f}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#131210;--panel:#1c1a17;--fg:#ece7de;--mut:#9b9284;--line:#302c26;
+  --acc:#e0913f;--acc-soft:#2a2018;--ok:#79bd8a;--bad:#e08a84}}
+:root[data-theme="dark"]{--bg:#131210;--panel:#1c1a17;--fg:#ece7de;--mut:#9b9284;
+  --line:#302c26;--acc:#e0913f;--acc-soft:#2a2018;--ok:#79bd8a;--bad:#e08a84}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:400 16.5px/1.68 "IBM Plex Sans","Segoe UI",system-ui,sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:0 22px 80px}
+.back{display:inline-block;margin:26px 0 6px;font:500 13px/1 "IBM Plex Mono",monospace;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--acc);text-decoration:none}
+.back:hover{text-decoration:underline}
+h1{font:700 clamp(30px,5vw,46px)/1.08 "IBM Plex Sans Condensed",sans-serif;
+  letter-spacing:-.02em;margin:14px 0 24px;text-wrap:balance}
+h2{font:600 26px/1.2 "IBM Plex Sans Condensed",sans-serif;letter-spacing:-.01em;
+  margin:52px 0 14px;padding-top:16px;border-top:1px solid var(--line);text-wrap:balance}
+h3{font:600 19px/1.3 "IBM Plex Sans",sans-serif;margin:34px 0 10px}
+p{margin:0 0 16px;max-width:68ch}
+ul,ol{max-width:68ch;padding-left:22px}
+li{margin:5px 0}
+a{color:var(--acc)}
+strong{font-weight:600}
+code{font:500 14px/1.5 "IBM Plex Mono",monospace;background:var(--acc-soft);
+  color:var(--acc);padding:1.5px 6px;border-radius:5px}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;margin:0 0 20px}
+pre code{background:none;color:var(--fg);padding:0;font-size:13.5px;line-height:1.6}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:0 0 24px}
+table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:520px}
+th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--panel);font:600 12px/1.3 "IBM Plex Mono",monospace;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--mut);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+blockquote{margin:0 0 20px;padding:2px 0 2px 18px;border-left:3px solid var(--acc);
+  color:var(--mut)}
+hr{border:none;border-top:1px solid var(--line);margin:40px 0}
+em{color:var(--mut)}
+</style></head>
+<body><div class="wrap">
+<a class="back" href="./">← ко всем документам</a>
+<h1>Qwen3.8-Flash-Next на 2×2080Ti — наш рецепт</h1>
+<p>Официальный рецепт vLLM для этой модели начинается с 4×H100 и требует, чтобы вся модель
+лежала в видеопамяти: чекпоинт в FP8 весит <strong>172 ГБ</strong>, в BF16 — 335 ГБ. У нас 44 ГБ видеопамяти
+на двух картах. Поэтому ниже — не адаптация чужого рецепта, а свой, собранный на живом стенде.</p>
+<p>Всё, что здесь написано, измерено. Где числа — это наши замеры, не документация.</p>
+<h2>Новое 04.10, вечер: DACAN против апстрима Strata 0.1.39</h2>
+<p>Автор Strata за неделю выпустил 30 версий (с 0.1.10 по 0.1.39): разбиение модели по слоям на две-три карты, несколько
+запросов одновременно, официальную поддержку RTX 20, лицензию MIT. Мы собрали 0.1.39 на нашем стенде (sm_75,
+CUDA 13.0) и поставили рядом с DACAN на одной модели и одном запросе.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>движок</th>
+<th style="text-align: right;">чтение промта (1 902 токена)</th>
+<th style="text-align: right;">ответ (512 токенов)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DACAN</strong> (две карты, два сокета)</td>
+<td style="text-align: right;">586 т/с</td>
+<td style="text-align: right;"><strong>67.4 т/с</strong></td>
+</tr>
+<tr>
+<td>апстрим Strata 0.1.39 (его разбиение по слоям на две карты)</td>
+<td style="text-align: right;">605 т/с</td>
+<td style="text-align: right;">17.7 т/с</td>
+</tr>
+</tbody>
+</table></div>
+<p>Одинаково для обоих: Swift 1.5 IQ3_XXS от UkisAI, тот же пакет, та же голова черновиков MTP и профиль экспертов, промт
+«хомяки — честная физика» (1 902 токена), жадный вывод, 512 токенов ответа, каждый движок через свой сервер. Промт оба
+читают одинаково, <strong>отвечает DACAN в 3.8 раза быстрее</strong> на этом железе. Наша боевая модель, Swift 1.5 Q8_0, идёт на
+DACAN со скоростью 75 т/с; апстрим 0.1.39 её не загружает (таблицу по слоям принимает только в IQ4_NL, Q5_0 или FP8,
+не в Q8_0).</p>
+<p>Что берём из апстрима дальше, по одной правке и с замером: несколько запросов одновременно (<code>parallel</code>), чекпоинт
+системного промта, ускоренную выборку (#197), сторож, который перезапускает замолчавший движок.</p>
+<p>DACAN — общий проект Вадима и Claude, одна команда. На своём железе он быстрее оригинала, и сделали мы его вдвоём.</p>
+<h2>Новое 04.10, днём: имя кванта NVFP4 + Q8 (DACAN), зрение и скорость чтения в DACAN, аудит галереи</h2>
+<p><strong>Имя кванта — NVFP4 + Q8 (DACAN).</strong> Так мы называем смесь, на которой работает служба DACAN. Маршрутные эксперты —
+около 95 % весов — в 4-битном NVFP4. Большие матрицы, через которые проходит каждый
+токен, и таблица n-грамм — в 8-битном Q8_0. Маленькие чувствительные матрицы остаются в BF16. Раскладка снята по типам
+тензоров в GGUF и одинакова у исходной модели (эксперты NVFP4 от NVIDIA) и у Swift 1.5 (эксперты наши, из его BF16):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>часть</th>
+<th>тип</th>
+<th style="text-align: right;">объём</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>маршрутные эксперты: gate, up, down × 512 × 48 слоёв</td>
+<td>NVFP4: значения E2M1, масштаб E4M3 на 16 значений, масштаб FP32 на тензор</td>
+<td style="text-align: right;">63.3 ГиБ</td>
+</tr>
+<tr>
+<td>проекции внимания и DeltaNet, общий эксперт, эмбеддинги, выходная голова</td>
+<td>Q8_0</td>
+<td style="text-align: right;">4.1 ГиБ</td>
+</tr>
+<tr>
+<td>таблица n-грамм</td>
+<td>Q8_0</td>
+<td style="text-align: right;">51 ГиБ</td>
+</tr>
+<tr>
+<td>маршрутизатор, гиперсвязи, индексатор разреженного внимания, α/β DeltaNet</td>
+<td>BF16</td>
+<td style="text-align: right;">1.4 ГиБ</td>
+</tr>
+</tbody>
+</table></div>
+<p>В галерее группы переименованы: «Flash-Next NVFP4 + Q8 (DACAN) 2x2080Ti 256K», «Swift 1.5 NVFP4 + Q8 (DACAN) 2x2080Ti
+256K», «Flash-Next NVFP4 + Q8 (DACAN) Strata выборка 2x2080Ti» и «… Strata как в Open WebUI». Папки прогонов и ссылки
+на них прежние. Карточки на Hugging Face с тем же разбором — у <a href="https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN">исходной модели</a>
+и у <a href="https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN">Swift 1.5</a>; заливка Swift закончена: 30 файлов,
+321 ГБ (8 бит Q8_0 одним GGUF на 189 ГБ, эксперты NVFP4 68 ГБ, плотный GGUF 60 ГБ, пакеты, слой MTP).</p>
+<p><strong>Зрение в DACAN.</strong> Энкодер <code>strata-vision</code> собран из <code>tools/vision</code> (llama.cpp mtmd, CUDA, sm_75), к нему — штатный
+<code>mmproj-Qwen3.8-Flash-Next-BF16.gguf</code> (865 МиБ) от ISTA-DASLab. Энкодер стартует раньше движка и занимает свою часть
+главной карты, так что кеш экспертов раздаётся уже под оставшуюся память. Служба DACAN теперь работает на Swift 1.5
+NVFP4 + Q8 (DACAN) со зрением, модель <code>swift-1.5-flash-next-nvfp4-q8-dacan</code>. Проверка: картинка с красным кругом слева
+и синим квадратом справа, вопрос «что изображено». Ответ «Слева — красный круг. Справа — синий квадрат» пришёл за 2.8 с
+(промт 97 токенов вместе с картинкой, ответ 48 токенов при 51.9 т/с). Загрузка заняла 40 минут вместо обычных 25:
+эксперты читались по NFS со скоростью 0.05 ГиБ/с, потому что с того же хранилища в это время шла заливка на Hugging
+Face.</p>
+<p><strong>Скорость чтения промта на мониторе DACAN.</strong> Движок и раньше печатал скорость чтения новых токенов в каждой строке
+прогресса, а сервер её отбрасывал. Теперь на вкладке Monitor есть карточка «Prompt read» с графиком: во время чтения
+скорость живая, иначе по последнему запросу, с числом новых (не взятых из кеша) токенов. Скорость видна и в плашке
+«Reading prompt · 45% · 780 tok/s», а в таблице запросов есть столбец «Read tok/s». Тесты сервера: 16 из 16. Код —
+в <a href="https://github.com/tirex999/DACAN">DACAN</a> (<code>serve/server.py</code>, <code>serve/web/app.js</code>).</p>
+<p><strong>Аудит галереи.</strong> Все 445 прогонов на четырёх страницах (хомяки, аквариум, майнкрафт, физика) открыты в браузере
+(Chromium, WebGL). Первый проход шёл по восемь страниц сразу. Все подозрительные страницы (32) потом перепроверены по
+одной, а сомнительные ещё и осмотрены по снимку. Итог:</p>
+<ul>
+<li><strong>засчитанных сломанных нет.</strong> 10 из 11 подозрений среди засчитанных — ложные: при восьми страницах сразу программный
+  WebGL не успевал отрисовать тяжёлую сцену, а по одной они работают. Ещё одна страница (хомяки, Flash-Next
+  NVFP4 + Q8 (DACAN), medium) пишет ошибку в консоль, но сцена живая;</li>
+<li><strong>сломанных прогонов у Flash-Next и Swift 21</strong>, все уже были помечены «страница падает» и не засчитаны. Исправленные
+  копии были у 7, теперь есть у всех: ещё 14 сделаны сегодня. Ошибки модели типичные: <code>Object.assign(меш, {position})</code>
+  (в three.js <code>position</code> только для чтения), типографский минус «−» в коде, забытые скобки, <code>new OrbitControls</code> без
+  камеры, <code>?.</code> после <code>new</code>, переменные до объявления (<code>stats</code>, <code>rays</code>, <code>bubbles</code>, <code>$</code>, <code>WHEEL_X</code>), повторное
+  объявление (<code>y0</code>, <code>top</code> — имя занято окном браузера), <code>{p:g}</code> вместо <code>{p:p}</code>, обрыв числа <code>0x insertion</code>. В шести
+  копиях после первой правки открывались следующие ошибки (в двух аквариумах «как в Open WebUI» — по четыре слоя),
+  исправлены все; каждая копия проверена в браузере и осмотрена по снимку. Оригиналы и счёт не тронуты: в строке прогона —
+  ссылка «▶ исправленная» и что поправлено.</li>
+</ul>
+<p>Урок аудита: «сцена живая, два снимка различаются» обманывается анимированной заставкой. Вращающийся значок «Наполняем
+аквариум» тоже меняет снимок, поэтому сомнительные страницы теперь смотрим глазами.</p>
+<p><strong>README на двух языках и донаты.</strong> У репозитория сайта есть английский <a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/blob/main/README.en.md">README.en.md</a> с переключателем
+«🇬🇧 English | 🇷🇺 Русский», у DACAN переключатель тот же. В README обоих репозиториев и в карточках на Hugging Face
+появился раздел «Поддержать проект»: ЮMoney, USDT (TRC-20) и Ethereum, с QR-кодами; кнопка Sponsor на странице
+репозитория ведёт туда же.</p>
+<h2>Новое 04.10, ночь: два своих кванта Swift 1.5 из BF16 — NVFP4 + Q8 (DACAN) и 8 бит</h2>
+<p>Swift 1.5 мы сжали сами из его BF16 (360 ГБ) двумя способами и прогнали на DACAN теми же задачами, что и трёхбитный
+GSQ-RCO (раздел ниже):</p>
+<ul>
+<li><strong>NVFP4 + Q8 (DACAN)</strong> — смесь, на которой работает DACAN: эксперты NVFP4 по рецепту ModelOpt (общий масштаб на эксперта, масштаб на
+  каждые 16 значений в E4M3, значения в E2M1), плотная часть и таблица n-грамм Q8_0, роутеры BF16. Эксперты 63.3 ГиБ,
+  ошибка против BF16 9.4–9.5 % на всех 48 слоях.</li>
+<li><strong>8 бит</strong>: эксперты, плотная часть и таблица n-грамм Q8_0, роутеры и гиперсвязи BF16, остальные типы — как у
+  нашего кванта A. Файл 176 ГиБ, ошибка Q8_0 0.55–0.71 %. <code>llama-quantize</code> для этого не годится: роутеры
+  <code>ffn_gate_inp</code> он не трогает вовсе (жёсткое исключение, <code>--tensor-type</code> его не перебивает), а DACAN берёт их
+  только в BF16, — поэтому квантователь свой, на gguf-py.</li>
+</ul>
+<p>Условия одинаковые: соседняя ВМ погашена, у контейнера 192 ГиБ, выборка галереи 0.6 / 0.95 / 20, один прогон на
+ячейку. Засчитан прогон, только если страница работает в браузере (Chromium, WebGL): текстовые проверки засчитали
+все 27, а три страницы xhigh не запускаются.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача, уровень</th>
+<th style="text-align: right;">токенов: NVFP4 / 8 бит / IQ3_XXS</th>
+<th style="text-align: right;">размышление, знаков</th>
+<th style="text-align: right;">т/с</th>
+<th style="text-align: right;">проверки</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки low</td>
+<td style="text-align: right;">6 442 / 9 826 / 8 312</td>
+<td style="text-align: right;">4 062 / 4 020 / 1 681</td>
+<td style="text-align: right;"><strong>70.8</strong> / 60.5 / 62.8</td>
+<td style="text-align: right;">8/8 / 8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки medium</td>
+<td style="text-align: right;">7 634 / 6 920 / 7 704</td>
+<td style="text-align: right;">6 010 / 5 005 / 7 784</td>
+<td style="text-align: right;"><strong>61.7</strong> / 53.9 / 51.1</td>
+<td style="text-align: right;">8/8 / 8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки xhigh</td>
+<td style="text-align: right;">42 409 / 33 623 / 28 199</td>
+<td style="text-align: right;">63 622 / 44 917 / 70 484</td>
+<td style="text-align: right;">50.4 / 45.6 / 47.5</td>
+<td style="text-align: right;">8/8 * / 8/8 / 8/8</td>
+</tr>
+<tr>
+<td>аквариум low</td>
+<td style="text-align: right;">9 913 / 8 766 / 9 835</td>
+<td style="text-align: right;">636 / 818 / 1 221</td>
+<td style="text-align: right;"><strong>59.8</strong> / 51.0 / 54.6</td>
+<td style="text-align: right;">23/25 / 25/25 / 25/25</td>
+</tr>
+<tr>
+<td>аквариум medium</td>
+<td style="text-align: right;">7 983 / 8 482 / 7 491</td>
+<td style="text-align: right;">153 / 129 / 212</td>
+<td style="text-align: right;"><strong>57.6</strong> / 49.2 / 52.7</td>
+<td style="text-align: right;">23/25 / 24/25 / 24/25</td>
+</tr>
+<tr>
+<td>аквариум xhigh</td>
+<td style="text-align: right;">35 308 / 31 946 / 28 477</td>
+<td style="text-align: right;">46 132 / 38 178 / 37 375</td>
+<td style="text-align: right;"><strong>50.6</strong> / 44.6 / 46.4</td>
+<td style="text-align: right;">22/25 * / 22/25 * / 22/25</td>
+</tr>
+<tr>
+<td>майнкрафт low</td>
+<td style="text-align: right;">12 648 / 16 750 / 12 450</td>
+<td style="text-align: right;">12 070 / 23 091 / 13 306</td>
+<td style="text-align: right;"><strong>61.5</strong> / 51.3 / 60.3</td>
+<td style="text-align: right;">29/29 / 28/29 / 27/29</td>
+</tr>
+<tr>
+<td>майнкрафт medium</td>
+<td style="text-align: right;">17 640 / 21 054 / 10 300</td>
+<td style="text-align: right;">23 346 / 37 497 / 9 796</td>
+<td style="text-align: right;"><strong>58.2</strong> / 48.2 / 54.4</td>
+<td style="text-align: right;">29/29 / 27/29 / 29/29</td>
+</tr>
+<tr>
+<td>майнкрафт xhigh</td>
+<td style="text-align: right;">40 869 / 40 032 / 72 076</td>
+<td style="text-align: right;">102 707 / 95 884 / 214 124</td>
+<td style="text-align: right;"><strong>50.4</strong> / 45.1 / 37.5</td>
+<td style="text-align: right;">27/29 / 27/29 / 27/29</td>
+</tr>
+</tbody>
+</table></div>
+<p>* Страница не запускается — прогон не засчитан. NVFP4 + Q8 (DACAN), хомяки xhigh: <code>import</code> из <code>three/addons/OrbitControls.js</code>
+без папки <code>controls/</code> (на unpkg такого файла нет, 404). NVFP4 + Q8 (DACAN), аквариум xhigh: <code>Illegal return statement</code> —
+<code>return</code> на верхнем уровне обычного скрипта. 8 бит, аквариум xhigh: <code>Cannot read properties of undefined (reading
+'0')</code>, сцена стоит на заставке «Заполняем аквариум».</p>
+<p>Что видно:</p>
+<ul>
+<li><strong>Скорость: NVFP4 + Q8 (DACAN) быстрее всех</strong> — медиана 58.2 т/с против 52.7 у трёхбитного и 49.2 у восьмибитного.
+  8 бит медленнее везде: эксперт вдвое тяжелее, промт читается 230–260 т/с против 350–380.</li>
+<li><strong>Работающих страниц</strong>: трёхбитный 9 из 9, 8 бит 8 из 9, NVFP4 + Q8 (DACAN) 7 из 9. Все три сбоя — на xhigh, и это ошибки
+  в коде (путь, <code>return</code>, обращение к пустому массиву), а не обрыв ответа. По проверкам все три вровень: 177, 177 и
+  178 из 186. С одним прогоном на ячейку разница в один-два сбоя — ещё не мера.</li>
+<li><strong>Размышление</strong> у своих квантов в сумме короче, чем у трёхбитного: 258 738 и 249 539 знаков против 355 983 — почти
+  целиком за счёт майнкрафта xhigh, где трёхбитный думал вдвое дольше. Токенов всего 180 846 / 177 399 / 184 844.</li>
+<li><strong>Цена восьми бит</strong> — память и загрузка: 172 ГиБ занято в контейнере, движок поднимается 68 минут (эксперты 119.5
+  ГиБ и таблица 50.7 ГиБ по сети) против 25 минут у NVFP4 + Q8 (DACAN).</li>
+</ul>
+<p>Прогоны — в галерее: <a href="hamsters/hamsters.html">хомяки</a>, <a href="hamsters/aquarium.html">аквариум</a>,
+<a href="hamsters/minecraft.html">майнкрафт</a>, группы «Swift 1.5 NVFP4 + Q8 (DACAN)» и «Swift 1.5 Q8_0 Дацан» под пунктом «Swift 1.5
+(Flash-Next)». Сценарий — <code>scripts/quality/swift_probe2.sh</code> (поднимает оба движка по очереди, <code>UP_TRIES</code> — сколько
+ждать загрузки по 10 с; для восьми бит нужно не меньше 420). Оба кванта выложены на Hugging Face:
+<a href="https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN">tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN</a>.
+Зрения в GGUF нет, как во всяком GGUF: визуальная башня Swift побайтно совпала с исходной (333 тензора из 333),
+поэтому подходит штатный <code>mmproj-Qwen3.8-Flash-Next-BF16.gguf</code>.</p>
+<h3>Третий квант: NVFP4 точно как у RadixArk, на FreeToken</h3>
+<p>RadixArk NVFP4 — тот квант исходной модели, который был «умным» на FreeToken. Его рецепт мы сняли с заголовков
+safetensors на Hugging Face, не качая весов: в NVFP4 только маршрутные эксперты, у gate и up общий масштаб на кусок из
+128 экспертов, у down свой на эксперта; таблица n-грамм в FP8 с одним масштабом; всё остальное BF16. По этому рецепту
+сжали Swift из его BF16 (<code>tools/2x2080ti/swift_modelopt.py</code> в DACAN): 125.9 ГиБ, все 296 475 тензоров совпали с
+RadixArk по именам, типам и формам, а масштабы — до последнего знака (2.0781e-04 у gate/up слоя 0, 8.0654e-05 у down
+эксперта 0 слоя 47): максимумы весов экспертов у Swift такие же, как у исходной модели. FreeToken принял чекпойнт без
+правок. Рядом — тот же FreeToken на исходном RadixArk (прогоны 27.09, контекст 131K; майнкрафт тогда не снимали):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача, уровень</th>
+<th style="text-align: right;">токенов: Swift / исходный</th>
+<th style="text-align: right;">размышление, знаков</th>
+<th style="text-align: right;">т/с</th>
+<th style="text-align: right;">проверки</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки low</td>
+<td style="text-align: right;">5 086 / 8 127</td>
+<td style="text-align: right;">2 166 / 1 362</td>
+<td style="text-align: right;">27.4 / 28.9</td>
+<td style="text-align: right;">8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки medium</td>
+<td style="text-align: right;">8 433 / 9 330</td>
+<td style="text-align: right;">8 235 / 11 408</td>
+<td style="text-align: right;">26.9 / 28.6</td>
+<td style="text-align: right;">8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки xhigh</td>
+<td style="text-align: right;">39 872 / 41 533</td>
+<td style="text-align: right;">62 949 / 68 229</td>
+<td style="text-align: right;">26.2 / 26.1</td>
+<td style="text-align: right;">8/8 / 8/8 *</td>
+</tr>
+<tr>
+<td>аквариум low</td>
+<td style="text-align: right;">10 653 / 9 826</td>
+<td style="text-align: right;">920 / 910</td>
+<td style="text-align: right;">25.5 / 28.2</td>
+<td style="text-align: right;">23/25 / 24/25</td>
+</tr>
+<tr>
+<td>аквариум medium</td>
+<td style="text-align: right;">8 154 / 7 642</td>
+<td style="text-align: right;">447 / 406</td>
+<td style="text-align: right;">25.5 / 24.2</td>
+<td style="text-align: right;">25/25 / 23/25 *</td>
+</tr>
+<tr>
+<td>аквариум xhigh</td>
+<td style="text-align: right;">29 015 / 32 217</td>
+<td style="text-align: right;">34 735 / 47 809</td>
+<td style="text-align: right;">25.8 / 28.3</td>
+<td style="text-align: right;">23/25 / 22/25</td>
+</tr>
+<tr>
+<td>майнкрафт low / medium / xhigh</td>
+<td style="text-align: right;">8 939 / 19 446 / 83 446</td>
+<td style="text-align: right;">1 596 / 29 281 / 234 637</td>
+<td style="text-align: right;">25.4 / 26.0 / 25.5</td>
+<td style="text-align: right;">28/29 · 27/29 · 27/29</td>
+</tr>
+</tbody>
+</table></div>
+<p>* У исходного RadixArk страница не запускается: хомяки xhigh — <code>Unexpected token ','</code>, аквариум medium — <code>Cannot access
+'foods' before initialization</code>.</p>
+<p>У Swift на FreeToken работают все 9 страниц из 9 — как у трёхбитного GSQ-RCO и лучше наших двух квантов на DACAN (8 и
+7 из 9); у исходного RadixArk на том же движке — 4 из 6. FreeToken вдвое медленнее DACAN: 25–27 т/с на одной карте против
+медианы 58 у NVFP4 + Q8 (DACAN). Чекпойнт на Hugging Face не выкладываем: у UkisAI есть свой
+<a href="https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4">NVFP4</a> с теми же экспертами в формате ModelOpt и
+таблицей в BF16 (186.5 ГБ против наших 126). Прогоны — в галерее, группа «Swift 1.5 NVFP4 RadixArk FreeToken»;
+сценарий — <code>scripts/quality/swift_probe_ft.sh</code> (ждёт готовности по <code>/health</code>: список моделей FreeToken отдаёт ещё до
+загрузки весов).</p>
+<p><strong>Зависшие сцены.</strong> Шесть страниц, которые не запускаются в браузере (NVFP4 + Q8 (DACAN) — хомяки и аквариум xhigh, 8 бит —
+аквариум xhigh, ISTA — аквариум xhigh, исходный RadixArk на FreeToken — хомяки xhigh и аквариум medium), получили рядом
+исправленную копию: в строке прогона ссылка «▶ исправленная» и что поправлено (путь импорта, <code>return</code> вне функции,
+цикл за концом массива, переменные до объявления, двойное объявление, кривой литерал). Оригиналы и счёт не тронуты:
+прогоны по-прежнему не засчитаны.</p>
+<h2>Новое 03.10, вечер: Swift 1.5 против исходной модели на одном кванте</h2>
+<p><a href="https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF">Swift 1.5</a> от UkisAI — дообучение
+Qwen3.8-Flash-Next ради короткого размышления. По словам авторов: на 63 % меньше токенов размышления, ответ в 1.8 раза
+быстрее, точность на xhigh ниже меньше чем на 1 %. Геометрия та же, DACAN её принимает без правок.</p>
+<p>Как сравнивали. Один квант — GSQ-RCO IQ3_XXS: у Swift и у исходной модели одинаковая раскладка типов, 1 079
+тензоров, эксперты 42.9 ГБ. Один движок DACAN и один слой MTP — исходного Qwen, как берёт его установщик DACAN. Задачи
+галереи (хомяки, аквариум, майнкрафт), уровни low / medium / xhigh, выборка галереи 0.6 / 0.95 / 20, по одному прогону
+на ячейку. Различие в условиях одно: таблица n-грамм у Swift своя, IQ4_NL, а у исходной — наша Q8_0, потому что родной
+шард ISTA с таблицей удалён. Майнкрафт снят позже, при остановленной соседней ВМ и с конвертацией весов на фоне
+(пониженный приоритет): на токены и проверки это не влияет, на скорость — в пределах нескольких процентов.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача, уровень</th>
+<th style="text-align: right;">токенов, Swift / исходная</th>
+<th style="text-align: right;">размышление, знаков</th>
+<th style="text-align: right;">т/с</th>
+<th style="text-align: right;">проверки</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки low</td>
+<td style="text-align: right;">8 312 / 6 955</td>
+<td style="text-align: right;">1 681 / 1 824</td>
+<td style="text-align: right;">62.8 / 57.2</td>
+<td style="text-align: right;">8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки medium</td>
+<td style="text-align: right;">7 704 / 11 550</td>
+<td style="text-align: right;"><strong>7 784 / 18 677</strong></td>
+<td style="text-align: right;">51.1 / 46.8</td>
+<td style="text-align: right;">8/8 / 8/8</td>
+</tr>
+<tr>
+<td>хомяки xhigh</td>
+<td style="text-align: right;">28 199 / 12 867</td>
+<td style="text-align: right;">70 484 / 0 *</td>
+<td style="text-align: right;">47.5 / 51.4</td>
+<td style="text-align: right;">8/8 / 8/8</td>
+</tr>
+<tr>
+<td>аквариум low</td>
+<td style="text-align: right;">9 835 / 9 383</td>
+<td style="text-align: right;">1 221 / 1 035</td>
+<td style="text-align: right;">54.6 / 55.0</td>
+<td style="text-align: right;">25/25 / 23/25</td>
+</tr>
+<tr>
+<td>аквариум medium</td>
+<td style="text-align: right;">7 491 / 8 033</td>
+<td style="text-align: right;">212 / 95</td>
+<td style="text-align: right;">52.7 / 53.0</td>
+<td style="text-align: right;">24/25 / 24/25</td>
+</tr>
+<tr>
+<td>аквариум xhigh</td>
+<td style="text-align: right;">28 477 / 35 918</td>
+<td style="text-align: right;"><strong>37 375 / 64 277</strong></td>
+<td style="text-align: right;">46.4 / 44.0</td>
+<td style="text-align: right;">22/25 / 23/25, страница падает **</td>
+</tr>
+<tr>
+<td>майнкрафт low</td>
+<td style="text-align: right;">12 450 / 13 451</td>
+<td style="text-align: right;"><strong>13 306 / 18 522</strong></td>
+<td style="text-align: right;">60.3 / 56.7</td>
+<td style="text-align: right;">27/29 / 29/29</td>
+</tr>
+<tr>
+<td>майнкрафт medium</td>
+<td style="text-align: right;">10 300 / 14 119</td>
+<td style="text-align: right;"><strong>9 796 / 20 085</strong></td>
+<td style="text-align: right;">54.4 / 50.9</td>
+<td style="text-align: right;">29/29 / 27/29</td>
+</tr>
+<tr>
+<td>майнкрафт xhigh</td>
+<td style="text-align: right;">72 076 / 66 488</td>
+<td style="text-align: right;">214 124 / 197 524</td>
+<td style="text-align: right;">37.5 / 40.2</td>
+<td style="text-align: right;">27/29 / 27/29</td>
+</tr>
+</tbody>
+</table></div>
+<p>* Исходная модель в этом прогоне не размышляла вовсе: ответ сразу начинается с кода.
+** <code>SyntaxError: Identifier 'lastHover' has already been declared</code> — сцена не запускается, прогон не засчитан.
+Регэкспы проверок засчитали бы его, ошибку показал запуск страницы в браузере.</p>
+<p>Что видно:</p>
+<ul>
+<li>На low и medium, где обе модели размышляют, Swift короче: хомяки medium −58 %, майнкрафт low −28 %, майнкрафт
+  medium −51 % размышления; весь ответ — на 33 %, 7 % и 27 % токенов.</li>
+<li>На xhigh картина смешанная: аквариум −42 %, майнкрафт +8 % (Swift размышлял дольше), хомяки — не в счёт, исходная
+  модель там пропустила размышление.</li>
+<li>На аквариуме low/medium обе почти не думают, разницы нет.</li>
+<li>Всё вместе без пары хомяков xhigh: Swift 156 645 токенов против 165 897 (−6 %), размышление 285 499 знаков против
+  322 039 (−11 %). До обещанных −63 % далеко; основная экономия — на low и medium.</li>
+<li>Качество не просело: у Swift засчитаны все 9 прогонов, у исходной — 8 из 9; по проверкам 178 из 186 против 177.
+  Скорость одна (квант один): 37–63 т/с.</li>
+</ul>
+<p>По одному прогону на ячейку с выборкой это ориентир, а не мера. Следующий шаг — два своих кванта Swift из его BF16:
+8-битный (эксперты, плотная часть и таблица n-грамм Q8_0, роутеры и гиперсвязи BF16) и смесь как у рабочего DACAN
+(эксперты NVFP4, сжатые по рецепту ModelOpt — кодировка совпала с экспертами NVIDIA на 100 % на проверочных
+матрицах, — плотная часть и таблица n-грамм Q8_0). Все 18 прогонов — в галерее: <a href="hamsters/hamsters.html">хомяки</a>,
+<a href="hamsters/aquarium.html">аквариум</a>, <a href="hamsters/minecraft.html">майнкрафт</a> — в списке «модель» пункт «Swift 1.5
+(Flash-Next)», группы «Swift 1.5 IQ3_XXS Дацан» и «Flash-Next ISTA IQ3_XXS Дацан»: страница, размышление, ответ
+целиком, снимок. Как снято — <code>scripts/quality/swift_probe.sh</code> (задачи — переменная <code>TASKS</code>): снимает службу, по
+очереди поднимает оба движка, гоняет <code>bench_ext.py</code> и возвращает службу даже при сбое.</p>
+<h2>Новое 03.10: скорость на свободном узле — 72–80 т/с на коде, 47–60 на прозе</h2>
+<p>Служба DACAN (движок 5b1b8e3c, пакет промта 8K, стоянка на 16 разговоров) на узле, где на время замера остановлен
+прогон Baison в соседней ВМ. Жадно, без размышления, если не сказано иное. Каждый запрос — новый текст, которого нет
+в кеше движка. Скорости взяты из строки самого движка (<code>strata serve: prompt … read in …, … generated in …</code>).</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>запрос</th>
+<th style="text-align: right;">промт, токенов</th>
+<th style="text-align: right;">чтение промта, т/с</th>
+<th style="text-align: right;">ответ, токенов</th>
+<th style="text-align: right;">ответ, т/с</th>
+<th style="text-align: right;">принято черновиков</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>модуль на Python (SQL в памяти, разбор, тесты)</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">10 250</td>
+<td style="text-align: right;"><strong>76.9</strong></td>
+<td style="text-align: right;">7 244 из 8 517 (85 %)</td>
+</tr>
+<tr>
+<td>список по свежему документу 19K (<code>pf2_test.py</code>, 25 фактов из 25)</td>
+<td style="text-align: right;">19 338</td>
+<td style="text-align: right;"><strong>785.6</strong></td>
+<td style="text-align: right;">597</td>
+<td style="text-align: right;"><strong>80.4</strong></td>
+<td style="text-align: right;">431 из 485 (89 %)</td>
+</tr>
+<tr>
+<td>список по свежему документу 98K (11 фактов из 11)</td>
+<td style="text-align: right;">97 875</td>
+<td style="text-align: right;"><strong>714.6</strong></td>
+<td style="text-align: right;">259</td>
+<td style="text-align: right;"><strong>69.9</strong></td>
+<td style="text-align: right;">186 из 215 (87 %)</td>
+</tr>
+<tr>
+<td>калибровочный запрос 27.09 (LRU-кэш, размышление low)</td>
+<td style="text-align: right;">88</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">1 984</td>
+<td style="text-align: right;"><strong>71.9</strong></td>
+<td style="text-align: right;">1 145 из 1 713 (67 %)</td>
+</tr>
+<tr>
+<td>очерк по-английски</td>
+<td style="text-align: right;">58</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">1 931</td>
+<td style="text-align: right;"><strong>60.4</strong></td>
+<td style="text-align: right;">1 011 из 1 766 (57 %)</td>
+</tr>
+<tr>
+<td>очерк по-русски</td>
+<td style="text-align: right;">77</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">2 340</td>
+<td style="text-align: right;"><strong>47.0</strong></td>
+<td style="text-align: right;">625 из 1 934 (32 %)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Чтение промта на коротких запросах не показано: там это время запуска, а не скорость.</p>
+<p>Разброс 47–80 т/с — это черновики MTP: каждый принятый черновик даёт токен почти бесплатно. Код и списки
+предсказуемы, проза — меньше, русская проза — меньше всего. Поэтому одна цифра «скорость модели» без типа текста
+ничего не значит.</p>
+<p>Сравнение с 27.09. Тот же калибровочный запрос тогда давал 64.9 т/с при ВМ под обычной нагрузкой и 68.3 с пределом
+в 4 ЦП для ВМ (раздел «Узел делится с виртуальной машиной: сторож ядер» ниже). Теперь 71.9. Ответ стал на 55 токенов длиннее: движок с тех пор
+перевели на FP16 и пакеты по 8K, поэтому часть прироста дала правка движка, а не только свободный узел.</p>
+<p>Чтение промта с нуля: 786 т/с на 19K и 715 на 98K. 29.09 на 19K было 798.</p>
+<p><strong>Веса на Hugging Face теперь полные.</strong> Последний недостающий файл, плотный GGUF для <code>--native</code>
+(<code>Qwen3.8-Flash-Next-dense-Q8_0.gguf</code>, 5.99 ГБ: всё, кроме маршрутных экспертов), выложен в
+<a href="https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN">tirex2001/Qwen3.8-Flash-Next-DACAN</a>: 27 файлов,
+260.6 ГБ. Перед заливкой его проверили на движке. С этим файлом в <code>--native</code> движок дал три жадных ответа (1 984,
+1 931 и 596 токенов), совпавших знак в знак с ответами штатной службы. Скрипт — <code>tools/2x2080ti/dense_gguf.py</code> в форке.</p>
+<p><strong>Одна большая карта (24–48 ГБ).</strong> На 4090 с 48 ГБ половина видеопамяти стояла пустой («8 000 experts cached»).
+В DACAN теперь есть полный профиль экспертов, установщик берёт его с 20 ГБ видеопамяти и предлагает 16-битный KV. Инструкция для новой и уже стоящей установки —
+<a href="https://github.com/tirex999/DACAN/blob/main/docs/ONE_BIG_CARD.md">docs/ONE_BIG_CARD.md</a>.</p>
+<p>Замер прислал пользователь с такой картой: RTX 4090 48 ГБ, Ryzen 7 9700X, 59 ГБ ОЗУ. Модель и настройки до и после
+одни и те же: ISTA IQ3_S, KV fp16, 262K. С полным профилем на карту встали <strong>17 304 эксперта вместо 8000</strong>,
+видеопамять занята на 47.6 из 48 ГБ. Скорость ответа выросла с 50.6 т/с до <strong>95.3 т/с</strong>: «до» — мгновенное
+показание монитора, «после» — средняя по целому ответу в 2 279 токенов на контексте 75–85K. Короткие ответы на том же
+контексте идут 112–176 т/с. Сам он говорит «заметно шустрее, почти в 2 раза».</p>
+<h2>Новое 29.09: несколько разговоров сразу, промт 296 → 798 т/с, ответ до 100K</h2>
+<p>Код — в форке <a href="https://github.com/tirex999/DACAN">github.com/tirex999/DACAN</a>, проверки —
+<code>tools/2x2080ti/park_test.py</code> и <code>tools/2x2080ti/pf2_test.py</code> там же.</p>
+<h3>Стоянка разговоров: чужой запрос больше не заставляет перечитывать твой</h3>
+<p>Движок, как и Strata автора, держал в кеше <strong>один</strong> разговор. Внутри него всё хорошо: панель Claude Code выросла с 32K
+до 131K токенов, 70 ходов подряд брали из кеша 99 % промта, ход читался за 2–6 с. Но любой запрос другого разговора
+(второй чат, отдельный короткий запрос самого клиента) вытеснял его, и следующий ход перечитывал весь контекст:
+88K и 90K токенов — 296 и 303 с.</p>
+<p>Теперь вытесняемый разговор уезжает на стоянку в ОЗУ (<code>--park N</code>, по умолчанию 4 разговора и 8 ГиБ; служба DACAN
+работает с 16 разговорами и 16 ГиБ) и возвращается, когда его чат продолжается.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th></th>
+<th>время</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>разговор 16.8K уезжает на стоянку</td>
+<td>0.76 с (585 МиБ)</td>
+</tr>
+<tr>
+<td>возвращается</td>
+<td>0.055 с, из кеша 16 791 из 16 798 токенов</td>
+</tr>
+<tr>
+<td>без стоянки (перечитать)</td>
+<td>~55 с</td>
+</tr>
+</tbody>
+</table></div>
+<p>Ответ после возвращения совпал с ответом без перерыва знак в знак.</p>
+<h3>Промт читается в 2.7 раза быстрее: 296 → 798 т/с</h3>
+<p>Свежий промт на 19 339 токенов, каждый шаг — отдельная правка движка с замером:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>шаг</th>
+<th>чтение</th>
+<th>скорость</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>было (утро 29.09)</td>
+<td>65.3 с</td>
+<td>296 т/с</td>
+</tr>
+<tr>
+<td>шаг 1</td>
+<td>40.1 с</td>
+<td>483 т/с</td>
+</tr>
+<tr>
+<td>шаг 2: пакеты по 8K (<code>--prefill 8192</code>)</td>
+<td>30.5 с</td>
+<td>633 т/с</td>
+</tr>
+<tr>
+<td>шаг 3</td>
+<td>24.2 с</td>
+<td><strong>798 т/с</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>После первых двух шагов жадный ответ совпадал с прежним знак в знак. Третий меняет младшие биты: на раннем почти
+равном токене ответ выбрал другую форму строк («canyon-1, copper, river, 46 grams» вместо «canyon-1, made of copper,
+kept near the river, weighs 46 grams»), все 25 фактов верны на двух свежих документах. Вернуть чтение на одну карту —
+<code>STRATA_PREFILL_CARD2=0</code>.</p>
+<p><strong>Живой разговор Claude Code на 94 301 токен, прочитанный с нуля: 122.5 с, 770 т/с</strong> (утром 88K и 90K читались 296 и
+303 с). Дальше разговор идёт из кеша: 95 708 токенов — 94 893 из кеша и 815 прочитано за 3.5 с; 137 651 — 120 074 из
+кеша и 17 577 за 28.7 с.</p>
+<h3>Субагенты Claude Code</h3>
+<p><strong>Субагенты перечитывали свой промт каждый ход.</strong> Стоянка брала только разговор от двух ходов или от 32K, чтобы
+разовые служебные запросы Claude Code (заголовки и сводки по 17–18K) не вытесняли настоящие разговоры. Но субагент
+выглядит так же — 17–26K, один ход за раз — и продолжается, поэтому за полчаса работы процесса 12 его ходов
+прочитались с нуля, по 23–35 с. Теперь паркуется любой разговор от 8K, мест на стоянке 16, лимит 16 ГиБ
+(<code>--park 16 --park-mib 16384</code>); первыми уходят самые старые. Разговор на 171K уезжает на стоянку за 3.8 с.</p>
+<p>Чего пока нет: общее начало разных разговоров (системный промт Claude Code, ~17K) каждый новый разговор читает заново —
+новый субагент и новый разговор после сжатия (67K с нуля за 90 с).</p>
+<h3>Лимит ответа и Claude Code с локальной моделью</h3>
+<ul>
+<li><code>"min_max_tokens": 100000</code> в конфиге сервера: клиент, который просит меньше (агенты шлют 32000), получает 100 000 —
+  но не больше, чем осталось в контексте.</li>
+<li><code>"fit_max_tokens": true</code>: вместо ошибки 400 «prompt + max tokens exceeds the context» ответ урезается до свободного
+  места.</li>
+<li><strong>Claude Code 2.1.283 не сжимает разговор по порогу, если окно не задано явно</strong>: он ждёт от сервера ошибку «prompt is
+  too long», а у DACAN текст ошибки другой. Разговор в панели дорос до 201K токенов и встал. Лечение — в <code>env</code>
+  настроек Claude Code <code>"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000"</code> (так советует и MiniMax): каждая модель берёт
+  меньшее из 1M и своего окна — DACAN сжимается на 167K, MiniMax M3 — на 967K.</li>
+</ul>
+<h2>Новое 28.09, вечер: движок зовётся DACAN (Дацан), контекст 256K, узел делится с виртуальной машиной</h2>
+<p>После правок дня это уже не Strata автора, а свой движок под одну модель и одну машину. Назвали его <strong>DACAN</strong>
+(Дацан), форк переименован: <a href="https://github.com/tirex999/DACAN">github.com/tirex999/DACAN</a>, веса для него — <a href="https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN">huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN</a>. Он собран под
+Qwen3.8-Flash-Next (архитектура <code>qwen4exp</code>: 48 слоёв, 512 экспертов, 10 на токен + общий, MTP) на двух
+2080 Ti с NVLink и двух сокетах Ice Lake с AVX-512 VNNI. Имя Strata дальше — только про оригинал автора.</p>
+<h3>Весь контекст модели: 262 144 токена</h3>
+<p>Служба теперь поднимается с контекстом 262 144 (KV-кэш int8) и с ускорением второй карты
+(<code>STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1</code>). Проверка иголкой: в длинный текст спрятано кодовое слово, модель
+должна его найти. Ответ без ограничения длины, как у боевого клиента:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>промпт, токенов</th>
+<th>префилл, т/с</th>
+<th>префилл, с</th>
+<th>декод, т/с</th>
+<th>нашла</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7 844</td>
+<td>309</td>
+<td>25</td>
+<td>56.4</td>
+<td>да</td>
+</tr>
+<tr>
+<td>24 246</td>
+<td>301</td>
+<td>81</td>
+<td>54.3</td>
+<td>да</td>
+</tr>
+<tr>
+<td>105 017</td>
+<td>285</td>
+<td>369</td>
+<td>52.9</td>
+<td>да</td>
+</tr>
+<tr>
+<td>195 164</td>
+<td>267</td>
+<td>732</td>
+<td>53.5</td>
+<td>да</td>
+</tr>
+</tbody>
+</table></div>
+<p>Декод на 195K почти тот же, что на 8K. Префилл тогда был долгим: 195K читались 12 минут (ускорение чтения — 29.09,
+раздел выше).</p>
+<h3>Что модель делает на задачах галереи</h3>
+<p>Все четыре задачи, по <strong>два прогона</strong> на уровень размышления, выборка 0.6 / 0.95 / 20, без потолка ответа. Галерея
+засчитывает прогон, если код прошёл проверки <strong>и</strong> сцена работает в браузере (осмотр по снимку). В клетке — прогон 1 ·
+прогон 2:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>low</th>
+<th>medium</th>
+<th>xhigh</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Хомяки</td>
+<td>8/8 ✓ · 8/8 ✓</td>
+<td>8/8 ✓ · 8/8 ✓</td>
+<td>8/8 падает · 8/8 ✓</td>
+</tr>
+<tr>
+<td>Хомяки-физика</td>
+<td>10/20 ниже порога · 14/20 ниже порога</td>
+<td>16/20 падает · 16/20 падает</td>
+<td>17/20 падает · 16/20 падает</td>
+</tr>
+<tr>
+<td>Аквариум</td>
+<td>24/25 ✓ · 23/25 ✓</td>
+<td>22/25 ✓ · 25/25 ✓</td>
+<td>21/25 ✓ · 20/25 ✓</td>
+</tr>
+<tr>
+<td>Майнкрафт</td>
+<td>26/29 ✓ · 29/29 ✓</td>
+<td>27/29 ✓ · 27/29 ✓</td>
+<td>29/29 ✓ · 29/29 ✓</td>
+</tr>
+</tbody>
+</table></div>
+<p>Засчитано 17 из 24. На хомяках, аквариуме и майнкрафте — 17 из 18: лучше всех сборок Flash-Next, у которых прогонов
+на этих задачах хватает для сравнения (NVFP4 на Strata с выборкой 8 из 9, Q8_0 из FP8 8 из 9, свой IQ4X-Q8A 6 из 9).
+Слабое место — хомяки-физика: 0 из 6, у тех же сборок 2 из 3. На low не добирает проверок, на medium и xhigh
+страница падает или 3D-сцена остаётся пустой. Почему физика даётся этой сборке хуже, пока не разобрано.</p>
+<p>Сначала я написал здесь «уровень лучших сборок», глядя только на проверки кода; потом «6 из 12», глядя на осмотр,
+который любую ошибку в консоли считал падением. Оба раза было неверно. Вторые прогоны сняты по слову хозяина
+«пусть переделывает»: все прежние прогоны остались в галерее, и доля засчитанных считается по всем.
+Самые длинные ответы — майнкрафт xhigh на 87 214 токенов (39.8 т/с) и физика xhigh на 60 643 — движок довёл до конца.</p>
+<p><strong>Поправка правила для всей галереи.</strong> Аквариум xhigh осмотр записал в «страница падает» из-за
+<code>controls.getDistance is not a function</code>, а в браузере он открывается и работает: ошибка сидит только в счётчике
+дистанции. Все 79 прогонов галереи с ошибкой в консоли и появившимся холстом пересмотрены по снимкам: 27 глазами,
+остальные 52 по мере наполненности центра кадра (число цветов, разброс яркости, края; калибровка по рабочим снимкам).
+Сцена построена целиком и живёт у 7. Засчитаны 5, у которых ошибка не отключает требование задания: два прогона
+Дацана, хомяки Q4_K_M xhigh, аквариумы Ornith AutoRound low и medium. Не засчитаны аквариум 8 бит расцензуренная
+medium (<code>OrbitControls is not a constructor</code> — не вращается камера) и аквариум Ornith AutoRound без размышления
+(<code>raycaster.intersectPlane</code> — через него корм по клику). У хомяков 8 бит расцензуренная клетка построена, а хомяков
+нет (<code>CapsuleGeometry</code> в r128 нет). Остальное — заставка «загрузка…» или пустая сцена. Майнкрафты с ошибкой (14)
+оставлены провалами: на снимке у них меню «Click to play», мир за ним снимок не показывает.
+В галерее у засчитанных видна пометка «ошибка в консоли — сцена работает» с текстом ошибки.</p>
+<p>Настоящие падения Дацана — ошибки в коде, который написала модель; движок текст не портит (битых символов в ответах
+нет). Например, хомяки xhigh, прогон 1 — типографский минус «−» вместо «-» в <code>[−3.66]</code>, скрипт не разбирается.</p>
+<p>Попутно исправлена проверка «цикл анимации»: она искала только <code>requestAnimationFrame</code>, а цикл через
+<code>renderer.setAnimationLoop</code> в three.js тот же самый. Галерея перепроверена: три прогона хомяков поднялись
+с 7/8 до 8/8 (годность не поменялась).</p>
+<h3>Интерфейс: обе карты и оба сокета</h3>
+<p>Встроенная страница движка (<code>http://&lt;узел&gt;:8000/</code>) показывала одну карту и один процессор. Теперь в мониторе
+по карточке на каждую карту (загрузка, память, температура, мощность, PCIe) и на каждый сокет (загрузка ЦП,
+память своего узла, какая карта к нему подключена). Новая гамма и имя DACAN. Заодно найдена ошибка в подсчёте
+загрузки процессора: время гостевой виртуальной машины в <code>/proc/stat</code> уже входит в <code>user</code>, а его складывали ещё раз.
+На нашем узле показывалось 56 % вместо 36 %.</p>
+<h3>Узел делится с виртуальной машиной: сторож ядер</h3>
+<p>На том же узле живёт ВМ с Windows (50 vCPU, сегодня ела от 25 до 49 ЦП). Задача была такая: жить вместе, приоритет у движка.
+На хосте служба-сторож раз в полсекунды спрашивает <code>/status</code> движка. Пока движок читает промпт или отвечает, ВМ
+получает не больше 16 ЦП (<code>cpu.max</code>, период 10 мс: Windows-гостю длинные простои vCPU вредны). Через 10 с после
+ответа предел снимается.</p>
+<p>Калибровка: один и тот же жадный ответ (1 929 токенов, текст одинаковый), по 3 раза на условие, скорость декода по
+счётчику движка, ВМ под своей обычной нагрузкой (47–49 ЦП):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>ВМ</th>
+<th>DACAN, т/с</th>
+<th>ЦП у ВМ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>без предела</td>
+<td>64.9</td>
+<td>47</td>
+</tr>
+<tr>
+<td>предел 16 ЦП</td>
+<td>67.6</td>
+<td>16</td>
+</tr>
+<tr>
+<td>предел 8 ЦП</td>
+<td>68.0</td>
+<td>8</td>
+</tr>
+<tr>
+<td>предел 4 ЦП</td>
+<td>68.3</td>
+<td>4</td>
+</tr>
+</tbody>
+</table></div>
+<p>Полная нагрузка ВМ стоит движку 3–5 %, предел 16 возвращает почти всё, дальше — полка.</p>
+<p>Урок методики. Первый проход мерил окнами по 40 с внутри одного длинного живого ответа, и одно и то же условие дало
+50.6 и 58.9 т/с. MTP угадывает код и рассуждение по-разному, поэтому скорость зависит от того, какой кусок текста попал
+в окно. Скорость движка со спекуляцией сравниваем только на одинаковом тексте.</p>
+<h3>Скрипты</h3>
+<p>Проверки галереи, иголка и сводка по качеству — <a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/scripts/quality"><code>scripts/quality/</code></a>, сторож —
+<code>scripts/dacan-cpu-guard.sh</code> и <code>systemd/dacan-cpu-guard.service</code>, калибровка — <code>scripts/quality/calib_guard2.sh</code>.</p>
+<h2>Новое 28.09, день: «нормальный движок» — +8.8 % от второй карты, процессоры на AVX-512</h2>
+<p>Strata писали под одну карту и десктопный процессор. У нас два сокета Ice Lake (по 32 ядра, 8 каналов памяти, AVX-512
+VNNI), на каждом своя 2080 Ti 22 ГБ, между картами мост NVLink. Движок перестраивается под эту машину.</p>
+<h3>Вторая карта: +8.8 % (<code>STRATA_HELPER</code>)</h3>
+<p>С <code>STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1</code> вторая карта берёт на себя больше работы. Ответ тот же токен в токен;
+проверка — контрольный прогон с тем же набором экспертов (<code>STRATA_HELPER_RESERVE_ONLY=1</code>):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>NVFP4, хомяки low, 512 токенов жадно</th>
+<th>т/с</th>
+<th>сверка</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>контроль</td>
+<td>73.07</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1</code></td>
+<td><strong>79.49</strong></td>
+<td>токен в токен</td>
+</tr>
+</tbody>
+</table></div>
+<p>На длинном окне (промпт 23 985 токенов): контроль 69.82 т/с, с ускорением 73.56 т/с (+5.4 %), токен в токен. Цена —
+1.3 ГБ видеопамяти второй карты.</p>
+<p>Что не сработало: <code>--spec-split</code> — 58.02 т/с против 73.07 у контроля, ответ тот же. Остаётся выключенным.</p>
+<h3>Процессоры: NVFP4 на AVX-512</h3>
+<p>ggml-cpu считает NVFP4 × Q8_0 на x86 только на AVX2. У DACAN своё ядро на AVX-512 VNNI
+(<code>src/kernels/cpu/nvfp4_avx512.cpp</code>), результат побитно тот же, что у ggml (0 расхождений из 13 608), на одном ядре
+процессора быстрее в 1.3–2.7 раза.</p>
+<h3>Гиперпотоки — замерено: не нужны</h3>
+<p>Поток на каждом логическом ЦП (<code>STRATA_SMT=1</code>, 126 рабочих) медленнее: 76.5 т/с против 78.3. Оставлено по потоку на
+физическое ядро.</p>
+<h2>Новое 28.09, ночь: свой форк на 0.1.9, эксперты Q8_0 из FP8, 65.97 → 69.88 т/с</h2>
+<p><strong>Свой движок — форк на GitHub.</strong> <a href="https://github.com/tirex999/DACAN">tirex999/DACAN</a>, ветка <code>main</code>: Strata v0.1.9
+(кэш разговора, KV streaming, IQ3_S, выборка по запросу) плюс наши правки под 2×2080 Ti и два сокета. Перенос с
+v0.1.2 сверен токен в токен: 256 жадных токенов совпали, скорость та же (60.45 против 60.48 т/с).</p>
+<h3>Эксперты Q8_0 из официального FP8</h3>
+<p>Q8_0 — 8.5 бита на вес, эксперт весит 5.2 МБ против 2.76 МБ у NVFP4, все эксперты — 128 ГБ. Конвертер
+<code>tools/q8_experts.py</code> берёт FP8-чекпойнт Qwen (float8_e4m3fn, масштаб на блок 128×128), восстанавливает веса и
+квантует их по правилу ggml. Ядра для карты — порт <code>vec_dot_q8_0_q8_1</code> из llama.cpp; процессор считает их через
+ggml-cpu. Сверка ядер: карта и процессор совпадают до 1e-7.</p>
+<p>Насколько квант далёк от оригинала FP8 (относительная ошибка весов, среднее по матрице):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>квант экспертов</th>
+<th>ошибка против FP8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q8_0 (наш, из FP8)</td>
+<td>0.55–0.59 %, худшая матрица 0.8 %</td>
+</tr>
+<tr>
+<td>NVFP4 (NVIDIA ModelOpt)</td>
+<td>9.8 %</td>
+</tr>
+</tbody>
+</table></div>
+<p>Скорость на одном и том же коде, хомяки low, 512 токенов жадно, обе карты и оба сокета:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>эксперты</th>
+<th>т/с</th>
+<th>приёмка черновиков MTP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVFP4</td>
+<td>69.88</td>
+<td>0.663</td>
+</tr>
+<tr>
+<td>Q8_0</td>
+<td>64.36</td>
+<td>0.733</td>
+</tr>
+</tbody>
+</table></div>
+<p>Q8_0 медленнее на 8 %: эксперт вдвое тяжелее. Зато черновики MTP принимаются чаще — косвенный признак, что модель ближе
+к оригиналу (один промпт — не проверка мозгов).</p>
+<h3>Длинные окна (NVFP4, жадно, 256 новых токенов)</h3>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>промпт</th>
+<th>т/с</th>
+<th>префилл</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>233 токена</td>
+<td>65.97</td>
+<td>91 т/с</td>
+</tr>
+<tr>
+<td>~24 тыс.</td>
+<td>65.8</td>
+<td>329 т/с</td>
+</tr>
+<tr>
+<td>~97 тыс.</td>
+<td>52.8</td>
+<td>310 т/с</td>
+</tr>
+</tbody>
+</table></div>
+<p>До 24 тысяч длина скорость не роняет; на 97 тысячах черновики принимаются хуже. Главная карта при этом грелась до
+83–84 °C.</p>
+<h3>Правки ночи: 65.97 → 69.88 т/с</h3>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>правка</th>
+<th>т/с</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>перенос на 0.1.9</td>
+<td>65.97</td>
+</tr>
+<tr>
+<td>обмен между картами (выключить — <code>STRATA_CARD2_NVLINK=0</code>)</td>
+<td>67.24</td>
+</tr>
+<tr>
+<td>ядра экспертов</td>
+<td>69.11</td>
+</tr>
+<tr>
+<td>мелкие запуски</td>
+<td>69.88</td>
+</tr>
+</tbody>
+</table></div>
+<p>NVFP4, хомяки low, 512 токенов жадно; на каждом шаге ответ совпадал с прежним токен в токен. Итог ночи <strong>+5.9 %</strong>.</p>
+<p>Проверили и оставили как есть:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>что</th>
+<th>т/с</th>
+<th>вывод</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>запуск графа из отдельного потока (<code>STRATA_ASYNC_LAUNCH=1</code>)</td>
+<td>69.26</td>
+<td>выигрыша нет</td>
+</tr>
+<tr>
+<td>порог черновиков <code>--spec-min-p</code> 0.35 / 0.5 / 0.65</td>
+<td>67.60 / 69.88 / 69.56</td>
+<td>0.5 остаётся</td>
+</tr>
+</tbody>
+</table></div>
+<h3>Сеть: 1 Гбит/с между узлами</h3>
+<p>Физические сетевые карты узлов — 1 Гбит/с (мост Proxmox показывает 10G, но это виртуальная цифра). Поэтому NFS
+упирается в ~115 МБ/с: эксперты NVFP4 (68 ГБ) грузятся ~10 минут, Q8_0 (128 ГБ) — ~20 минут, конвертация FP8 → Q8_0
+заняла 32 минуты. Ночное резервное копирование Proxmox (с 01:00, архивы на то же NFS) забирает канал целиком: загрузка
+модели падает до ~12 МБ/с — замеры в это время не ставим.</p>
+<p>Служба Strata 0.1.9 со всеми правками ночи работает на CT 200, порт 8000 (OpenAI API), модель
+<code>qwen3.8-flash-next-nvfp4</code>, выборка по умолчанию 1.0 / 0.95 / 20.</p>
+<h2>Новое 27.09, ночь: Strata отвечала жадно — теперь выборка, как у FreeToken</h2>
+<p>На FreeToken с NVFP4 сцены выходят умнее, чем на Strata с нашим квантом. Сверка по весам этого не объясняет. Плотная
+часть кванта A бит в бит совпадает с Q8_0 из BF16-чекпоинта NVIDIA. Эксперты IQ4_XS/IQ4_NL ближе к официальному FP8,
+чем NVFP4: ошибка 8.5 % против 9.8 % на 18 матрицах. Разница нашлась в самом движке, в трёх местах.</p>
+<ol>
+<li><strong>Strata отвечала жадно на любой запрос.</strong> Сервер не читал из запроса <code>temperature</code>, <code>top_p</code> и <code>top_k</code>, а окно
+   проверки черновиков было жёстко на argmax. А модель рассчитана на выборку: в её <code>generation_config.json</code> стоит
+   <code>do_sample: true</code>, и в заметках NVIDIA к чекпоинту рекомендованная выборка — temperature 1.0, top_p 0.95, top_k 20.</li>
+<li><strong>Порядок фильтров.</strong> В Strata цепочка llama.cpp: top_p считается по сырым логитам, температура применяется после.
+   FreeToken (flashinfer), vLLM и HF сначала делят логиты на температуру, потом режут top_k и top_p. Так эти
+   параметры понимает любой OpenAI-совместимый сервер.</li>
+<li><strong>KV в int8.</strong> Мы запускали с <code>--kv int8</code>. У автора это экспериментальный режим: по умолчанию fp16.</li>
+</ol>
+<p>Что сделано:</p>
+<ul>
+<li><strong>Быстрое ядро выборки</strong>: 1.1 мс на окно из 5 строк против 6.5 с у эталонного, 0 расхождений с эталоном в 672
+  выборах.</li>
+<li><strong>Точная спекулятивная выборка</strong>: черновик MTP принимается, только если совпал с разыгранным токеном; при том же
+  зерне ответ совпадает с выборкой без черновиков токен в токен.</li>
+<li><strong>Сервер передаёт движку параметры запроса.</strong> <code>temperature</code>, <code>top_k</code>, <code>top_p</code> и <code>seed</code> идут из запроса, по
+  умолчанию 0.6 / 20 / 0.95. Порядок фильтров — как у vLLM; <code>STRATA_SAMPLE_ORDER=llama</code> возвращает прежний. Для
+  прямого запуска есть ключи <code>--seed</code>, <code>--temperature</code>, <code>--top-k</code>, <code>--top-p</code> и <code>--temp-first</code>.</li>
+<li><strong>Точность KV задаётся при запуске.</strong> В <code>strata_run_fast.sh</code> появился ключ <code>KV=fp16|int8</code>.</li>
+</ul>
+<p><strong>Задания стенда на FreeToken NVFP4</strong> — те же 12 промптов, та же выборка 0.6 / 0.95 / 20, её стенд шлёт всем
+движкам одинаково. Одна карта, эксперты считает процессор, 64 потока (очередь идёт):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>размышление</th>
+<th>т/с</th>
+<th>токенов</th>
+<th>проверки</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>аквариум</td>
+<td>low</td>
+<td>24.7</td>
+<td>10 160</td>
+<td>24/25</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>medium</td>
+<td>23.4</td>
+<td>7 120</td>
+<td>24/25</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>xhigh</td>
+<td>23.1</td>
+<td>41 345</td>
+<td>21/25</td>
+</tr>
+<tr>
+<td>хомяки, майнкрафт, хомяки-физика</td>
+<td></td>
+<td>идут</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<p>Автоматические проверки на обоих движках близки: Strata с жадным выбором дала на аквариуме 23/24/20. Разница видна
+в целостной оценке сцены: два «провала» нашего кванта на жадном выводе — ошибки JS в самом коде
+(<code>Cannot access 'bubbles' before initialization</code>), из-за которых сцена не строится.</p>
+<p><strong>FreeToken на двух сокетах: +24 %.</strong> Наш патч к FreeToken —
+<a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/blob/main/scripts/freetoken-numa-spin-2709.patch"><code>scripts/freetoken-numa-spin-2709.patch</code></a>.
+Ядро экспертов выдаёт те же числа, что заводское, бит в бит (сверка на синтетических банках NVFP4 в пяти режимах).
+Замер — промпт хомяков, жадно, 2048 токенов:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>FreeToken NVFP4</th>
+<th>вывод, т/с</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>заводской</td>
+<td>23.55 / 23.94</td>
+</tr>
+<tr>
+<td>с патчем</td>
+<td><strong>29.64 / 29.37</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>На задании стенда (аквариум low, выборка) — 28.2 т/с против 24.7 у заводского.</p>
+<p>Как поставить: <code>patch -p1 -d &lt;site-packages&gt; &lt; freetoken-numa-spin-2709.patch</code>, затем пересобрать <code>_cpu_moe</code>
+(<code>CppExtension("_cpu_moe", ["cpu_moe_ext.cpp"], include_dirs=["/usr/local/cuda/include"], libraries=["cudart"],
+extra_compile_args=["-O3", "-std=c++17"])</code>, около 40 с). Переменные: <code>FT_NUMA=1</code>, <code>FT_MOE_HOT_US</code> (50000 по
+умолчанию, 0 — заводское поведение; файл <code>/dev/shm/ft_moe_hot_us</code> меняет его на живом сервере), <code>FT_MOE_STATS=1</code> —
+строка задержек пула в журнале.</p>
+<p><strong>Первое сравнение по картинке</strong> — те же промпты, по одному прогону на уровень, сумма оценок из 25 (живость, детали,
+отсутствие пересечений, механика, вид):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>FreeToken NVFP4</th>
+<th>Strata, квант A (ещё жадный вывод)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>аквариум low</td>
+<td>18</td>
+<td>17</td>
+</tr>
+<tr>
+<td>аквариум medium</td>
+<td>17 — рыбы-капсулы без плавников</td>
+<td><strong>21</strong></td>
+</tr>
+<tr>
+<td>аквариум xhigh</td>
+<td>13 — сцена почти чёрная, 1 кадр в секунду</td>
+<td><strong>23</strong> — стекло, каустика, 30 пузырей</td>
+</tr>
+<tr>
+<td>хомяки low</td>
+<td><strong>1 — провал</strong>: ошибка JS, пустой экран</td>
+<td>18</td>
+</tr>
+</tbody>
+</table></div>
+<p>На этих парах FreeToken с NVFP4 не умнее. Ошибки JS, из-за которых сцена не строится, бывают у обоих движков.
+Остальные задания идут на обоих движках с одинаковой выборкой.</p>
+<h2>Новое 27.09, вечер: оба сокета и таблица n-грамм в памяти — до 74 т/с</h2>
+<p>На графике Proxmox было видно: пока работает Strata, процессор двое суток держится ровно на 50 %, а нагружена одна
+карта. Замер нашёл причины в движке; правки — ключ <code>--numa</code> (работа на обоих сокетах), таблица n-грамм теперь
+держится в памяти, рабочие пула без работы засыпают через 50 мс — сервер без запросов больше не держит 64 ядра.</p>
+<p><strong>Прямой замер</strong> — квант A с таблицей NVIDIA Q8_0, промпт хомяков, жадно, 512 токенов:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th></th>
+<th>до</th>
+<th>после</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>вывод</td>
+<td>39.7 т/с</td>
+<td><strong>71.7 т/с</strong></td>
+</tr>
+<tr>
+<td>префилл 233 токенов</td>
+<td>45 т/с</td>
+<td>102 т/с</td>
+</tr>
+</tbody>
+</table></div>
+<p>Выход совпал бит в бит (514 токенов): правка меняет только скорость.</p>
+<p><strong>Задания стенда</strong> — квант A с таблицей n-грамм NVIDIA (8 бит), Strata с <code>--numa</code> (очередь ещё идёт). Та же
+связка до правки давала на хомяках 53.1 и 54.5 т/с. Для сравнения — квант A с таблицей ISTA и ISTA целиком, оба до
+правки:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>размышление</th>
+<th>т/с</th>
+<th>токенов</th>
+<th>проверки</th>
+<th>A до правки, т/с</th>
+<th>ISTA до правки, т/с</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки</td>
+<td>low</td>
+<td><strong>73.7</strong></td>
+<td>7 915</td>
+<td>8/8</td>
+<td>66.4</td>
+<td>68.5</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>medium</td>
+<td><strong>67.9</strong></td>
+<td>6 390</td>
+<td>8/8</td>
+<td>59.0</td>
+<td>60.8</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>xhigh</td>
+<td><strong>59.3</strong></td>
+<td>37 940</td>
+<td>8/8</td>
+<td>56.9</td>
+<td>50.1</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>low</td>
+<td><strong>69.9</strong></td>
+<td>9 764</td>
+<td>23/25</td>
+<td>64.5</td>
+<td>68.3</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>medium</td>
+<td><strong>67.2</strong></td>
+<td>7 197</td>
+<td>24/25</td>
+<td>62.6</td>
+<td>64.6</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>xhigh</td>
+<td>48.5</td>
+<td>33 575</td>
+<td>20/25</td>
+<td>56.0</td>
+<td>57.8</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>low</td>
+<td><strong>70.1</strong></td>
+<td>24 938</td>
+<td>29/29</td>
+<td>59.3</td>
+<td>66.0</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>medium</td>
+<td><strong>64.9</strong></td>
+<td>14 832</td>
+<td>28/29</td>
+<td>64.2</td>
+<td>64.3</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>xhigh</td>
+<td>идёт</td>
+<td></td>
+<td></td>
+<td>37.1</td>
+<td>33.6</td>
+</tr>
+<tr>
+<td>хомяки-физика</td>
+<td>low / medium / xhigh</td>
+<td>в очереди</td>
+<td></td>
+<td></td>
+<td>63.2 / 56.1 / 46.0</td>
+<td>64.1 / 58.9 / 47.5</td>
+</tr>
+</tbody>
+</table></div>
+<p>Медленнее прежнего только аквариум xhigh. Главная карта на долгом ответе доходит до своей целевой температуры
+84 °C: драйвер держит её, сбрасывая частоту (<code>SW Thermal Slowdown</code>, 1545 МГц из 2100 при вентиляторе 51 %).</p>
+<p><strong>Эталоны Claude.</strong> В <a href="hamsters/">галерее</a> рядом с моделями — эталоны аквариума и майнкрафта, написанные Claude
+напрямую по тем же промптам: 25 из 25 и 29 из 29 проверок, страницы без ошибок. Прежний эталон аквариума (04.09)
+падал с <code>THREE.OrbitControls is not a constructor</code> — заменён.</p>
+<p>Патч в папке <a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/strata"><code>strata/</code></a> обновлён; README — как
+запускать без <code>numactl</code>, про память и нагрев.</p>
+<h2>Новое 27.09, днём: квант поднят до 4 бит — 56–66 т/с</h2>
+<p>Тот же движок Strata с нашим патчем и те же две карты, но квант не ISTA 3 бита, а свой. Эксперты gate/up —
+IQ4_XS, down — IQ4_NL, то есть 4.25–4.5 бита вместо 2–3. Вся плотная часть — внимание, общий эксперт, эмбеддинги и
+голова — Q8_0 (у ISTA Q4_K…Q6_K). Файл 71.4 ГБ, таблица n-грамм та же, что у ISTA (28.8 ГБ).</p>
+<p>Чтобы он пошёл, в движок пришлось добавить две вещи: счёт экспертов IQ4_XS на карте (скалярное произведение по
+образцу llama.cpp) и чтение таблицы токенов в Q8_0. Обе сверены с эталоном. Распаковка совпадает с gguf-py бит в
+бит, умножение — в пределах округления активаций (0.4–0.6 %). Эксперт, посчитанный на карте, отличается от
+посчитанного процессором на 1.4 % на слоях 0, 17 и 40 — как у типов, которые уже работали.</p>
+<p><strong>Прямой замер</strong> — один промпт, 1536 токенов ответа, одинаковые ключи:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>квант</th>
+<th>т/с</th>
+<th>токенов за проход черновика</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISTA 3 бита</td>
+<td>70.7</td>
+<td>3.12</td>
+</tr>
+<tr>
+<td>свой 4 бита, плотная часть Q8_0</td>
+<td>67.0</td>
+<td>3.16</td>
+</tr>
+</tbody>
+</table></div>
+<p>Эксперт 4-битного кванта весит 2.66 МБ против 1.3–1.9 МБ у ISTA; отсюда −5 %.</p>
+<p><strong>Задания стенда</strong> (очередь ещё идёт; кадры и оценка сцен — после неё):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>размышление</th>
+<th>4 бита, т/с</th>
+<th>токенов</th>
+<th>проверки</th>
+<th>ISTA 3 бита, т/с</th>
+<th>проверки</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки</td>
+<td>low</td>
+<td>66.4</td>
+<td>8 831</td>
+<td>8/8</td>
+<td>68.5</td>
+<td>8/8</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>medium</td>
+<td>59.0</td>
+<td>9 660</td>
+<td>8/8</td>
+<td>60.8</td>
+<td>8/8</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>xhigh</td>
+<td>56.9</td>
+<td>41 260</td>
+<td>8/8</td>
+<td>50.1</td>
+<td>8/8</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>low</td>
+<td>64.5</td>
+<td>9 130</td>
+<td><strong>25/25</strong></td>
+<td>68.3</td>
+<td>23/25</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>medium</td>
+<td>62.6</td>
+<td>8 007</td>
+<td>24/25</td>
+<td>64.6</td>
+<td>24/25</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>xhigh</td>
+<td>56.0</td>
+<td>32 467</td>
+<td>21/25</td>
+<td>57.8</td>
+<td>22/25</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>low</td>
+<td>59.3</td>
+<td>21 648</td>
+<td>28/29</td>
+<td>66.0</td>
+<td>29/29</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>medium</td>
+<td>64.2</td>
+<td>17 941</td>
+<td>28/29</td>
+<td>64.3</td>
+<td>27/29</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>xhigh</td>
+<td>идёт</td>
+<td></td>
+<td></td>
+<td>33.6</td>
+<td>0/29 — утонула</td>
+</tr>
+<tr>
+<td>хомяки-физика</td>
+<td>low / medium / xhigh</td>
+<td>в очереди</td>
+<td></td>
+<td></td>
+<td>64.1 / 58.9 / 47.5</td>
+<td>12 / 14 / 13 из 20</td>
+</tr>
+</tbody>
+</table></div>
+<p>т/с — токены, делённые на всё время запроса, как везде на стенде.</p>
+<p>Пока так:</p>
+<ul>
+<li>скорость на 0–10 % ниже ISTA; на хомяках xhigh выше, потому что ответ короче: 41 тыс. токенов против 63 тыс.;</li>
+<li>все прогоны годные, по проверкам — вровень;</li>
+<li>чего не хватило: аквариуму medium — гравитации корма; аквариуму xhigh — 8 цветовых схем, зрачков, 30 пузырей и
+  преломления в стекле; майнкрафту low и medium — луча на 6 блоков.</li>
+</ul>
+<p>Проверки читают только текст кода; живая сцена или пустая — покажут кадры. Главный вопрос к 4 битам — трудные
+задания: майнкрафт на xhigh, где ISTA утонула в размышлении, и хомяки-физика, которую ISTA не прошла ни разу.</p>
+<p>Запуск такой же, как для ISTA, плюс <code>--vram-reserve-mib 1024</code>. Голова в Q8_0 на 238 МБ больше, чем Q5_K у ISTA, и
+без запаса движок не находит места под голову черновика («mtp: the draft head does not fit»). Патч в папке
+<a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/strata"><code>strata/</code></a> обновлён: ядро IQ4_XS, таблица
+токенов Q8_0, и теперь он встаёт на чистую Strata 0.1.2 обычным <code>git apply</code>.</p>
+<h2>Новое 27.09: Strata, доработанная под 2×2080Ti — 50–68 т/с</h2>
+<p><a href="https://github.com/Niko1221/Strata">Strata</a> — движок под одну эту модель: плотная часть и кэш «горячих»
+экспертов на видеокарте, все 24 576 экспертов в закреплённой памяти хоста, недостающих считает процессор,
+таблица n-грамм лежит отдельным файлом, черновик MTP на 3 токена. Квант — <code>ISTA-DASLab</code> GSQ-RCO IQ3_XXS.
+Из коробки он собирается только для sm_80 и новее; перенос на 2080Ti (sm_75) и доработки — наши.</p>
+<p>Хомяки и аквариум, как у всех моделей стенда, по одному прогону на уровень размышления. «Одна карта» — движок
+после переноса, без доработок. «Две карты» — с доработками. «Сцена» — оценка по кадрам с четырёх ракурсов,
+из 25 (раздел «Оценка по качеству»).</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>размышление</th>
+<th>одна карта, т/с*</th>
+<th>две карты, т/с*</th>
+<th>токенов (2 карты)</th>
+<th>проверки</th>
+<th>сцена (2 карты)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки</td>
+<td>low</td>
+<td>39.0</td>
+<td><strong>68.5</strong></td>
+<td>8 037</td>
+<td>8/8</td>
+<td>17 — средне</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>medium</td>
+<td>37.5</td>
+<td><strong>60.8</strong></td>
+<td>9 642</td>
+<td>8/8</td>
+<td>20 — живая</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>xhigh</td>
+<td>31.7</td>
+<td><strong>50.1</strong></td>
+<td>63 246</td>
+<td>8/8</td>
+<td>15 — средне: колеса нет ни на кадрах, ни в коде</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>low</td>
+<td>25.1**</td>
+<td><strong>68.3</strong></td>
+<td>9 575</td>
+<td>23/25</td>
+<td>21 — живая</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>medium</td>
+<td>28.5</td>
+<td><strong>64.6</strong></td>
+<td>8 639</td>
+<td>24/25</td>
+<td>20 — живая</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>xhigh</td>
+<td>32.0</td>
+<td><strong>57.8</strong></td>
+<td>32 958</td>
+<td>22/25</td>
+<td>22 — живая, лучшая сцена Strata</td>
+</tr>
+</tbody>
+</table></div>
+<p>* токены делённые на всё время запроса, вместе с чтением промпта и размышлением.
+** в утреннем прогоне рядом работал FreeToken и делил с ним ядра.</p>
+<p><strong>Все варианты Flash-Next на этих задачах</strong> (т/с считаются так же, как в таблице выше):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>вариант (квант · движок)</th>
+<th>хомяки low / medium / xhigh</th>
+<th>аквариум low / medium / xhigh</th>
+<th>провалов по кадрам</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>свой 4 бита + таблица n-грамм 8 бит · Strata, 2 карты и 2 сокета (<code>--numa</code>)</td>
+<td><strong>73.7 / 67.9 / 59.3</strong></td>
+<td><strong>69.9 / 67.2</strong> / 48.5</td>
+<td>кадры — после очереди</td>
+</tr>
+<tr>
+<td>ISTA 3 бита · Strata, 2 карты (наш патч, до <code>--numa</code>)</td>
+<td>68.5 / 60.8 / 50.1</td>
+<td>68.3 / 64.6 / <strong>57.8</strong></td>
+<td>0 из 6</td>
+</tr>
+<tr>
+<td>свой 4 бита, плотная часть Q8_0 · Strata, 2 карты (до <code>--numa</code>)</td>
+<td>66.4 / 59.0 / 56.9</td>
+<td>64.5 / 62.6 / 56.0</td>
+<td>2 из 6 (ошибки JS)</td>
+</tr>
+<tr>
+<td>ISTA 3 бита · Strata, 1 карта (без доработок)</td>
+<td>39.0 / 37.5 / 31.7</td>
+<td>25.1 / 28.5 / 32.0</td>
+<td>0 из 6</td>
+</tr>
+<tr>
+<td>Q4_K_M · llama.cpp с кэшем экспертов (раздел ниже)</td>
+<td>27.4 / 27.9 / 15.5</td>
+<td>21.0 / 26.4 / 23.4</td>
+<td>3 из 6</td>
+</tr>
+<tr>
+<td>NVFP4 · FreeToken</td>
+<td>21.2 / — / —</td>
+<td>—</td>
+<td>прогнан один</td>
+</tr>
+</tbody>
+</table></div>
+<p>Патч к Strata, инструкция по сборке и запуску, таблицы маршрутизации — в папке
+<a href="https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/strata"><code>strata/</code></a> репозитория.</p>
+<p><strong>Трудные задания стенда</strong> (Strata, 2 карты):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задание</th>
+<th>размышление</th>
+<th>т/с</th>
+<th>токенов</th>
+<th>проверки</th>
+<th>итог</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>майнкрафт</td>
+<td>low</td>
+<td>66.0</td>
+<td>20 907</td>
+<td>29/29</td>
+<td>годен</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>medium</td>
+<td>64.3</td>
+<td>15 399</td>
+<td>27/29</td>
+<td>годен: нет чтения и записи блока</td>
+</tr>
+<tr>
+<td>майнкрафт</td>
+<td>xhigh</td>
+<td>33.6</td>
+<td>129 024</td>
+<td>0/29</td>
+<td>утонула: 476 тыс. знаков размышления, до кода не дошла</td>
+</tr>
+<tr>
+<td>хомяки-физика</td>
+<td>low</td>
+<td>64.1</td>
+<td>18 837</td>
+<td>12/20</td>
+<td>ниже порога 15</td>
+</tr>
+<tr>
+<td>хомяки-физика</td>
+<td>medium</td>
+<td>58.9</td>
+<td>32 452</td>
+<td>14/20</td>
+<td>ниже порога 15</td>
+</tr>
+<tr>
+<td>хомяки-физика</td>
+<td>xhigh</td>
+<td>47.5</td>
+<td>66 913</td>
+<td>13/20</td>
+<td>ниже порога 15</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li>Майнкрафт на low и medium — на уровне 27B-квантов стенда (у них 26–29 из 29), мир из блоков рисуется, строить и
+  ломать можно. Утонуть в размышлении на xhigh случалось и 27B; на 130 тысячах контекста и скорость падает до 33 т/с.</li>
+<li>Хомяков-физику почти не проходит никто: порог 15 из 20 взяли только два прогона из всех моделей, ровно по 15.
+  По кадрам все три сцены Strata рабочие — колесо, труба, панель физики, — а на xhigh колесо крутит бегущий хомяк
+  с расхождением скорости лап и обода 4.9 %: часть «недостающих» проверок — текстовые, физику они не узнали.</li>
+<li>Таблица маршрутизации снималась в том числе на промптах этих двух задач. На ответы это не влияет — только на
+  скорость, и то немного.</li>
+</ul>
+<p><strong>Что сделано в движке</strong> (каждый пункт — отдельный замер «до/после» на одном и том же промпте):</p>
+<ul>
+<li><strong>Перенос на sm_75</strong> (2080 Ti).</li>
+<li><strong>Вторая карта в работе</strong> (<code>--second-card 1</code>).</li>
+<li><strong><code>--pcie-frac</code></strong>: с одной картой лучшее значение 0.15, с двумя — 0.</li>
+<li><strong>Таблица n-грамм — из памяти</strong> (<code>--ple-io mmap</code>).</li>
+<li><strong>Свои ядра гипер-связей</strong>: совпадают со штатными до округления fp32, ~2 мс на раунд быстрее.</li>
+<li><strong>Таблицы маршрутизации сняты на чужих промптах</strong> (шесть других задач, не хомяки и не аквариум): цифры выше — не
+  подгонка под тест.</li>
+<li><strong>Перенос на Linux:</strong> пул рабочих процессора ставил по два потока на физическое ядро — исправлено.</li>
+</ul>
+<p><strong>Проверено и отвергнуто:</strong> огромные страницы для арены экспертов (без изменений), окно черновика 6 токенов
+вместо 4 (хуже: 47.9 против 60.5 т/с), запуск графа отдельным потоком (−0.8 %), другие раскладки плотных проекций
+(без разницы).</p>
+<p><strong>Оговорки:</strong></p>
+<ul>
+<li>Скорость сильно зависит от того, как угадывает черновик. Хомяки и аквариум — это код, его легко предсказать:
+  2.1–3.5 токена за проход. На разговорных текстах черновик угадывает хуже, и выходит 45–55 т/с.</li>
+<li>Один запрос за раз, кэш между запросами не переиспользуется: каждый ход перечитывает весь контекст.</li>
+<li>Первая съёмка кадров у прогонов на двух картах вышла пустой — в тот момент не открылся CDN с three.js
+  («THREE is not defined»). Страницы исправны, кадры пересняты.</li>
+</ul>
+<h2>Новое 26.09: llama.cpp с кэшем экспертов — 28–30 т/с</h2>
+<p>Лучший наш результат на этой модели: <strong>28.4–30.4 т/с вывода</strong> на коротком запросе и <strong>27.7–28.7 т/с</strong>
+на промпте в 5.3 тысячи токенов. Прежний рекорд — 24.4 т/с (FreeToken, 08.09).</p>
+<p>Как это устроено: llama.cpp с <a href="https://github.com/ggml-org/llama.cpp/pull/27861">PR #27861</a> — кэш
+«горячих» экспертов прямо в VRAM. Все эксперты лежат в закреплённой памяти хоста (<code>CUDA_Host</code>), процессор
+считает те, которых нет на карте, а те, что модель брала последние несколько десятков токенов, живут в
+кэше на обеих картах. Модель выбирает экспертов с сильной повторяемостью, поэтому кэш попадает часто.
+Рецепт взят у <a href="https://www.reddit.com/r/LocalLLaMA/comments/1w5vjp6/">автора с 2×3090</a> и переложен на наши карты.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>запрос</th>
+<th>промпт</th>
+<th>вывод, т/с</th>
+<th>время до первого токена</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>короткий (код)</td>
+<td>75 ток</td>
+<td>28.4 → 30.4</td>
+<td>3.0 с</td>
+</tr>
+<tr>
+<td>средний</td>
+<td>5 337 ток</td>
+<td>27.7 → 28.7</td>
+<td>51 с (префилл 104 т/с)</td>
+</tr>
+<tr>
+<td>тот же средний повторно</td>
+<td>5 337 ток</td>
+<td>28.7</td>
+<td><strong>0.27 с</strong> — кэш префикса llama.cpp</td>
+</tr>
+</tbody>
+</table></div>
+<p>Железо: узел с 2×2080Ti 22 ГБ, 2×Xeon Ice Lake, 220 ГБ DDR4-2666 (на тот день 14 планок; с вечера 26.09 — 16 планок,
+256 ГБ, ОС видит 251 ГиБ); контейнер с лимитом 150 ГБ.
+Квант — <code>lmstudio-community/Qwen3.8-Flash-Next-GGUF</code> Q4_K_M (119 ГБ).</p>
+<p><strong>Сборка.</strong> PR ещё не влит в основную ветку, берём его голову:</p>
+<pre><code class="language-bash">git init llama-pr27861 &amp;&amp; cd llama-pr27861
+git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --depth=1 origin refs/pull/27861/head:pr-27861 &amp;&amp; git checkout pr-27861
+cmake -S . -B build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=ON -DLLAMA_CURL=OFF
+cmake --build build -j 40 --target llama-server
+</code></pre>
+<p><strong>Правка в одну строку, без неё не работает.</strong> В этой версии PR правило <code>-ot "...=CUDA_Host"</code> падает с
+<code>Available buffer types: CPU CUDA0 CUDA1</code> — разбор знает только буферы устройств. В <code>common/arg.cpp</code>,
+функция <code>parse_tensor_buffer_overrides</code>, в цикл по устройствам добавить закреплённый буфер хоста:</p>
+<pre><code class="language-cpp">        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+        if (hbuft) {
+            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
+        }
+</code></pre>
+<p><strong>Запуск:</strong></p>
+<pre><code class="language-bash">LLAMA_ATTN_ROT_DISABLE=1 numactl --interleave=all ./build/bin/llama-server \
+  -m Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf --no-mmap \
+  -ngl 99 -c 131072 --parallel 1 -fa on \
+  -ot &quot;ffn_(gate|up|down)_exps\.weight=CUDA_Host,per_layer_token_embd\.weight=CPU&quot; \
+  -t 24 -tb 48 -b 4096 -ub 512 -ctk f16 -ctv f16 \
+  --moe-expert-cache 200 --jinja --host 0.0.0.0 --port 8081
+</code></pre>
+<ul>
+<li><code>--no-mmap</code> обязателен, если модель лежит на NFS: mmap с сетевой шары давал у нас 0.07 т/с.
+  Загрузка 119.6 ГБ с шары по гигабиту — около 20 минут, процесс держит ~112 ГБ RAM.</li>
+<li><code>--moe-expert-cache 200</code> — слоты кэша на слой; при 200 обе карты заполнены (21.7 и 19.9 ГБ).</li>
+<li><code>-ub 512</code> освобождает видеопамять под кэш, но режет префилл: <strong>104 т/с</strong> — это слабое место,
+  длинный контекст читается минутами. Кэш префикса спасает повторные запросы с тем же началом.</li>
+<li>MTP-голову эта сборка не грузит (проверено 04.09), здесь ускорение только за счёт кэша экспертов.</li>
+<li><strong>Лучшая точка — <code>-ub 2048 --moe-expert-cache 150</code></strong> (замер в тот же день): префилл холодного промпта
+  в 5 295 токенов — <strong>244 т/с</strong> вместо 104, время до первого токена 22 с вместо 51, а вывод почти не
+  потерял: 27–30 т/с. Меньше слотов кэша — но больше видеопамяти под пакет префилла, и он того стоит.
+  Эталоны ниже гонялись на этой точке.</li>
+</ul>
+<h3>Хомяки и аквариум на этой сборке</h3>
+<p>Те же две задачи, что у всех моделей стенда, по одному прогону на уровень размышления. «Проверки» — текстовые,
+по коду; «сцена» — оценка по кадрам с четырёх ракурсов, из 25 (как в разделе «Оценка по качеству»).</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>задача</th>
+<th>размышление</th>
+<th>токенов</th>
+<th>время</th>
+<th>т/с*</th>
+<th>проверки</th>
+<th>сцена</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>хомяки</td>
+<td>low</td>
+<td>7 312</td>
+<td>4.4 мин</td>
+<td>27.4</td>
+<td>8/8</td>
+<td>15 — средне</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>medium</td>
+<td>7 379</td>
+<td>4.4 мин</td>
+<td>27.9</td>
+<td>8/8</td>
+<td><strong>провал</strong>: синтаксическая ошибка, холст не создаётся</td>
+</tr>
+<tr>
+<td>хомяки</td>
+<td>xhigh</td>
+<td>35 336</td>
+<td>38 мин</td>
+<td>15.5</td>
+<td>7/8</td>
+<td>20 — живая, лучшая из трёх; ошибка при работе ломает камеру</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>low</td>
+<td>8 990</td>
+<td>7.1 мин</td>
+<td>21.0</td>
+<td>23/25</td>
+<td>16 — средне</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>medium</td>
+<td>9 289</td>
+<td>5.9 мин</td>
+<td>26.4</td>
+<td>21/25</td>
+<td><strong>провал</strong>: синтаксическая ошибка, холст не создаётся</td>
+</tr>
+<tr>
+<td>аквариум</td>
+<td>xhigh</td>
+<td>27 553</td>
+<td>20 мин</td>
+<td>23.4</td>
+<td>20/25</td>
+<td><strong>провал для зрителя</strong>: глухое стекло r128, внутри — лучшая сцена</td>
+</tr>
+</tbody>
+</table></div>
+<p>* токены делённые на всё время запроса, вместе с чтением промпта и размышлением. На xhigh у хомяков
+35 тысяч токенов — контекст растёт, и каждый следующий токен дороже.</p>
+<p>Что из этого следует:</p>
+<ul>
+<li><strong>Текстовые проверки не видят экран.</strong> Оба medium прошли их на 8/8 и 21/25, а страница падает на первой же
+  строке с ошибкой. Мы открыли каждую страницу в браузере и сняли консоль: <code>missing ) after argument list</code> у
+  хомяков, <code>Unexpected identifier 'Mesh'</code> у аквариума.</li>
+<li><strong>Аквариум на xhigh — «построил, но не видно».</strong> Стекло сделано <code>MeshPhysicalMaterial</code> с <code>transmission</code>, а
+  подключена r128, которая такое стекло не рисует (разбор — в граблях, «Стекло, которого не видно»). Со стеклом,
+  сделанным полупрозрачным на время съёмки, внутри 15 рыб с глазами и плавниками, водоросли, камни, лучи
+  света. Оценено так, как видит зритель, — так же, как 4 бита AWQ с той же бедой.</li>
+<li>Первый прогон хомяков на low шёл вперемешку с ручными запросами к тому же серверу (он обслуживает один запрос
+  за раз) и дал 7.4 т/с; в таблице — перепрогон на пустом сервере. Качество у обоих — 8/8.</li>
+</ul>
+<h2>Почему FreeToken, а не vLLM и не llama.cpp</h2>
+<p>Ключ ко всему — <strong>где считаются эксперты</strong>. У модели 125 млрд параметров, из них
+120.8 млрд — роутируемые эксперты, и на каждый токен работают только 10 из 512.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>движок</th>
+<th>эксперты</th>
+<th>подходит нам</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>только в VRAM (в host RAM выносится лишь n-граммная таблица)</td>
+<td>нет: 172 ГБ против наших 44</td>
+</tr>
+<tr>
+<td>llama.cpp</td>
+<td>в RAM, но без перекрытия — две цепочки идут по очереди</td>
+<td>хуже <em>(до 26.09; с PR #27861 и кэшем экспертов — </em><em>лучший результат</em><em>, см. раздел выше)</em></td>
+</tr>
+<tr>
+<td><strong>FreeToken</strong></td>
+<td><strong><code>--moe-backend cpu</code>: считает на AVX-512 VNNI, перекрывая с картой</strong></td>
+<td><strong>да</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>У FreeToken вся последовательность захвачена в CUDA-граф: выгрузка скрытых состояний на хост →
+host-функция ставит задачу в пул потоков → ожидание → возврат выхода экспертов на карту.
+Это ровно наша конфигурация: плотная часть на карте, эксперты на процессоре.</p>
+<h2>Железо, на котором это работает</h2>
+<ul>
+<li>2× RTX 2080Ti, <strong>модифицированные до 22 ГБ</strong> каждая (Turing, sm_75), NVLink NV2</li>
+<li>обе карты на PCIe Gen3 x16 — проверять под нагрузкой, в простое NVIDIA штатно роняет линк до Gen1</li>
+<li>два сокета Ice Lake-SP по 32 ядра, 128 потоков, AVX-512 VNNI</li>
+<li>16 планок DDR4 RDIMM 16 ГБ на 2666, все 16 каналов заполнены (по 8 на сокет)</li>
+<li>256 ГБ ОЗУ хоста (ОС видит 251 ГиБ); контейнеру FreeToken в сентябре было отдано 205 ГБ, нынешнему контейнеру
+  DACAN — 150 ГБ (сам DACAN держит ~130 ГиБ: арена экспертов и закреплённая таблица PLE)</li>
+</ul>
+<p>Модель: <code>RadixArk/Qwen3.8-Flash-Next-NVFP4</code>, 126 ГБ, <strong>лежит локально</strong> (<code>/root/models/flash-next-nvfp4</code>).
+По сети с NFS-шары она грузится минутами — это была отдельная потерянная ночь.</p>
+<h2>Установка</h2>
+<p>Сборки нет — это питоновский пакет, ставится в отдельный venv:</p>
+<pre><code>uv pip install &quot;freetoken[accel]&quot;      # venv: /root/ft-venv
+</code></pre>
+<p>Требуется: Linux x86_64, драйвер r580+, CUDA 13 <strong>с nvcc в работе</strong> (ядра компилируются при первом
+использовании), Python ≥3.10. Образ обязан остаться devel — ужать до runtime нельзя.
+Нужен том под кеш ядер, иначе каждый запуск компилирует заново и первые замеры врут.</p>
+<h2>Рабочая команда</h2>
+<pre><code>export CUDA_VISIBLE_DEVICES=1          # одна карта; TP для этой модели не поддержан, см. ниже
+export FT_CPU_PREFILL=256              # наша врезка: префилл на AVX-512
+export TRITON_CACHE_DIR=/root/.triton/cache-ft
+
+exec numactl --interleave=all /root/ft-venv/bin/ft serve \
+  --model /root/models/flash-next-nvfp4 \
+  --host 0.0.0.0 --port 1919 \
+  --moe-backend cpu \
+  --moe-cpu-threads 64 \
+  --attention-backend auto \
+  --ple-backend pinned \
+  --memory-ratio 0.85 \
+  --max-running-requests 1 \
+  --max-prefill-length 262144 \
+  --max-output-tokens 262144
+</code></pre>
+<p>Что делает каждый флаг, который не очевиден:</p>
+<ul>
+<li><strong><code>numactl --interleave=all</code></strong> — чередование по обоим узлам, +8% против одного узла.</li>
+<li><strong><code>--moe-cpu-threads 64</code></strong> — 32 потока уже насыщают один узел, 128 проверены и не оправдались.</li>
+<li><strong><code>--ple-backend pinned</code></strong> — таблица n-грамм (47.7 ГБ) закрепляется в хостовой памяти.
+  Умолчание <code>disk</code> читает её из файлов чекпоинта, и на сетевой шаре это смерть.</li>
+<li><strong><code>--max-running-requests 1</code></strong> — намеренно. Батч из двух с MTP и CUDA-графом ронял движок.
+  Следствие: пока идёт один запрос, остальные ждут — это очередь, а не поломка.</li>
+<li><strong><code>FT_CPU_PREFILL=256</code></strong> — врезка, дала префиллу 127×. Обновление пакета её снесёт, см. грабли.</li>
+</ul>
+<h2>Замеры</h2>
+<p>Скорость генерации, Flash-Next NVFP4, одна карта, 2 NUMA, 64 потока:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>дата</th>
+<th>что изменилось</th>
+<th>т/с</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>04.09</td>
+<td>базовая точка на .104</td>
+<td>11.0</td>
+</tr>
+<tr>
+<td>07.09</td>
+<td><em>(карта 0 сидела на одной линии PCIe — цифры не эталон)</em></td>
+<td>16.9–18</td>
+</tr>
+<tr>
+<td>08.09</td>
+<td>целые x16, один узел, 32 потока</td>
+<td>18.1</td>
+</tr>
+<tr>
+<td>08.09</td>
+<td>два узла, 64 потока</td>
+<td>19.5</td>
+</tr>
+<tr>
+<td>08.09</td>
+<td>после заполнения всех каналов памяти</td>
+<td>20.9</td>
+</tr>
+<tr>
+<td>08.09</td>
+<td><strong>в живом чате, длинный ответ</strong></td>
+<td><strong>24.4</strong></td>
+</tr>
+<tr>
+<td>26.09</td>
+<td><strong>llama.cpp PR #27861 + кэш экспертов в VRAM, Q4_K_M, обе карты</strong></td>
+<td><strong>28.4–30.4</strong></td>
+</tr>
+</tbody>
+</table></div>
+<h2>Про полосу памяти: не объяснять ею скорость</h2>
+<p>Это ловушка, в которую легко попасть дважды.</p>
+<p>Замер 08.09, когда на узел добавили две планки (у каждого сокета было по пустому каналу): numpy copy (чтение и запись
+разом), лучшее из четырёх. Это другой тест, чем STREAM triad в README и <code>docs/results.md</code> (там у этого же узла с 16
+планками 268.2 ГБ/с), — между собой их числа не сравнивать.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>раскладка</th>
+<th>полоса, ГБ/с</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>14 планок, один узел</td>
+<td>76.8</td>
+</tr>
+<tr>
+<td>14 планок, оба узла</td>
+<td>122.8</td>
+</tr>
+<tr>
+<td>16 планок, один узел</td>
+<td>137.8</td>
+</tr>
+<tr>
+<td>16 планок, оба узла</td>
+<td>175.7</td>
+</tr>
+</tbody>
+</table></div>
+<p>Заполнение двух пустых каналов подняло полосу <strong>на 43%</strong>, а скорость модели — <strong>на 7%</strong>
+(19.5 → 20.9 т/с). Тот же вывод независимо получен 30.08 сравнением двух нод на чистом процессоре: разница в полосе
+(STREAM triad) <strong>3.17 раза</strong> (84.7 против 268.2 ГБ/с), разница в генерации MoE-модели — <strong>1.74 раза</strong>
+(11.95 против 20.82 т/с), в обработке промпта — никакой.</p>
+<p>Вывод, который надо держать в голове: <strong>полоса памяти — не главный ограничитель.</strong>
+Улучшать её стоит (она дешева и работает в плюс), но обещать по ней прирост нельзя.</p>
+<h2>Что на самом деле ограничивает</h2>
+<p>Профиль вычислений (<code>ft bench bw --dtype nvfp4</code>):</p>
+<pre><code>CPU STREAM read 192.0  |  PCIe H2D 10.2  D2H 11.3  GB/s
+nvfp4   CPU-MoE 78.4 GB/s   PCIe-gather 10.2 GB/s   = 7.65x   → hybrid
+</code></pre>
+<p>Процессор быстрее шины в 6–7.6 раза даже на исправной x16 — <strong>отсюда выбор <code>--moe-backend cpu</code></strong>
+и отсюда же то, что починка линий x1 → x16 почти не сдвинула скорость этой модели.</p>
+<p>Замер загрузки карты во время генерации: <strong>занята 41%, пик 52%, 158 Вт из 250</strong>.
+Больше половины шага она ждёт. Раскладка шага при 51 мс (19.5 т/с): чтение плотной части
+с карты ~10 мс, чтение активных экспертов из ОЗУ ~11 мс, остальные ~30 мс — синхронизации,
+host-функции CUDA-графа, PLE, роутинг.</p>
+<p>То есть узкое место — <strong>не карта, не шина и не полоса памяти, а число проходов и накладные
+внутри шага</strong>. Отсюда следует, куда бить дальше.</p>
+<h2>Что проверено и отвергнуто</h2>
+<p>Это самая ценная часть: каждый пункт стоил времени.</p>
+<ul>
+<li><strong><code>--moe-backend hybrid</code></strong> — 6.9–8.4 т/с против 19.5 на <code>cpu</code>, <strong>втрое хуже</strong>. Профилировщик
+  движка сам его рекомендует — не верить: подкачка по шине отъедает ту же полосу DRAM,
+  которой пользуется CPU-MoE. Проверено дважды, в том числе на целой шине.</li>
+<li><strong>Эксперты в VRAM</strong> — вдвое хуже процессорных. Пустая карта тут не рычаг.</li>
+<li><strong>Тензорный параллелизм TP=2</strong> — не поддержан: <code>qwen4_exp weight loading supports TP=1 only</code>
+  (<code>models/qwen4_exp/weight.py:161</code>). И это не забытая мелочь: TP=1-only у <strong>всех</strong> гибридных
+  моделей дерева (qwen3_5_moe, glm5_next, muse_glimmer, minimax_m3), модель написана на
+  реплицированных линейках. Плюс при TP=2 каждый ранг дублирует PLE 47.7 ГБ и банки экспертов.</li>
+<li><strong>128 потоков</strong> — не оправдались против 64.</li>
+<li><strong>Сжатие KV в fp8</strong> — не рассматриваем по решению архитектора.</li>
+</ul>
+<h2>Чат через Open WebUI: бюджет вывода и потеря ответов</h2>
+<p>Разобрано 09.09.2026 по симптому «задаю вопрос — ответ не приходит, в истории пусто».
+Три независимые причины, каждая подтверждена замером.</p>
+<p><strong>1. Бюджет вывода 32768 вместо заданного флагом.</strong> Open WebUI не присылает <code>max_tokens</code>.
+FreeToken в этом случае берёт зашитую константу:</p>
+<pre><code class="language-python"># freetoken/server/generation.py
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+max_tokens = DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens
+</code></pre>
+<p>Флаг <code>--max-output-tokens</code> читается <strong>только</strong> в Responses API (<code>responses_api.py:153</code>), а
+OpenAI-ручка — та, которой пользуются Open WebUI и большинство клиентов — его игнорирует.
+То есть флаг стоит, а работает вхолостую. Нам это стоило пустых ответов: на задаче
+«3D-сцена одним файлом» модель тратит около 29000 токенов только на планирование, и при
+бюджете 32768 на сам код оставалось менее 4000 — ответ физически не помещался.</p>
+<p>Врезка в форк (<code>generation.py</code> + <code>openai_api.py</code>) приводит OpenAI-ручку к поведению
+Responses API: <code>resolve_sampling</code> принимает <code>default_max_tokens</code>, а <code>handle_chat_completion</code>
+передаёт в него <code>state.config.max_output_tokens</code>. Без параметра поведение прежнее.</p>
+<p><strong>2. Ответ не сохраняется, если клиент отвалился.</strong> Open WebUI 0.10.2 при
+<code>ENABLE_REALTIME_CHAT_SAVE=False</code> (это дефолт, <code>env.py:360</code>) пишет ответ в базу одним куском
+в самом конце (<code>utils/middleware.py:5226</code>). Ответ, который идёт двадцать минут, переживает
+обрыв браузера только при <code>ENABLE_REALTIME_CHAT_SAVE=true</code> — тогда запись идёт по мере
+генерации. Симптом выключенного режима узнаваем: в <code>chat_message</code> строка <code>user</code> записана
+целиком, а <code>assistant</code> — ровно 2 знака, с временем создания на секунду позже вопроса.</p>
+<p>Замер, который это доказал: движок принял запрос в 06:34:00, дошёл до 38900 токенов
+контекста к 07:00:12, ушёл в <code>Scheduler is idle</code> — и <strong>ни одного <code>200 OK</code></strong> в журнале.
+Ответ дописан в оборванный сокет.</p>
+<p><strong>3. Фоновые вызовы воруют единственный слот.</strong> На каждое сообщение Open WebUI
+дополнительно зовёт модель за заголовком чата, тегами и подсказками-продолжениями. При
+<code>--max-running-requests 1</code> они встают в ту же очередь, что и настоящий ответ. В журнале это
+выглядит обманчиво: <code>200 OK</code> есть, а ответа в чате нет — потому что <code>200 OK</code> принадлежал
+заголовку. Выключать <code>task.tags.enable</code> и <code>task.follow_up.enable</code>; заголовок можно оставить,
+он короткий (префилл около 30 токенов).</p>
+<p>Настройки Open WebUI живут в таблице <code>config</code> базы <code>webui.db</code> — она плоская, <code>key</code>/<code>value</code>:</p>
+<pre><code class="language-sql">update config set value = 'false' where key = 'task.tags.enable';
+update config set value = 'false' where key = 'task.follow_up.enable';
+update config set value = '{&quot;max_tokens&quot;: 262144}' where key = 'models.default_params';
+</code></pre>
+<p><code>models.default_params</code> применяется ко всем моделям (<code>main.py:1044</code>), в том числе к тем, у
+которых нет своей записи в таблице <code>model</code> — а у подключённой напрямую модели её нет.
+Читается из базы на каждый запрос, перезапуск контейнера для него не нужен; переменные
+окружения вроде <code>ENABLE_REALTIME_CHAT_SAVE</code> — нужен.</p>
+<h2>Claude Code на нашей модели</h2>
+<p>Подключение предусмотрено самим FreeToken: в <code>server/anthropic_api.py</code> есть ручка
+<code>/v1/messages</code> с прямой пометкой «the endpoint Claude Code talks to», а команда
+<code>ft launch claude</code> ставит и настраивает агента против запущенного сервера
+(<code>--dry-run</code> печатает план, ничего не меняя; кроме claude поддержаны codex, hermes,
+openclaw, opencode, dsh).</p>
+<p>Проверено 09.09.2026, инструменты работают:</p>
+<pre><code>stop_reason: tool_use
+ВЫЗОВ ИНСТРУМЕНТА: read_file  input={&quot;path&quot;: &quot;/etc/hostname&quot;}   — 5 секунд
+</code></pre>
+<p>Модель сама выбрала инструмент и подставила аргумент, то есть агент сможет читать и
+править файлы, а не только отвечать текстом.</p>
+<p>Для VS Code блок кладётся в <code>~/.claude/settings.json</code>. Неизвестный ключ верхнего уровня
+Claude Code не ломает (проверено запуском <code>claude --settings &lt;файл&gt; -p ...</code>), поэтому
+выключенный вариант удобно держать прямо в боевом файле и включать переименованием ключа
+в <code>env</code> с последующим Developer: Reload Window.</p>
+<pre><code class="language-json">&quot;env&quot;: {
+  &quot;ANTHROPIC_BASE_URL&quot;: &quot;http://&lt;адрес движка&gt;:1919&quot;,
+  &quot;ANTHROPIC_AUTH_TOKEN&quot;: &quot;freetoken&quot;,
+  &quot;ANTHROPIC_API_KEY&quot;: &quot;&quot;,
+  &quot;ANTHROPIC_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_OPUS_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_SONNET_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;ANTHROPIC_DEFAULT_HAIKU_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;CLAUDE_CODE_SUBAGENT_MODEL&quot;: &quot;flash-next-nvfp4&quot;,
+  &quot;CLAUDE_CODE_MAX_CONTEXT_TOKENS&quot;: &quot;262144&quot;,
+  &quot;CLAUDE_CODE_MAX_OUTPUT_TOKENS&quot;: &quot;262144&quot;,
+  &quot;CLAUDE_CODE_ATTRIBUTION_HEADER&quot;: &quot;0&quot;
+}
+</code></pre>
+<p>Отдельно меняется строка <code>"model"</code> вверху того же файла. Смешанный режим невозможен:
+<code>ANTHROPIC_BASE_URL</code> один на весь сеанс, поэтому увести на локальную модель только хайку,
+оставив остальное в облаке, нельзя — либо всё локально, либо всё в облако.</p>
+<h3>Сколько это стоит по времени</h3>
+<p>Замер 09.09.2026 на задаче «низкополигональная 3D-сцена одним файлом, Three.js, без внешних
+ресурсов» — та же задача, что мы гоняем на всех движках:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>выдано токенов</td>
+<td>52 121</td>
+</tr>
+<tr>
+<td>время</td>
+<td>2246 с (37 минут)</td>
+</tr>
+<tr>
+<td>скорость</td>
+<td>23.2 т/с (медиана движка 23.28, максимум 25.62)</td>
+</tr>
+<tr>
+<td>пик контекста</td>
+<td>52 352 из 262 144 — 20% окна</td>
+</tr>
+<tr>
+<td>размышление</td>
+<td>96 099 знаков</td>
+</tr>
+<tr>
+<td>готовый код</td>
+<td>58 103 знака</td>
+</tr>
+<tr>
+<td>остановка</td>
+<td>по своей воле (<code>stop</code>), не по лимиту</td>
+</tr>
+</tbody>
+</table></div>
+<p>Размышление занимает две трети выдачи: у модели <code>default_reasoning_effort: xhigh</code>
+(поддерживаются также <code>medium</code> и <code>low</code>). Это и есть причина, по которой ответ идёт
+десятками минут; понизив усилие, время сокращают за счёт качества разбора задачи.</p>
+<h3>Скорость генерации прямо в чате</h3>
+<p>Open WebUI 0.10.2 скорость <strong>не считает</strong> — ни фронтенд, ни бэкенд. Он умеет вычислять её
+только для Ollama-подключений (<code>utils/response.py:170-184</code>, поле <code>response_token/s</code> из
+<code>eval_count</code> и <code>eval_duration</code>); для OpenAI-совместимых серверов этот код не вызывается, а
+поиск по исходникам всей сборки не даёт ни одного совпадения на <code>token/s</code>. Значит цифру
+должен прислать сам сервер.</p>
+<p>Дверь для этого есть, и правок Open WebUI она не требует — <code>utils/middleware.py:4152</code>:</p>
+<pre><code class="language-python">raw_usage.update(data.get('timings', {}))  # llama.cpp
+</code></pre>
+<p>Любой объект <code>timings</code> на верхнем уровне финального чанка вливается прямо в <code>usage</code>.
+Дальше <code>normalize_usage</code> (<code>result = dict(usage)</code>) сохраняет все исходные поля, а
+<code>merge_usage</code> складывает только токены и стоимость — остальное «keeps the latest provider
+value». Показывается это в подсказке у иконки <strong>«i»</strong> под ответом
+(<code>ResponseMessage.svelte:1160</code>); отдельной строки со скоростью в 0.10.2 не существует.</p>
+<p><strong>Нужны оба шага, порознь не работают.</strong></p>
+<p>Шаг 1 — включить у модели способность «Usage». Без неё фронтенд не добавляет в запрос
+<code>stream_options: {include_usage: true}</code> (<code>Chat.svelte:2604-2607</code>), и сервер не присылает
+ничего. Для модели, подключённой напрямую (своей строки в таблице <code>model</code> нет), действует
+глобальный ключ:</p>
+<pre><code class="language-sql">-- в capabilities добавить &quot;usage&quot;: true
+select value from config where key = 'models.default_metadata';
+</code></pre>
+<p>Читается из базы при формировании списка моделей (<code>utils/models.py:295</code>) — перезапуск
+контейнера не нужен, достаточно обновить страницу.</p>
+<p>Шаг 2 — врезка в движок (<code>server/openai_api.py</code>): в <code>stream_chat_completion_chunks</code>
+засекается начало запроса и момент первого события, а в финальный чанк рядом с <code>usage</code>
+кладётся <code>timings</code>. Скорость ответа считается <strong>по времени генерации</strong>, а не по всему
+запросу: иначе долгий префилл на процессоре занижал бы её втрое и цифра расходилась бы с
+той, что движок печатает в журнал (<code>gen throughput (token/s)</code>).</p>
+<p>Что приходит после обоих шагов (живая проба):</p>
+<pre><code class="language-json">&quot;usage&quot;:   {&quot;prompt_tokens&quot;: 65, &quot;completion_tokens&quot;: 39, &quot;total_tokens&quot;: 104},
+&quot;timings&quot;: {&quot;time_to_first_token_s&quot;: 0.83, &quot;generation_time_s&quot;: 1.86,
+            &quot;total_time_s&quot;: 2.69, &quot;response_token/s&quot;: 20.91, &quot;prompt_token/s&quot;: 78.71}
+</code></pre>
+<p>Имена полей взяты в стиле Ollama-пути Open WebUI, чтобы подсказка читалась одинаково для
+любой модели.</p>
+<h4>На vLLM это делается штатно</h4>
+<p>У vLLM свой счётчик уже есть, писать ничего не надо — достаточно флага
+<code>--enable-per-request-metrics</code>. Он кладёт в финальный чанк стрима объект <code>metrics</code>:</p>
+<pre><code class="language-json">&quot;metrics&quot;: {&quot;time_to_first_token_ms&quot;: 83.65, &quot;generation_time_ms&quot;: 1602.0,
+            &quot;queue_time_ms&quot;: 0.008, &quot;mean_itl_ms&quot;: 14.97, &quot;tokens_per_second&quot;: 64.07}
+</code></pre>
+<p>Флаг требует включённой статистики движка: вместе с <code>--disable-log-stats</code> vLLM откажется
+стартовать (<code>cli_args.py</code>, проверка при разборе аргументов).</p>
+<p>Мостик всё равно нужен: Open WebUI читает только верхнеуровневый <code>timings</code> и поле <code>metrics</code>
+не смотрит. Поэтому рядом кладутся те же числа в секундах под именами, которые интерфейс
+уже понимает. Правка протокола не требуется — <code>ChatCompletionStreamResponse</code> наследует
+<code>OpenAIBaseModel</code> с <code>ConfigDict(extra="allow")</code>, поэтому лишнее поле проходит.</p>
+<p>Такой источник цифры лучше самодельного: скорость считает сам движок, и это видно в ответе
+рядом с нашими полями — удобно, когда числа нужно кому-то показать.</p>
+<p><strong>Про лимит вывода при этом:</strong> на vLLM <code>max_tokens</code> во весь контекст ставить НЕЛЬЗЯ. Он
+требует <code>prompt_tokens + max_tokens &lt;= max_model_len</code> и отвергает запрос с текстом
+«you requested N output tokens and your prompt contains ...». Параметр в Open WebUI надо
+просто не задавать — тогда под ответ уходит весь остаток контекста. FreeToken в той же
+ситуации избыточное значение молча урезает, поэтому настройка, вылеченная на одном движке,
+на другом становится поломкой: при смене движка параметры по умолчанию пересматривать.</p>
+<h2>Грабли</h2>
+<p><strong>Обновление пакета сносит врезки.</strong> <code>FT_CPU_PREFILL</code> живёт двумя правками внутри venv
+(<code>engine/engine.py</code> и <code>layers/moe.py</code>). После обновления пакета их нет, а скорость падает молча.
+Держать форк: <code>/root/ft-fork</code>.</p>
+<p><strong>Падение по видеопамяти на длинном ответе.</strong> Раскладка при старте:</p>
+<pre><code>Free memory before loading model: 21.32 GiB
+Allocating 205504 tokens for KV cache, K + V = 4.85 GiB
+Free memory after initialization: 3.20 GiB
+</code></pre>
+<p>Модель с буферами берёт 13.3 ГБ, KV — 4.85 ГБ, свободными остаются 3 ГБ. В них живут рабочие
+буферы внимания, которые растут с длиной. На ответе, где контекст дорос до 31 тысячи токенов,
+они кончились:</p>
+<pre><code>torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 162.00 MiB ... 10.19 MiB free
+Backend worker is gone and cannot be restarted; stopping the API server
+</code></pre>
+<p>Важно: <strong>воркер умирает, и сервер гасит сам себя</strong>. Снаружи это выглядит как «модель пропала».
+KV тут ни при чём — он рассчитан на 205 тысяч токенов, контекст в него влезал.</p>
+<p><strong>Модель по умолчанию думает на максимуме.</strong> <code>/v1/models</code> отдаёт
+<code>default_reasoning_effort: xhigh</code>. Размышление доходит до десятков тысяч токенов, и ответ идёт
+двадцать минут. Усилие задаётся в запросе (<code>reasoning_effort</code>), флага у сервера нет.</p>
+<p><strong>Скорость генерации ≠ время ответа.</strong> Полное время = префилл + размышление + ответ.
+Префилл идёт около 100 т/с, то есть файл на 13 тысяч токенов — это две минуты <strong>до первого
+символа</strong>. На коротком вопросе незаметно, на разборе файла решает всё.</p>
+<p><strong>Оборванный поток не отменяет запрос.</strong> Если чат потерял соединение, движок продолжает
+генерировать в никуда, а ответ не доходит до базы. Занятость проверять по журналу:
+<code>journalctl -u ftserve | grep "gen throughput"</code>.</p>
+<p><strong><code>pkill -f "ft serve"</code> убивает собственную оболочку</strong> — строка команды содержит тот же текст.
+Писать <code>pkill -f "[f]t serve"</code>.</p>
+<p><strong>docker-compose 1.29.2 на Docker 28 разрушает контейнер.</strong> <code>docker-compose up -d</code> падает с
+<code>KeyError: 'ContainerConfig'</code>, но ДО падения успевает переименовать и остановить старый
+контейнер — сервис лежит, а новый не создан. Плагина <code>docker compose</code> v2 в контейнере нет.
+Поднимать напрямую <code>docker run</code> с набором из compose-файла; тома именованные, данные
+переживают пересоздание, <code>.webui_secret_key</code> лежит в томе, поэтому разлогина не происходит.</p>
+<p><strong>Правка в форке не действует, пока не перенесена в рабочую копию.</strong> Служба запускается из
+<code>/root/ft-venv/lib/python3.10/site-packages/freetoken</code> — это отдельная копия дерева, а не
+ссылка на форк. Порядок всегда один: правка в форк, <code>cp</code> в site-packages, перезапуск.</p>
+<h2>Обслуживание</h2>
+<p>Подъём (transient-юнит, переживает выход из сессии):</p>
+<pre><code>pct exec 110 -- systemd-run --unit=ftserve --setenv=HOME=/root /bin/bash /root/ft_cpu.sh
+</code></pre>
+<p>Проверять живость <strong>пробой, а не статусом</strong> — сервер поднимается две минуты:</p>
+<pre><code>curl -s -m 8 -X POST http://192.168.1.175:1919/v1/chat/completions \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{&quot;model&quot;:&quot;flash-next-nvfp4&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hi&quot;}],&quot;max_tokens&quot;:1}'
+</code></pre>
+<p>В Open WebUI (0.10.2) подключение живёт в базе <code>webui.db</code> плоскими ключами
+<code>openai.api_base_urls</code> / <code>openai.api_keys</code> / <code>openai.api_configs</code> / <code>openai.enable</code>.
+Живая база — та, что смонтирована в контейнер (<code>docker inspect open-webui</code>), а не первая
+найденная поиском. Перед правкой контейнер останавливать — иначе пишешь в базу с WAL.</p>
+<h2>Что дальше</h2>
+<p>Раз ограничивает число проходов и накладные внутри шага, бить надо туда:</p>
+<ol>
+<li><strong>Спекуляция MTP.</strong> Голова написана и грузится (форк, коммит <code>a9c7e5f</code>), не хватает цикла
+   «черновик → проверка → принятие». Штатной спекуляции в FreeToken нет вовсе. Проверка
+   нескольких токенов стоит почти как генерация одного — здесь счёт идёт на разы, а не проценты.</li>
+<li><strong>12 слоёв полного внимания на вторую карту.</strong> Она простаивает, а падаем мы по её соседке.
+   Освобождает 4.85 ГБ там, где не хватило 162 МБ. Резать надо по границе слоя, а не переносом
+   пула: ядро внимания получает <code>q/k/v</code> с одной карты и <code>K/V</code> из пула — с разных карт Triton
+   не запускается. Состояние 36 GDN-слоёв переносить нельзя, оно в горячем пути.</li>
+</ol>
+</div></body></html>

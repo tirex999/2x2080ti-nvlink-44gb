@@ -1,0 +1,667 @@
+Create a single HTML file using Three.js from a CDN. Include OrbitControls (either use unpkg's three@0.160 build + examples/jsm via importmap, or write a simple custom orbit to avoid module issues). Simplest and most robust approach: use ES modules with an importmap pointing to unpkg/cdnjs. This works in modern browsers.
+
+Scene: a tray floor (rounded box), wireframe cage bars (cylinders) + top, a running wheel (torus + spokes, rotating), food bowl, scattered pellets. Hamsters: body (low-segment sphere), head, ears, eyes, nose, legs, tail; colors vary. Behavior: each hamster has a state machine: wander (move forward, random turn), pause, and some go to the wheel and rotate the wheel / stand near it. Keep it simple: pick a random target point within the tray bounds, walk toward it, stop when close, pause for a while, repeat. Add a little up-and-down bobbing animation. One hamster "interacts" with the wheel: walks to the wheel, stays there, spins fast (wheel rotates faster).
+
+Camera: OrbitControls with damping, auto-rotate optional.
+
+Lighting: hemisphere + directional with shadows (keep shadow map small). Background is a gradient color, soft.
+
+Write the code carefully. Use THREE.SphereGeometry(r, 8, 6) etc. for low-poly. FlatShading material.
+
+Structure:
+- importmap: three, three/addons/
+- module script.
+
+Hamster construction function makeHamster(color):
+Group. Body: scaled sphere (1, 0.85, 1.1). Head merged — simpler: elongated capsule-like body + head sphere at front + snout. Ears: two small spheres/cones. Eyes: black spheres. Nose: small red/pink sphere. Legs: four small cylinders/boxes. Tail: small cone/sphere.
+
+Simplify: body = sphere scaled to (0.9, 0.75, 1.2); head = sphere r 0.55 placed at z 0.9; snout small sphere; ears; eyes on head; nose at tip of snout; feet are 4 boxes; tail is small sphere at rear. That's enough.
+
+Cage: tray = box 14 x 0.6 x 10, colored. Bars: vertical cylinders along the back and sides? Simpler: low-poly cage: back wall and side walls made of grid bars — generate vertical bars spaced apart along the perimeter, plus horizontal rails top and bottom. Use InstancedMesh? Just create cylinders, that's fine (~30 bars).
+
+Wheel: torus (radius 1.4, tube 0.12) + inner disc? Spokes: 4 thin cylinders crossing through the center. Stand: 2 legs + axle cylinder. Rotate wheel.rotation.z over time; increase speed when hamster is inside.
+
+Tunnel: half-cylinder? Use a rotated cylinder with open ends — skip; wheel + food bowl is enough. Food bowl: squashed cylinder + pellets (small icosahedrons).
+
+Hamster behavior loop:
+Each hamster: {group, speed, angle (facing direction), state, timer, target}
+update(dt):
+ if state === 'pause': timer -= dt; if <=0 pick new target, state='walk'
+ else walk: rotate group to face target (lerp), move by speed*dt in facing direction; bob up-down: group.position.y = base + sin(t*10)*0.03. If distance to target < 0.4 → state 'pause', timer = 1+rand*2.
+ Clamp position within tray bounds.
+
+Special wheel hamster: target = wheel position; when reached, state 'wheel': stay, wobble, wheelSpeed target high; occasionally leave (timer).
+
+Also, hamsters avoid walls — just clamp.
+
+Shadows: enable renderer.shadowMap, castShadow on hamsters and objects, receiveShadow on floor. Shadow camera range ~15.
+
+UI: title overlay, small hint text. Cute font via system.
+
+Let's write the code.
+
+importmap:
+{
+ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+ }
+}
+
+Constants: TRAY_W=14, TRAY_D=10, floor y=0 (top of tray). Hamsters at y ≈ 0.55 (body radius ~0.55).
+
+Wheel at (-4.5, 0, -2.5)? Place at left side: position (-4.5, 0, 0). Radius 1.5, center height 1.6.
+
+Food bowl at (4.5, 0, 2.5).
+
+Tunnel: add a simple arched tunnel? Could also do a half-cylinder: CylinderGeometry(0.9, 0.9, 3, 8, 1, false, 0, Math.PI) rotated so the opening faces sideways. Material DoubleSide. Place at (3, 0.9, -2.5), rotated 90° on y-axis. That adds variety. OK, include it.
+
+Cage bars: perimeter of the tray. Vertical bar height 3, from y0=0.3 to 3.3. Back wall (z=-5) spans x -7..7, spacing 1 → 15 bars. Left wall (x=-7) spans z -5..5, spacing 1.25 → 9 bars. Right wall (x=7) same. Front open for viewing — but the camera orbits... front bars would obstruct view. Leave front open, that's fine. Top rail: horizontal cylinders along the tops of the three walls. Base rail too.
+
+Bars: CylinderGeometry(0.06,0.06,3). Position y=1.8.
+
+Colors: pastel palette. Background #ffe9d6 or sky blue. Let's go warm cream background #fff3e4, fog optional.
+
+Tray color: teal #4ecdc4? Cage bars white. Floor inside: maybe add a plane with slightly different color (wood shavings) — add a thin box 13.4x0.1x9.4 in beige #f5deb3 with scattered pellet dots? Skip dots.
+
+Now let's write everything.
+
+Hamster detail code:
+
+function makeHamster(fur){
+ const g = new THREE.Group();
+ const mat = new THREE.MeshStandardMaterial({color:fur, flatShading:true, roughness:0.9});
+ const bellyMat = ... lighter color: clone with lightened color: fur.clone().lerp(white,0.5)
+ body: SphereGeometry(0.55, 8, 6); mesh scale.set(1, 0.85, 1.25); position y 0.55.
+ Actually simpler: build the hamster with the group origin at the ground, body center at y≈0.5.
+ body mesh: geometry sphere(0.5,8,6), scale (1,0.8,1.3), pos (0,0.5,0).
+ head: sphere(0.42,8,6), pos (0,0.62,0.5).
+ snout: sphere(0.16,6,5), pos (0,0.52,0.88).
+ nose: sphere(0.07,6,5) pink #ff6b81, pos (0,0.55,1.0).
+ eyes: sphere(0.07,6,5) black, pos (±0.18,0.72,0.82).
+ ears: sphere(0.13,6,5) fur color, pos (±0.22,0.95,0.42); inner ear smaller pink? skip.
+ cheeks: two small spheres in a lighter color at (±0.3,0.45,0.75), r 0.14 — cute! Use bellyMat.
+ feet: box(0.14,0.1,0.2) ×4 at (±0.2, 0.06, ±0.35), color darker than fur? use fur.
+ tail: sphere(0.09,6,5), pos (0,0.45,-0.72).
+ set castShadow on all meshes: traverse.
+ return g;
+}
+
+Facing: group looks toward +z. So rotation.y = atan2(dx, dz) to face target. Smoothly lerp angle: keep h.angle, compute targetAngle, delta = wrap(targetAngle - h.angle), h.angle += delta * min(1, dt*5).
+
+Movement: dir = (sin(angle), cos(angle)); pos += dir * speed * dt. Clamp x to [-6.2,6.2], z to [-4.2,4.2].
+
+Bob: while walking: h.group.position.y = 0.02*Math.abs(Math.sin(time*12 + phase)).
+
+Base y = 0.
+
+Wheel interaction hamster:
+h.wheelMode = true; its target is the wheel center at ground level: (wx, wz). When within 0.5: state 'atWheel', timer 4+rand*4; while atWheel: face the wheel, wobble: small x offset sin; wheelSpeedTarget = 4 (rad/s); otherwise wheelSpeedTarget = 0.8 (slow idle spin? cute — wheel slowly idles). When timer expires → state 'leave': pick a random target, after reaching it normal pause. Simplify: when timer expires, just set state to 'walk' with a new random target; wheelSpeed decays based on whether any hamster is atWheel.
+
+Wheel rotation: wheelSpin += wheelSpeed*dt; wheel.rotation.z = wheelSpin. wheelSpeed lerps to target.
+
+Number of hamsters: 4. Colors: #ffb347 (orange), #f7d794 (cream), #e17055 (ginger), #dfe6e9 (white-gray)? Use 4 distinct ones.
+
+Add a small "name tag"? Skip.
+
+Renderer: antialias, setPixelRatio min(devicePixelRatio,2), outputColorSpace default. Shadows PCFSoft.
+
+Camera: fov 45, position (10, 8, 12), lookAt (0,1,0). OrbitControls target (0,1,0), enableDamping, maxPolarAngle 1.45, minDistance 6, maxDistance 25.
+
+Lights: HemisphereLight(0xfff2e0, 0xd8c8ff?, 0.9); DirectionalLight(0xffffff, 1.2) pos (8,14,6), castShadow, shadow.mapSize 1024, camera bounds ±12.
+
+Background: scene.background = new Color(0xffefd9); maybe no fog.
+
+Also add a big soft "table" beneath the tray? Tray floats — add a table: box 18x1x14 at y -0.5? Tray thickness 0.6, top at 0 → tray center y=-0.3. Table: box 20 x 0.8 x 15, top at y=-0.6 (center -1.0), wood color #b08968. Legs? Just a slab, that's fine.
+
+Title overlay div with CSS.
+
+Pellets: scatter 12 small IcosahedronGeometry(0.08) in orange/brown near the bowl.
+
+Bowl: CylinderGeometry(0.55,0.4,0.3,8) color #ff9ff3? pink. y 0.15.
+
+Wheel construction:
+const wheelG = new THREE.Group();
+rim: TorusGeometry(1.3, 0.09, 6, 12) color #74b9ff.
+spokes: 4 cylinders (r 0.04, length 2.5) rotated at 0,45,90,135 degrees in the z-plane: create cylinder along Y axis, rotate x by 90°? cylinder is along Y axis; to lay it across the torus plane (XY plane), rotate the cylinder around Z axis by the angle: mesh.rotation.z = a. Length 2.6.
+hub: cylinder(0.15,0.15,0.3) rotated x 90°, dark color.
+Stand: 2 legs: box(0.12,1.6,0.12) at (±0.5, 0.8, 0); axle: cylinder(0.05,0.05,1.1) rotated z 90° at y 1.6.
+Place wheelG at (wx, 0, wz); wheel rim group is a child at y=1.6 that rotates.
+
+So: stand at wheelG origin; spinGroup = Group at (0,1.6,0) containing rim/spokes/hub; spinGroup.rotation.z = wheelSpin.
+
+Hamster "inside" wheel: hamster stands near the wheel; that's fine.
+
+Tunnel: half-cylinder: CylinderGeometry(0.9, 0.9, 3, 8, 1, true, 0, Math.PI) — thetaStart 0, length PI gives a half. Default cylinder axis is Y. To arch it over the ground with the opening facing down: we want the half to be the upper half. With thetaStart 0, the range of the cylinder's theta goes... just rotate it anyway: mesh.rotation.x = PI/2 makes the axis lie along Z (tunnel runs in Z direction). Then the half-circle cross-section is in XY. Need the curved part to be on top: may need to rotate around the axis (Z) by some amount. Simpler: create a full torus? Alternative: use a SphereGeometry scaled to form a dome? Simplest and most reliable: use a half-torus? Hmm.
+
+Use LatheGeometry? Overkill.
+
+Approach: geo = new THREE.CylinderGeometry(0.9,0.9,3,8,1,true,0,Math.PI). After rotation.x = PI/2, the axis is along Z. Cross-section circle lies in XY plane. The half covers theta 0..PI. In three.js's cylinder, vertex positions: x = r*sin(theta), z = r*cos(theta). With theta 0..PI: x goes 0→0 passing through r at PI/2, z = cos goes 1→-1. So the half-disk covers the region where z is negative? At theta=0: (x=0,z=1); at theta=PI: (0,-1). Points: z = r cos θ ∈ [-r, r], x = r sin θ ≥ 0. So the half is on the x≥0 side. After rotation.x=PI/2 (rotating +90° about X: y→z? Rotation about X: (y,z) → (y cos − z sin, y sin + z cos); with +90°: y' = −z, z' = y). So the x≥0 half stays x≥0. We want the arch on top: rotate around Z (the tunnel axis) so the x≥0 half becomes the y≥0 half: rotate about Z by 90°: (x,y)→(−y,x): the x≥0 half maps to the y≥0 half.
+
+So the order: mesh.rotation.set(PI/2, 0, PI/2)? Euler XYZ applied... rotations applied as intrinsic R = Rx * Ry * Rz? Three uses 'XYZ' order meaning the matrix is composed as Rz then Ry then Rx? Actually Euler 'XYZ' means rotation about X, then Y, then Z in local frame... to avoid confusion, just set the mesh's quaternion: q = Qz(PI/2) * Qx(PI/2)? Just test logically: first apply rotation.x = PI/2, then rotateOnAxis? Simplest: set the mesh's quaternion: q = Qz(PI/2) * Qx(PI/2)? Just test: v=(1,0,0) (point on the x>0 half). Apply Qx(PI/2): (1,0,0) unchanged (rotation about X keeps x). Then Qz(PI/2): (1,0,0)→(0,1,0). Good, the arch is on top. So set mesh.quaternion from Euler? Compose: mesh.quaternion.copy(qz).multiply(qx)? Quaternion multiplication q1*q2 applies q2 first then q1. So q = Qz * Qx means apply Qx first, then Qz.
+
+Just do:
+const m = new THREE.Mesh(geo, mat);
+m.rotation.x = Math.PI/2;
+// then rotate about local Z? After setting rotation.x, local z is world... use m.rotateZ(Math.PI/2) which rotates about the current local z axis.
+After rotation.x=PI/2, local z axis points in world +Y? Rotating about local Z by PI/2: this is rotation about the tunnel axis. Arch was on the x>0 side; rotating about the axis (local z) by PI/2 moves x>0 to y>0? Local z is the axis; rotating about it by +90°: local x→local y. So the arch (on local x>0 side) moves to local y>0 side. Is local y world up? After rotation.x=PI/2, local y is... original local y (axis) is now along world z (tunnel direction). Local z is now world −y? Let me compute: Rx(90°) maps: local x→world x; local y→world z? Rx(θ): y_world = y cosθ − z sinθ... vector transform: v_world = R v_local. Rx(90): (x, y, z)_local → (x, −z, y)_world? R_x(90) = [[1,0,0],[0,0,−1],[0,1,0]]. So local (0,1,0)→world (0,0,1): local y = world +z (tunnel axis, good). Local (0,0,1)→world (0,−1,0): local z = world −y. So local y (arch side after rotateZ) = world −z?? Wait, we want the arch on top = world +y. Local y maps to world +z, not +y. Hmm, so rotating about local z moves the arch to local y side = world +z side — that's horizontal, wrong.
+
+Reconsider: after rotation.x=PI/2, the arch is on the world x>0 side (since local x = world x, and the arch was on local x>0 before rotation). We want it on the world +y side. Rotate about the tunnel axis (world z, = local y) by 90°. So use m.rotateY(PI/2) (rotation about local y = world z). rotateY(+90): local x→? Rotation about local y by +90: local x→local −z? Right-hand rule about +y: x→−z? R_y(90): (x,y,z)→(z, y, −x). Local (1,0,0)→(0,0,−1) local = world (0,−1,0). Hmm, that puts the arch downward. Use rotateY(−PI/2): (x,y,z)→(−z,y,x): (1,0,0)→(0,0,1) local = world (0,1,0). Up! Great.
+
+So: m.rotation.x = PI/2; m.rotateY(-PI/2); — wait, does rotateY use the updated rotation? rotateY multiplies the quaternion by a rotation about the local y axis (current orientation). Yes.
+
+But actually, is the arch currently on the local x>0 side? Earlier: the half covers x = r sinθ ≥ 0 (theta 0..PI). Yes, x≥0.
+
+OK. Tunnel material DoubleSide, color #a29bfe purple. Position (3.2, 0, -2.8), length 3 along z? After rotation, the axis is along world z. Tunnel runs in Z direction, length 3, centered at z -2.8 → spans -4.3..-1.3, fine within tray (z min -4.2... -4.3 slightly outside; move to z=-2.6, spans -4.1..-1.1, OK).
+
+Radius 0.9 → height 1.8. Hamsters (height ~1.0) can't fit under it, but visually it's fine — or shrink radius to 0.7. Use 0.7.
+
+Now behavior code.
+
+const hamsters = [];
+function spawnHamster(x, z, fur, opts={}) {
+  const g = makeHamster(fur);
+  g.position.set(x, 0, z);
+  const h = {g, angle: rand(0,Math.PI*2), state:'pause', timer: rand(0.5,2), target:new THREE.Vector3(), speed: 1.2+Math.random()*0.6, phase: Math.random()*10, wheel: opts.wheel||false, atWheel:false};
+  g.rotation.y = h.angle;
+  scene.add(g);
+  hamsters.push(h);
+  return h;
+}
+
+update(dt, t):
+let wheelTarget = 0.6; // slow idle
+for h of hamsters:
+ if h.state==='pause':
+   h.timer -= dt;
+   if (h.timer<=0){ h.target.set(rand(-5.5,5.5),0,rand(-3.5,3.5)); h.state='walk'; }
+ else if h.state==='walk':
+   const dx=h.target.x-h.g.position.x, dz=h.target.z-h.g.position.z;
+   const dist=Math.hypot(dx,dz);
+   if (dist<0.5){ h.state='pause'; h.timer=rand(1,3); h.atWheel=false; }
+   else {
+     const ta=Math.atan2(dx,dz);
+     let da=ta-h.angle; while(da>Math.PI)da-=2PI; while(da<-PI)da+=2PI;
+     h.angle+=da*Math.min(1,dt*6);
+     h.g.position.x+=Math.sin(h.angle)*h.speed*dt;
+     h.g.position.z+=Math.cos(h.angle)*h.speed*dt;
+     bob...
+   }
+ clamp position.
+ h.g.rotation.y = h.angle;
+ 
+ wheel logic: if h.wheel && h.state==='walk' && h.target is near wheel? Better: give the wheel hamster special: when picking a new target, 50% chance target = wheel spot. When reaching (dist<0.6) and target==wheelSpot: state='atWheel', timer rand(4,8). While atWheel: face the wheel, wobble, h.atWheel=true; wheelTarget=5. When timer expires: state='walk', new random target.
+
+Track h.atWheel and set wheelTarget = anyAtWheel ? 5 : 0.6.
+
+Bob: while walking or atWheel: y = 0.03*Math.abs(Math.sin(t*10+h.phase)); else y=0.
+
+Idle wobble when paused: slight scale pulse? Skip.
+
+Wheel spin: wheelSpeed += (wheelTarget - wheelSpeed)*Math.min(1,dt*2); wheelSpin += wheelSpeed*dt; spinGroup.rotation.z = wheelSpin.
+
+Note: wheelTarget changes per frame — compute before the loop.
+
+Edge case: hamster target near the wheel, the wheel hamster reaches it → atWheel. Fine.
+
+Other hamsters' targets might land inside the wheel/tunnel — acceptable (low-poly chaos). Or just clamp; that's fine.
+
+Also add subtle idle animation for paused hamsters: occasional ear twitch? Skip — keep it stable.
+
+Now let's assemble the HTML.
+
+CSS: body margin 0, overflow hidden; #ui absolute top-left, pointer-events none, font-family system-ui; title large bold, colored; small hint.
+
+Maybe also a small credit bottom-right.
+
+Write final code:
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Low-Poly Hamster Playground</title>
+<style>...</style>
+<script type="importmap">...</script>
+</head>
+<body>
+<div id="ui">
+ <h1>🐹 Low-Poly Hamster Playground</h1>
+ <p>Drag to orbit · scroll to zoom · watch the hamsters party</p>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+const rand=(a,b)=>a+Math.random()*(b-a);
+
+// renderer
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth,innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// scene & camera
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xffe9cf);
+scene.fog = new THREE.Fog(0xffe9cf, 30, 60);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(11, 8, 13);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.2, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI*0.49;
+controls.minDistance = 6;
+controls.maxDistance = 30;
+
+// lights
+scene.add(new THREE.HemisphereLight(0xfff4e6, 0xcbb8ff, 0.85));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(9, 14, 7);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024,1024);
+sun.shadow.camera.left=-12; right 12; top 12; bottom -12; near 1 far 40;
+scene.add(sun);
+
+// materials helper
+function mat(c){return new THREE.MeshStandardMaterial({color:c,flatShading:true,roughness:0.95});}
+
+// ---- table & tray ----
+Table box 20x0.9x15 y=-1.05 (top -0.6).
+Tray: box 14x0.6x10 y=-0.3 color 0x4ecdc4 (teal).
+Floor pad: box 13.5x0.12x9.5 y=0.06? top at 0.12. Hmm, hamster base y should be 0.12. Simpler: pad top at 0.1: pad box 13.4x0.1x9.4, center y=0.05. Set GROUND=0.1.
+
+Set GROUND = 0.1; hamster group y base = GROUND.
+
+receiveShadow on pad and table; castShadow on tray.
+
+// ---- cage bars ----
+function bar(x,z,h=3.0){ const m=new THREE.Mesh(barGeo, barMat); m.position.set(x, GROUND + h/2, z); m.castShadow=true; scene.add(m); return m;}
+barGeo = new THREE.CylinderGeometry(0.06,0.06,3,6);
+Back wall z=-5: x from -7 to 7 step 1 → 15 bars.
+Left wall x=-7: z from -5 to 5 step 1.25 → 9 bars.
+Right x=7 same.
+Top rail: horizontal cylinders along the top of the three walls:
+rail(len, x, z, rotY): CylinderGeometry(0.08,0.08,len,6) rotated z 90° to align with X; for z-direction walls rotate y 90°.
+Positions: back rail at y=GROUND+3, z=-5, len 14. Left/right rails len 10 at x=±7 rotated.
+Also middle-height rail? Skip, top only + maybe one at 1.5 for style. Add a second rail at height 1.5.
+
+Total bars 15+9+9=33, fine.
+
+// ---- wheel ----
+Build as described above. wx=-4.5, wz=0.
+
+// ---- tunnel ----
+As computed.
+
+// ---- food bowl + pellets ----
+Bowl at (4.3, GROUND, 2.6). Pellets: 10 icosahedrons at random positions near the bowl.
+
+// ---- hamsters ----
+makeHamster as planned. Spawn 4:
+spawn(0, 0, 0xf4a261)
+spawn(2.5, -1.5, 0xe77f3f? ) colors: 0xffb17a, 0xf9e0b7, 0xe58e66, 0xdfe4ea
+One with wheel:true, e.g., the 2nd.
+
+Wait, hamster body center: build with origin at ground. Body center y 0.5. Total height ~1.05.
+
+Feet at y 0.05 (box height 0.1 → center 0.05).
+
+Now makeHamster code:
+
+function makeHamster(furHex){
+  const g = new THREE.Group();
+  const fur = new THREE.Color(furHex);
+  const cream = fur.clone().lerp(new THREE.Color(0xfff3d6), 0.55);
+  const mFur = mat(fur.getHex());
+  const mCream = mat(cream.getHex());
+  const mDark = mat(0x3b2f2f);
+  const mPink = mat(0xff8fa3);
+
+  function add(geo, material, x,y,z, sx=1,sy=1,sz=1){
+    const m = new THREE.Mesh(geo, material);
+    m.position.set(x,y,z); m.scale.set(sx,sy,sz);
+    m.castShadow = true;
+    g.add(m); return m;
+  }
+
+  const bodyGeo = new THREE.SphereGeometry(0.5, 8, 6);
+  add(bodyGeo, mFur, 0, 0.52, 0, 1, 0.82, 1.28);          // body
+  add(bodyGeo, mCream, 0, 0.5, 0.12, 0.92, 0.7, 1.1);        // belly
+  add(new THREE.SphereGeometry(0.4, 8, 6), mFur, 0, 0.62, 0.48);           // head
+  add(new THREE.SphereGeometry(0.15, 6, 5), mFur, 0, 0.55, 0.85);          // snout
+  add(new THREE.SphereGeometry(0.06, 6, 5), mPink, 0, 0.58, 1.0);        // nose
+  const eyeGeo = new THREE.SphereGeometry(0.06, 6, 5);
+  add(eyeGeo, mDark, -0.17, 0.72, 0.8);
+  add(eyeGeo, mDark, 0.17, 0.72, 0.8);
+  const cheekGeo = new THREE.SphereGeometry(0.13, 6, 5);
+  add(cheekGeo, mCream, -0.3, 0.5, 0.72);
+  add(cheekGeo, mCream, 0.3, 0.5, 0.72);
+  const earGeo = new THREE.SphereGeometry(0.12, 6, 5);
+  add(earGeo, mFur, -0.24, 0.98, 0.4);
+  add(earGeo, mFur, 0.24, 0.98, 0.4);
+  const footGeo = new THREE.BoxGeometry(0.13, 0.09, 0.2);
+  add(footGeo, mFur, -0.2, 0.05, 0.35);
+  add(footGeo, mFur, 0.2, 0.05, 0.35);
+  add(footGeo, mFur, -0.2, 0.05, -0.35);
+  add(footGeo, mFur, 0.2, 0.05, -0.35);
+  add(new THREE.SphereGeometry(0.08, 6, 5), mFur, 0, 0.5, -0.72);       // tail
+  return g;
+}
+
+// behavior
+const GROUND = 0.1;
+const BOUNDS = {x: 6.1, z: 4.1};
+const wheelSpot = new THREE.Vector3(wx+0.9, 0, wz); // hamster stands next to/in front of the wheel
+
+Spawn 4 hamsters.
+
+function updateHamsters(dt, t){
+  let anyAtWheel = false;
+  for(const h of hamsters){
+    if(h.state === 'pause'){
+      h.timer -= dt;
+      if(h.timer <= 0){
+        if(h.wheel && Math.random() < 0.55){ h.target.copy(wheelSpot); }
+        else { h.target.set(rand(-5.6,5.6), 0, rand(-3.6,3.6)); }
+        h.state = 'walk';
+      }
+    } else if(h.state === 'walk'){
+      const p = h.g.position;
+      const dx = h.target.x - p.x, dz = h.target.z - p.z;
+      const dist = Math.hypot(dx, dz);
+      if(dist < 0.55){
+        if(h.wheel && h.target === wheelSpot){ h.state='atWheel'; h.timer=rand(4,8); }
+        else { h.state='pause'; h.timer=rand(1,3); }
+      } else {
+        const ta = Math.atan2(dx, dz);
+        let da = ta - h.angle;
+        while(da > Math.PI) da -= Math.PI*2;
+        while(da < -Math.PI) da += Math.PI*2;
+        h.angle += da * Math.min(1, dt*6);
+        p.x += Math.sin(h.angle) * h.speed * dt;
+        p.z += Math.cos(h.angle) * h.speed * dt;
+      }
+    } else if(h.state === 'atWheel'){
+      anyAtWheel = true;
+      h.timer -= dt;
+      const p = h.g.position;
+      // face the wheel and wobble
+      const ta = Math.atan2(wx - p.x, wz - p.z);
+      let da = ta - h.angle;
+      while(da > Math.PI) da -= Math.PI*2;
+      while(da < -Math.PI) da += Math.PI*2;
+      h.angle += da * Math.min(1, dt*4);
+      p.x = wheelSpot.x + Math.sin(t*3 + h.phase) * 0.15;
+      p.z = wheelSpot.z + Math.cos(t*2.2 + h.phase) * 0.15;
+      if(h.timer <= 0){
+        h.state = 'walk';
+        h.target.set(rand(-5.6,5.6), 0, rand(-3.6,3.6));
+      }
+    }
+    // clamp
+    const p = h.g.position;
+    p.x = THREE.MathUtils.clamp(p.x, -BOUNDS.x, BOUNDS.x);
+    p.z = THREE.MathUtils.clamp(p.z, -BOUNDS.z, BOUNDS.z);
+    // bob
+    const moving = h.state !== 'pause';
+    p.y = GROUND + (moving ? 0.035*Math.abs(Math.sin(t*11 + h.phase)) : 0);
+    h.g.rotation.y = h.angle;
+  }
+  // wheel spin
+  const target = anyAtWheel ? 5.5 : 0.7;
+  wheelSpeed += (target - wheelSpeed) * Math.min(1, dt*1.5);
+  wheelSpin += wheelSpeed * dt;
+  spinGroup.rotation.z = wheelSpin;
+}
+
+Note: h.target === wheelSpot check — since we used copy, reference equality holds.
+
+Animation loop:
+
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  updateHamsters(dt, t);
+  // gentle idle: slight bob on pellets? skip
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+Resize handler.
+
+Wheel construction code:
+
+const wx = -4.5, wz = 0;
+const wheelG = new THREE.Group();
+wheelG.position.set(wx, GROUND, wz);
+scene.add(wheelG);
+
+const standMat = mat(0x8d6e63);
+const rimMat = mat(0x74c0fc);
+function leg(x){ const m = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1.7, 0.14), standMat); m.position.set(x, 0.85, 0); m.castShadow = true; wheelG.add(m); }
+leg(-0.55); leg(0.55);
+const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,1.25,6), standMat);
+axle.rotation.z = Math.PI/2; axle.position.y = 1.7; wheelG.add(axle);
+
+const spinGroup = new THREE.Group();
+spinGroup.position.y = 1.7;
+wheelG.add(spinGroup);
+
+const rim = new THREE.Mesh(new THREE.TorusGeometry(1.25, 0.09, 6, 14), rimMat);
+rim.castShadow = true;
+spinGroup.add(rim);
+const spokeGeo = new THREE.CylinderGeometry(0.035, 0.035, 2.4, 5);
+for(let i=0;i<4;i++){
+  const s = new THREE.Mesh(spokeGeo, rimMat);
+  s.rotation.z = i * Math.PI/4;
+  spinGroup.add(s);
+}
+const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.16,0.16,0.22,8), mat(0x5f3dc4));
+hub.rotation.x = Math.PI/2;
+spinGroup.add(hub);
+
+Spokes: cylinders along Y axis, rotated by angle around Z — they lie in the XY plane, crossing the center. Good.
+
+Tunnel code:
+
+const tunGeo = new THREE.CylinderGeometry(0.7, 0.7, 3, 8, 1, true, 0, Math.PI);
+const tun = new THREE.Mesh(tunGeo, new THREE.MeshStandardMaterial({color:0xa29bfe, flatShading:true, roughness:0.9, side:THREE.DoubleSide}));
+tun.rotation.x = Math.PI/2;
+tun.rotateY(-Math.PI/2);
+tun.position.set(3.1, GROUND, -2.5);
+tun.castShadow = true;
+scene.add(tun);
+
+Wait: rotateY rotates about the local Y axis. After rotation.x=PI/2, local y = world z (tunnel axis). So rotateY(±90°) rotates the cross-section about the tunnel axis. As computed, rotateY(-PI/2) puts the arch on top.
+
+Hmm, but the sign convention for rotateY: rotateY(angle) = premultiply? In three.js, Object3D.rotateY(angle) is "rotates the rotation defined by this Euler... rotation about the object's local Y axis". Implementation: _q.setFromAxisAngle(_zAxis? ...) actually:
+rotateX: _q.setFromAxisAngle(_xAxis, angle); this.quaternion.premultiply(_q);
+Premultiplying a local-axis rotation in the current frame: q_new = q_axis * q_current. This is a rotation about the current local axis. Yes, as expected.
+
+Bowl & pellets:
+
+const bowl = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.38, 0.28, 8), mat(0xff9ff3));
+bowl.position.set(4.3, GROUND + 0.14, 2.6);
+bowl.castShadow = true;
+scene.add(bowl);
+const pelletGeo = new THREE.IcosahedronGeometry(0.07, 0);
+for(let i=0;i<12;i++){
+  const p = new THREE.Mesh(pelletGeo, mat(i%2? 0xb9770e : 0xd35400));
+  p.position.set(4.3 + rand(-1.4,1.4), GROUND + 0.07, 2.6 + rand(-1.4,1.4));
+  p.rotation.set(rand(0,3), rand(0,3), rand(0,3));
+  p.castShadow = true;
+  scene.add(p);
+}
+
+Some pellets inside the bowl too: skip.
+
+Cage bar code:
+
+const barGeo = new THREE.CylinderGeometry(0.055, 0.055, 3.1, 6);
+const barMat = mat(0xffffff);
+function addBar(x, z){
+  const m = new THREE.Mesh(barGeo, barMat);
+  m.position.set(x, GROUND + 1.55, z);
+  m.castShadow = true;
+  scene.add(m);
+}
+for(let x=-7; x<=7; x+=1) addBar(x, -5);
+for(let z=-5; z<=5; z+=1.25) { addBar(-7, z); addBar(7, z); }
+
+Rail:
+
+function addRail(len, x, z, ry){
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.07,len,6), barMat);
+  m.rotation.z = Math.PI/2;
+  m.rotation.y = ry;
+  m.position.set(x, GROUND + 3.05, z);
+  scene.add(m);
+}
+addRail(14, 0, -5, 0);
+addRail(10, -7, 0, Math.PI/2);
+addRail(10, 7, 0, Math.PI/2);
+
+Rotation order: with default XYZ euler, setting both rotation.z and rotation.y — the resulting orientation: R = Rx Ry Rz? In three, the quaternion is computed from the euler with the specified order, composing the rotations... for rotation.x=0, rotation.y=ry, rotation.z=PI/2: the matrix is M = Ry(ry) * Rz(PI/2)? Order: 'XYZ' means rotate about X first, then Y, then Z in the local frame... the resulting world transform = Rx * Ry * Rz? Hmm.
+
+For our case: we want the cylinder (default along Y) to be laid horizontally along X (if ry=0) or along Z (if ry=PI/2).
+
+Test with ry=0: rotation = (0, 0, PI/2). Applying Rz(PI/2) to the Y axis: (0,1,0) → (−1,0,0). So the cylinder lies along X. Good.
+
+With ry=PI/2, rotation=(0, PI/2, PI/2). World orientation = ? For euler XYZ, the rotation matrix = Rx(a)Ry(b)Rz(c)? Or Rz... let me recall: THREE.Euler 'XYZ' → quaternion.setFromEuler: the implementation composes in the order such that the final matrix is M = Rx * Ry * Rz? Actually, the standard for three.js's Euler XYZ is: M = Rx(x) * Ry(y) * Rz(z), applied to a vector as M*v, meaning Rz is applied first.
+
+Verify with our case: v = (0,1,0) (cylinder axis). M*v = Rx(0)*Ry(PI/2)*Rz(PI/2)*(0,1,0). Rz(PI/2)*(0,1,0) = (−1,0,0). Ry(PI/2)*(−1,0,0) = (0,0,1)? Ry(θ): x' = x cosθ + z sinθ; z' = −x sinθ + z cosθ. For (−1,0,0), θ=90: x' = −cos90 = 0; z' = sin90 = 1. So (0,0,1). Good, the cylinder lies along Z.
+
+So addRail works: back rail along X at z=−5; side rails along Z at x=±7.
+
+But wait — the side rails span z −5..5 at x=±7, and the back rail spans x −7..7 at z=−5. They meet at corners (±7,−5). Good.
+
+Front open. Camera default (11,8,13) is on the front-right — sees the open front.
+
+One concern: the hamster at the wheel — wheelSpot = (wx+0.9, wz) = (−3.6, 0). The hamster stands there and faces the wheel center (−4.5, 0). Wobbles. Wheel spins fast.
+
+Now, hamster spawn positions:
+spawn(0.5, 0.5, 0xffb17a)
+spawn(-1.5, -1.0, 0xf9e0b7, {wheel:true})
+spawn(2.8, 1.6, 0xe58e66)
+spawn(-2.2, 2.2, 0xdfe4ea)
+
+Wheel hamster starts near the wheel — will quickly go to the wheel. Good.
+
+UI CSS:
+
+#ui { position: fixed; top: 18px; left: 22px; pointer-events: none; font-family: 'Segoe UI', system-ui, sans-serif; color: #6b4f3a; }
+#ui h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: .5px; text-shadow: 0 2px 0 rgba(255,255,255,.6); }
+#ui p { margin: 6px 0 0; font-size: 13.5px; opacity: .85; }
+
+Also a small badge bottom-right: "Three.js · low-poly · 🐹".
+
+Now double-check the hamster geometry numbers:
+- body sphere r0.5 scaled (1,0.82,1.28) → extents: x ±0.5, y ±0.41, z ±0.64. Center (0,0.52,0): y range 0.11..0.93, z range −0.64..0.64.
+- head r0.4 at (0,0.62,0.48): z range 0.08..0.88, y 0.22..1.02.
+- snout r0.15 at (0,0.55,0.85): z up to 1.0.
+- nose at z 1.0.
+- eyes at z 0.8, x ±0.17 — head surface at that height: head center z 0.48, r 0.4 → front z 0.88. Eyes at 0.8, slightly embedded — visible bulge. OK.
+- ears at (±0.24, 0.98, 0.4): head top y 1.02 — ears at 0.98, x ±0.24: head x range at that y is... roughly on the head. Slightly embedded, tips visible. Good.
+- cheeks at (±0.3, 0.5, 0.72) r0.13: bulge out from the head/side of the body. Cute.
+- feet at z ±0.35 — body z range ±0.64, so feet are under the body. Good.
+- tail at (0,0.5,−0.72): body back z −0.64; tail sphere r0.08 at −0.72 → sticks out. Good.
+
+Overall hamster: width ~1.0, length ~1.7 (nose to tail), height ~1.05. On a 14×10 tray — proportional, cute.
+
+Speed 1.2-1.8 units/sec — traverses the tray in ~8 sec. Good.
+
+Now, one issue: hamsters can walk through each other and through the bowl/tunnel/wheel. Acceptable for low-poly charm. But the wheel is big (radius 1.25, center height 1.7) — hamsters near x=−4.5 might visually clip through the rim. Minor.
+
+To reduce clipping, could restrict other hamsters' targets to avoid the wheel area. But keep it simple — accept.
+
+Actually, let's reduce: make the wheel a bit smaller, radius 1.1, center height 1.5. And the stand shorter. That way hamsters (height 1.05) mostly don't reach the rim (bottom of rim at 1.5−1.1−0.09=0.31, top at 2.69). Hamster head at 1.0 < 2.69, so could clip if directly under. But the hamster stands at wheelSpot (x=−3.6), which is 0.9 from the wheel center (x=−4.5). The rim at x=−3.6: distance from center 0.9 < 1.1, so the rim passes over the hamster's head area. Hmm.
+
+Move wheelSpot further: x = wx + 1.4 = −3.1. Distance 1.4 > 1.1+0.09=1.19, so the hamster is just outside the rim. Good, minimal clipping.
+
+Set wheelSpot = (wx + 1.5, wz) = (−3.0, 0).
+
+And wheel radius 1.15, center y 1.6. Rim outer 1.15+0.09=1.24. wheelSpot distance 1.5 > 1.24. Good.
+
+Update: TorusGeometry(1.15, 0.09, 6, 14). Spokes length 2.2 (diameter 2.3). Hub at y 1.6. Legs height 1.6 (y 0.8). Axle at y 1.6, length 1.2.
+
+Fine.
+
+Now finalize the wheel variables: wx=−4.5, wz=0. spinGroup.position.y=1.6. Legs BoxGeometry(0.14,1.6,0.14) at y 0.8. Axle y 1.6.
+
+OK, I think the code is complete. Let's also verify the importmap URLs are correct for three 0.160.0:
+- https://unpkg.com/three@0.160.0/build/three.module.js ✓
+- https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js ✓
+
+Good.
+
+One more thing: `renderer.outputColorSpace` defaults to SRGB in recent three, fine.
+
+Let's also add `scene.add(new THREE.AmbientLight(0xffffff, 0.25))`? Hemisphere already covers ambient. Skip.
+
+Final: write the answer with a brief intro, the full code block, and short notes (how to run, what's included, tuning knobs).
+
+Let's double-check the hamster's makeHamster function once more — the add() helper creates a mesh with a given geometry and material. Reuse bodyGeo for body and belly (different scales). Good.
+
+Cheeks: mCream color (lightened fur). Good.
+
+I think we're ready. Let's also make sure the `mat()` helper is defined before use in makeHamster — yes, defined at the top.
+
+One subtle bug: in makeHamster, `fur` is a THREE.Color; `fur.getHex()` returns a number. mat(number) creates MeshStandardMaterial with color number. Good.
+
+`cream = fur.clone().lerp(new THREE.Color(0xfff3d6), 0.55)` — lightens toward cream. Good.
+
+All set.
+
+Now let's write the final response. I'll present:
+1. A one-line description.
+2. The full index.html code block.
+3. A "How to run" note (save as index.html, open in browser; needs internet for the CDN).
+4. A brief "What's inside / tuning" bullet list.
+
+Keep it clean.
+
+Actually, let me reconsider using unpkg vs jsdelivr for reliability. Both work. I'll use unpkg as written. Some people prefer jsdelivr: https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js and https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/. Either is fine. I'll stick with unpkg.
+
+Let me finalize.
+
+Double-check: `new THREE.CylinderGeometry(0.7, 0.7, 3, 8, 1, true, 0, Math.PI)` — parameters: radiusTop, radiusBottom, height, radialSegments, heightSegments, openEnded, thetaStart, thetaLength. openEnded=true so no caps (we want a tube). thetaStart=0, thetaLength=PI → half tube. Good.
+
+After rotation.x=PI/2 and rotateY(-PI/2), the tube's axis is along world Z (length 3), and the arch is on top. Position (3.1, GROUND, -2.5). The arch height = 0.7 (radius) above GROUND → top at 0.1+0.7=0.8. Hamster height 1.05 > 0.8, so the hamster doesn't fit under the tunnel — but that's OK, it's decorative. Or shrink hamster? No. Accept: the tunnel is a decoration that the hamster walks past/around. Since targets are random, a hamster might "walk through" the tunnel wall. Minor visual clip. Acceptable for low-poly.
+
+Alternatively, raise the tunnel radius to 0.9 so the top is 1.0, and hamsters (1.05) still barely clip. Meh. Keep 0.7, accept.
+
+OK, finalizing.
+
+Let me also ensure the hamster's feet don't sink below GROUND: feet box center y 0.05, height 0.09 → bottom at 0.005, top at 0.095. The group's origin is at ground (y=0 in local), and the group is placed at world y=GROUND. So feet bottom at world GROUND+0.005. Slightly above ground. Good, no sinking.
+
+Body bottom: body center y 0.52, y-scale 0.82*0.5=0.41 → bottom at 0.52−0.41=0.11. So the body floats 0.11 above the feet — the feet (top 0.095) nearly touch the body bottom (0.11). Good, connected look.
+
+Great.
+
+Now writing.
+
+Actually, I realize I should double-check the `addRail` rotation. We set m.rotation.z = PI/2 and m.rotation.y = ry. The euler order is 'XYZ'. The resulting orientation = Rx(0) * Ry(ry) * Rz(PI/2)? For euler XYZ, three computes the quaternion such that the rotation is applied as: first Rz, then Ry, then Rx (intrinsic). Equivalently, the matrix M = Rx * Ry * Rz (extrinsic composition where the rightmost is applied first to the vector).
+
+We verified earlier with ry=PI/2 that the cylinder axis maps to world Z. And ry=0 maps to world X. So addRail is correct.
+
+But wait, in addRail we set both rotation.z and rotation.y via the euler. The euler is (x=0, y=ry, z=PI/2). As analyzed, this gives the desired horizontal orientation. Good.
+
+Position: m.position.set(x, GROUND + 3.05, z). Rail top at GROUND+3.05 ≈ 3.15. Bars top at GROUND+1.55+1.55=GROUND+3.1. So the rail (3.15) is slightly above the bar tops (3.1) — good, caps the bars.
+
+Actually, the bar height is 3.1 (CylinderGeometry height 3.1), center at GROUND+1.55, so top at GROUND+1.55+1.55=GROUND+3.1. Rail at GROUND+3.05, radius 0.07 → top at 3.12, bottom at 2.98. So the rail overlaps the top of the bars (3.1). Visually the rail sits on top of / around the bar tops. Good.
+
+All consistent.
+
+Final answer time.
+
+Let me write it out cleanly.

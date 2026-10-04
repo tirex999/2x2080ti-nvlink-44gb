@@ -1,0 +1,632 @@
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Low-Poly Hamster Playground 🐹</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px;
+            color: #fff; background: rgba(0,0,0,0.6);
+            padding: 15px 20px; border-radius: 12px;
+            font-size: 14px; backdrop-filter: blur(5px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        #ui h1 { font-size: 18px; margin-bottom: 5px; }
+        #ui p { opacity: 0.7; font-size: 12px; }
+        #stats {
+            position: absolute; bottom: 20px; left: 20px;
+            color: #fff; background: rgba(0,0,0,0.6);
+            padding: 10px 15px; border-radius: 10px;
+            font-size: 12px; backdrop-filter: blur(5px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <h1>🐹 Hamster Playground</h1>
+        <p>Drag to rotate • Scroll to zoom</p>
+    </div>
+    <div id="stats">Hamsters: 5 | Wheel speed: 0</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // === SCENE SETUP ===
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x2d1b69);
+        scene.fog = new THREE.Fog(0x2d1b69, 20, 40);
+
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(12, 10, 12);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 1, 0);
+        controls.maxPolarAngle = Math.PI / 2.1;
+        controls.minDistance = 5;
+        controls.maxDistance = 30;
+
+        // === LIGHTS ===
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffeedd, 1.2);
+        dirLight.position.set(8, 12, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.set(2048, 2048);
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 30;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        scene.add(dirLight);
+
+        const fillLight = new THREE.DirectionalLight(0x88aaff, 0.3);
+        fillLight.position.set(-5, 3, -5);
+        scene.add(fillLight);
+
+        const pointLight = new THREE.PointLight(0xffaa44, 0.5, 15);
+        pointLight.position.set(0, 5, 0);
+        scene.add(pointLight);
+
+        // === MATERIALS HELPER ===
+        function mat(color) {
+            return new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.8, metalness: 0.1 });
+        }
+
+        // === TRAY / FLOOR ===
+        const trayGroup = new THREE.Group();
+        const trayGeo = new THREE.BoxGeometry(12, 0.6, 12, 4, 1, 4);
+        const trayMesh = new THREE.Mesh(trayGeo, mat(0xd4a574));
+        trayMesh.position.y = 0;
+        trayMesh.receiveShadow = true;
+        trayGroup.add(trayMesh);
+
+        // Sawdust texture - scattered small bumps
+        for (let i = 0; i < 60; i++) {
+            const bump = new THREE.Mesh(
+                new THREE.SphereGeometry(0.08 + Math.random() * 0.06, 4, 3),
+                mat(0xc49a6c)
+            );
+            bump.position.set(
+                (Math.random() - 0.5) * 10,
+                0.3 + Math.random() * 0.05,
+                (Math.random() - 0.5) * 10
+            );
+            bump.scale.y = 0.5;
+            trayGroup.add(bump);
+        }
+        scene.add(trayGroup);
+
+        // === CAGE BARS ===
+        const cageGroup = new THREE.Group();
+        const barMat = mat(0x888888);
+        barMat.metalness = 0.7;
+        barMat.roughness = 0.3;
+        const barGeo = new THREE.CylinderGeometry(0.04, 0.04, 5, 5);
+
+        // Vertical bars
+        for (let side = 0; side < 4; side++) {
+            for (let i = -5; i <= 5; i += 1.2) {
+                const bar = new THREE.Mesh(barGeo, barMat);
+                bar.castShadow = true;
+                if (side === 0) bar.position.set(i, 2.8, -6);
+                else if (side === 1) bar.position.set(i, 2.8, 6);
+                else if (side === 2) bar.position.set(-6, 2.8, i);
+                else bar.position.set(6, 2.8, i);
+                cageGroup.add(bar);
+            }
+        }
+
+        // Horizontal bars (top frame)
+        const hBarGeo = new THREE.CylinderGeometry(0.05, 0.05, 12, 5);
+        const hBars = [
+            { pos: [0, 5.3, -6], rot: [0, 0, Math.PI / 2] },
+            { pos: [0, 5.3, 6], rot: [0, 0, Math.PI / 2] },
+            { pos: [-6, 5.3, 0], rot: [Math.PI / 2, 0, 0] },
+            { pos: [6, 5.3, 0], rot: [Math.PI / 2, 0, 0] },
+        ];
+        hBars.forEach(h => {
+            const bar = new THREE.Mesh(hBarGeo, barMat);
+            bar.position.set(...h.pos);
+            bar.rotation.set(...h.rot);
+            cageGroup.add(bar);
+        });
+
+        // Top cross bars
+        for (let i = -5; i <= 5; i += 2) {
+            const tb = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 12, 5), barMat);
+            tb.position.set(i, 5.3, 0);
+            tb.rotation.x = Math.PI / 2;
+            cageGroup.add(tb);
+        }
+        scene.add(cageGroup);
+
+        // === HAMSTER WHEEL ===
+        const wheelGroup = new THREE.Group();
+        const wheelRadius = 1.8;
+
+        // Wheel rim
+        const rimGeo = new THREE.TorusGeometry(wheelRadius, 0.12, 6, 16);
+        const rimMesh = new THREE.Mesh(rimGeo, mat(0xff6b6b));
+        rimMesh.castShadow = true;
+        wheelGroup.add(rimMesh);
+
+        // Inner rim
+        const innerRim = new THREE.Mesh(new THREE.TorusGeometry(wheelRadius - 0.3, 0.06, 5, 16), mat(0xff8e8e));
+        wheelGroup.add(innerRim);
+
+        // Spokes
+        for (let i = 0; i < 8; i++) {
+            const angle = (i / 8) * Math.PI * 2;
+            const spoke = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, wheelRadius * 2 - 0.3, 4), mat(0xcc5555));
+            spoke.position.set(Math.cos(angle) * (wheelRadius / 2), Math.sin(angle) * (wheelRadius / 2), 0);
+            spoke.rotation.z = angle + Math.PI / 2;
+            wheelGroup.add(spoke);
+        }
+
+        // Wheel stand
+        const standGeo = new THREE.BoxGeometry(0.3, 3, 0.3);
+        const standL = new THREE.Mesh(standGeo, mat(0x666666));
+        standL.position.set(0, -1.5, -0.4);
+        standL.castShadow = true;
+        wheelGroup.add(standL);
+        const standR = new THREE.Mesh(standGeo, mat(0x666666));
+        standR.position.set(0, -1.5, 0.4);
+        standR.castShadow = true;
+        wheelGroup.add(standR);
+
+        // Stand base
+        const baseGeo = new THREE.BoxGeometry(1.5, 0.2, 1.2);
+        const base = new THREE.Mesh(baseGeo, mat(0x555555));
+        base.position.y = -3;
+        wheelGroup.add(base);
+
+        wheelGroup.position.set(-4, 2.8, -3);
+        scene.add(wheelGroup);
+
+        // === FOOD BOWL ===
+        const bowlGroup = new THREE.Group();
+        const bowlOuter = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.7, 0.5, 0.5, 8),
+            mat(0x4ecdc4)
+        );
+        bowlOuter.castShadow = true;
+        bowlGroup.add(bowlOuter);
+
+        const bowlInner = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.55, 0.4, 0.3, 8),
+            mat(0x3dbdb5)
+        );
+        bowlInner.position.y = 0.15;
+        bowlGroup.add(bowlInner);
+
+        // Food pellets
+        const pelletColors = [0x8B4513, 0xD2691E, 0xDEB887, 0x6B8E23];
+        for (let i = 0; i < 8; i++) {
+            const pellet = new THREE.Mesh(
+                new THREE.SphereGeometry(0.1, 4, 3),
+                mat(pelletColors[i % pelletColors.length])
+            );
+            pellet.position.set(
+                (Math.random() - 0.5) * 0.6,
+                0.25,
+                (Math.random() - 0.5) * 0.6
+            );
+            pellet.scale.y = 0.7;
+            bowlGroup.add(pellet);
+        }
+        bowlGroup.position.set(2, 0.55, 2);
+        scene.add(bowlGroup);
+
+        // === TUNNEL ===
+        const tunnelGroup = new THREE.Group();
+        const tunnelGeo = new THREE.CylinderGeometry(0.8, 0.8, 3, 8, 1, true);
+        const tunnelMesh = new THREE.Mesh(tunnelGeo, mat(0x9b59b6));
+        tunnelMesh.rotation.z = Math.PI / 2;
+        tunnelMesh.castShadow = true;
+        tunnelGroup.add(tunnelMesh);
+
+        // Tunnel rings
+        for (let i = -1; i <= 1; i++) {
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(0.85, 0.08, 5, 8), mat(0x8e44ad));
+            ring.position.x = i * 1.2;
+            ring.rotation.y = Math.PI / 2;
+            tunnelGroup.add(ring);
+        }
+        tunnelGroup.position.set(3, 1.1, -3);
+        scene.add(tunnelGroup);
+
+        // === WATER BOTTLE ===
+        const bottleGroup = new THREE.Group();
+        const bottleBody = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.3, 0.3, 1.5, 6),
+            new THREE.MeshStandardMaterial({ color: 0x88ccff, flatShading: true, transparent: true, opacity: 0.7 })
+        );
+        bottleGroup.add(bottleBody);
+        const bottleCap = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 0.3, 6), mat(0xff6b6b));
+        bottleCap.position.y = -0.9;
+        bottleGroup.add(bottleCap);
+        const bottleTop = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.3, 0.2, 6), mat(0xcc4444));
+        bottleTop.position.y = 0.85;
+        bottleGroup.add(bottleTop);
+        bottleGroup.position.set(5.5, 2.5, 0);
+        scene.add(bottleGroup);
+
+        // === HAMSTER FACTORY ===
+        const hamsterColors = [
+            { body: 0xf4a460, belly: 0xffe4c4, name: "Cinnamon" },
+            { body: 0xffffff, belly: 0xf0f0f0, name: "Snowball" },
+            { body: 0x808080, belly: 0xb0b0b0, name: "Dusty" },
+            { body: 0xdaa520, belly: 0xffe4b5, name: "Honey" },
+            { body: 0xffb6c1, belly: 0xfff0f5, name: "Rosie" },
+        ];
+
+        const hamsters = [];
+
+        function createHamster(colorScheme, startPos) {
+            const group = new THREE.Group();
+
+            // Body - chubby sphere
+            const bodyGeo = new THREE.SphereGeometry(0.5, 6, 5);
+            bodyGeo.scale(1.2, 0.9, 1);
+            const body = new THREE.Mesh(bodyGeo, mat(colorScheme.body));
+            body.castShadow = true;
+            group.add(body);
+
+            // Belly
+            const bellyGeo = new THREE.SphereGeometry(0.35, 5, 4);
+            bellyGeo.scale(1, 0.7, 0.9);
+            const belly = new THREE.Mesh(bellyGeo, mat(colorScheme.belly));
+            belly.position.set(0.1, -0.15, 0);
+            group.add(belly);
+
+            // Head
+            const headGeo = new THREE.SphereGeometry(0.32, 6, 5);
+            headGeo.scale(1, 0.9, 0.95);
+            const head = new THREE.Mesh(headGeo, mat(colorScheme.body));
+            head.position.set(0.55, 0.15, 0);
+            head.castShadow = true;
+            group.add(head);
+
+            // Cheeks (puffy!)
+            const cheekGeo = new THREE.SphereGeometry(0.15, 5, 4);
+            const cheekL = new THREE.Mesh(cheekGeo, mat(colorScheme.belly));
+            cheekL.position.set(0.6, 0.05, 0.2);
+            group.add(cheekL);
+            const cheekR = new THREE.Mesh(cheekGeo, mat(colorScheme.belly));
+            cheekR.position.set(0.6, 0.05, -0.2);
+            group.add(cheekR);
+
+            // Eyes
+            const eyeGeo = new THREE.SphereGeometry(0.06, 5, 4);
+            const eyeMat = mat(0x111111);
+            const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+            eyeL.position.set(0.75, 0.22, 0.12);
+            group.add(eyeL);
+            const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+            eyeR.position.set(0.75, 0.22, -0.12);
+            group.add(eyeR);
+
+            // Eye shine
+            const shineGeo = new THREE.SphereGeometry(0.025, 4, 3);
+            const shineMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const shineL = new THREE.Mesh(shineGeo, shineMat);
+            shineL.position.set(0.78, 0.25, 0.14);
+            group.add(shineL);
+            const shineR = new THREE.Mesh(shineGeo, shineMat);
+            shineR.position.set(0.78, 0.25, -0.10);
+            group.add(shineR);
+
+            // Nose
+            const noseGeo = new THREE.SphereGeometry(0.04, 4, 3);
+            const nose = new THREE.Mesh(noseGeo, mat(0xff69b4));
+            nose.position.set(0.85, 0.12, 0);
+            group.add(nose);
+
+            // Ears
+            const earGeo = new THREE.SphereGeometry(0.12, 5, 4);
+            earGeo.scale(1, 1, 0.5);
+            const earMat = mat(colorScheme.body);
+            const earL = new THREE.Mesh(earGeo, earMat);
+            earL.position.set(0.45, 0.42, 0.18);
+            group.add(earL);
+            const earR = new THREE.Mesh(earGeo, earMat);
+            earR.position.set(0.45, 0.42, -0.18);
+            group.add(earR);
+
+            // Inner ears
+            const innerEarGeo = new THREE.SphereGeometry(0.07, 4, 3);
+            innerEarGeo.scale(1, 1, 0.5);
+            const innerEarMat = mat(0xffb6c1);
+            const innerEarL = new THREE.Mesh(innerEarGeo, innerEarMat);
+            innerEarL.position.set(0.47, 0.42, 0.18);
+            group.add(innerEarL);
+            const innerEarR = new THREE.Mesh(innerEarGeo, innerEarMat);
+            innerEarR.position.set(0.47, 0.42, -0.18);
+            group.add(innerEarR);
+
+            // Legs
+            const legGeo = new THREE.CylinderGeometry(0.06, 0.05, 0.2, 5);
+            const legMat = mat(colorScheme.body);
+            const legPositions = [
+                [0.25, -0.45, 0.2],
+                [0.25, -0.45, -0.2],
+                [-0.25, -0.45, 0.2],
+                [-0.25, -0.45, -0.2],
+            ];
+            const legs = [];
+            legPositions.forEach(pos => {
+                const leg = new THREE.Mesh(legGeo, legMat);
+                leg.position.set(...pos);
+                leg.castShadow = true;
+                group.add(leg);
+                legs.push(leg);
+            });
+
+            // Tail (tiny nub)
+            const tailGeo = new THREE.SphereGeometry(0.07, 4, 3);
+            const tail = new THREE.Mesh(tailGeo, mat(colorScheme.body));
+            tail.position.set(-0.55, 0.05, 0);
+            group.add(tail);
+
+            group.position.copy(startPos);
+            group.position.y = 0.75;
+            scene.add(group);
+
+            return {
+                group, legs, body, head, tail,
+                state: 'idle',
+                timer: Math.random() * 3,
+                speed: 0.8 + Math.random() * 0.6,
+                turnSpeed: 1 + Math.random() * 2,
+                targetAngle: Math.random() * Math.PI * 2,
+                colorScheme,
+                bobPhase: Math.random() * Math.PI * 2,
+                wheelRunning: false,
+            };
+        }
+
+        // Create hamsters
+        const positions = [
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(3, 0, 3),
+            new THREE.Vector3(-2, 0, 2),
+            new THREE.Vector3(1, 0, -3),
+            new THREE.Vector3(-3, 0, -1),
+        ];
+
+        hamsterColors.forEach((color, i) => {
+            hamsters.push(createHamster(color, positions[i]));
+        });
+
+        // === BEHAVIOR SYSTEM ===
+        const WHEEL_POS = new THREE.Vector3(-4, 0, -3);
+        const WHEEL_RADIUS = 2.5;
+        const BOUND = 5;
+
+        function updateHamster(h, dt, time) {
+            h.timer -= dt;
+
+            switch (h.state) {
+                case 'idle':
+                    // Bobbing animation
+                    h.group.position.y = 0.75 + Math.sin(time * 2 + h.bobPhase) * 0.02;
+                    if (h.timer <= 0) {
+                        // Decide next action
+                        const distToWheel = h.group.position.distanceTo(WHEEL_POS);
+                        if (distToWheel < 3 && Math.random() < 0.3) {
+                            h.state = 'goToWheel';
+                            h.timer = 5;
+                        } else {
+                            h.state = 'walking';
+                            h.targetAngle = Math.random() * Math.PI * 2;
+                            h.timer = 1 + Math.random() * 3;
+                        }
+                    }
+                    break;
+
+                case 'walking':
+                    // Move forward
+                    const dx = Math.cos(h.targetAngle) * h.speed * dt;
+                    const dz = Math.sin(h.targetAngle) * h.speed * dt;
+                    h.group.position.x += dx;
+                    h.group.position.z += dz;
+
+                    // Rotate to face direction
+                    h.group.rotation.y = -h.targetAngle + Math.PI / 2;
+
+                    // Leg animation
+                    h.legs.forEach((leg, i) => {
+                        leg.position.y = -0.45 + Math.sin(time * 10 + i * Math.PI) * 0.05;
+                    });
+
+                    // Body bob
+                    h.group.position.y = 0.75 + Math.abs(Math.sin(time * 8)) * 0.03;
+
+                    // Boundary check
+                    if (Math.abs(h.group.position.x) > BOUND || Math.abs(h.group.position.z) > BOUND) {
+                        h.state = 'turning';
+                        h.timer = 0.5;
+                        h.targetAngle = Math.atan2(-h.group.position.z, -h.group.position.x);
+                    }
+
+                    // Random direction change
+                    if (h.timer <= 0) {
+                        if (Math.random() < 0.5) {
+                            h.state = 'idle';
+                            h.timer = 0.5 + Math.random() * 2;
+                        } else {
+                            h.state = 'turning';
+                            h.timer = 0.3 + Math.random() * 0.5;
+                            h.targetAngle += (Math.random() - 0.5) * Math.PI;
+                        }
+                    }
+                    break;
+
+                case 'turning':
+                    h.group.rotation.y += h.turnSpeed * dt;
+                    if (h.timer <= 0) {
+                        h.state = 'walking';
+                        h.timer = 1 + Math.random() * 3;
+                    }
+                    break;
+
+                case 'goToWheel':
+                    const dir = new THREE.Vector3().subVectors(WHEEL_POS, h.group.position).normalize();
+                    h.group.position.x += dir.x * h.speed * 1.2 * dt;
+                    h.group.position.z += dir.z * h.speed * 1.2 * dt;
+                    h.group.rotation.y = -Math.atan2(dir.z, dir.x) + Math.PI / 2;
+
+                    h.legs.forEach((leg, i) => {
+                        leg.position.y = -0.45 + Math.sin(time * 12 + i * Math.PI) * 0.06;
+                    });
+                    h.group.position.y = 0.75 + Math.abs(Math.sin(time * 10)) * 0.04;
+
+                    if (h.group.position.distanceTo(WHEEL_POS) < 1.5 || h.timer <= 0) {
+                        h.state = 'wheelRunning';
+                        h.timer = 3 + Math.random() * 4;
+                        h.wheelRunning = true;
+                    }
+                    break;
+
+                case 'wheelRunning':
+                    // Hamster sits near wheel and it spins
+                    h.group.position.y = 0.75 + Math.sin(time * 15) * 0.05;
+                    h.legs.forEach((leg, i) => {
+                        leg.position.y = -0.45 + Math.sin(time * 15 + i * Math.PI) * 0.08;
+                    });
+                    if (h.timer <= 0) {
+                        h.wheelRunning = false;
+                        h.state = 'idle';
+                        h.timer = 1 + Math.random() * 2;
+                        // Move away from wheel
+                        h.targetAngle = Math.random() * Math.PI * 2;
+                    }
+                    break;
+            }
+
+            // Keep in bounds
+            h.group.position.x = THREE.MathUtils.clamp(h.group.position.x, -BOUND, BOUND);
+            h.group.position.z = THREE.MathUtils.clamp(h.group.position.z, -BOUND, BOUND);
+        }
+
+        // === DECORATIONS ===
+        // Small wooden blocks
+        const blockColors = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xf38181];
+        for (let i = 0; i < 5; i++) {
+            const block = new THREE.Mesh(
+                new THREE.BoxGeometry(0.4, 0.4, 0.4, 2, 2, 2),
+                mat(blockColors[i])
+            );
+            block.position.set(
+                (Math.random() - 0.5) * 8,
+                0.5,
+                (Math.random() - 0.5) * 8
+            );
+            block.rotation.y = Math.random() * Math.PI;
+            block.castShadow = true;
+            scene.add(block);
+        }
+
+        // === ANIMATION LOOP ===
+        const clock = new THREE.Clock();
+        let wheelSpeed = 0;
+        const statsEl = document.getElementById('stats');
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.05);
+            const time = clock.getElapsedTime();
+
+            // Update hamsters
+            let anyOnWheel = false;
+            hamsters.forEach(h => {
+                updateHamster(h, dt, time);
+                if (h.wheelRunning) anyOnWheel = true;
+            });
+
+            // Wheel rotation
+            const targetSpeed = anyOnWheel ? 5 : 0;
+            wheelSpeed += (targetSpeed - wheelSpeed) * dt * 2;
+            wheelGroup.children[0].rotation.z += wheelSpeed * dt; // rim
+            wheelGroup.children[1].rotation.z += wheelSpeed * dt; // inner rim
+            for (let i = 2; i < 10; i++) { // spokes
+                if (wheelGroup.children[i]) {
+                    const angle = ((i - 2) / 8) * Math.PI * 2 + wheelSpeed * time * 0.5;
+                    wheelGroup.children[i].position.set(
+                        Math.cos(angle) * (wheelRadius / 2),
+                        Math.sin(angle) * (wheelRadius / 2),
+                        0
+                    );
+                    wheelGroup.children[i].rotation.z = angle + Math.PI / 2;
+                }
+            }
+
+            // Gentle auto-rotate
+            controls.autoRotate = true;
+            controls.autoRotateSpeed = 0.3;
+            controls.update();
+
+            // Update stats
+            statsEl.textContent = `Hamsters: ${hamsters.length} | Wheel speed: ${wheelSpeed.toFixed(1)} | 🐹 Running: ${anyOnWheel ? 'YES!' : 'no'}`;
+
+            renderer.render(scene, camera);
+        }
+
+        // === RESIZE ===
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
+```
+
+## What's Included 🐹
+
+| Feature | Details |
+|---------|---------|
+| **5 Hamsters** | Each with unique color & name (Cinnamon, Snowball, Dusty, Honey, Rosie) |
+| **Autonomous AI** | State machine: idle → walking → turning → running on wheel |
+| **Hamster Wheel** | Spins when a hamster "runs" on it, with spokes & stand |
+| **Cage** | Wire bars on all 4 sides + top frame |
+| **Floor/Tray** | Wooden tray with scattered sawdust bumps |
+| **Food Bowl** | Colorful bowl with pellets |
+| **Tunnel** | Purple tunnel with rings |
+| **Water Bottle** | Semi-transparent bottle on the wall |
+| **Decorations** | Colorful wooden blocks scattered around |
+| **Camera** | OrbitControls with gentle auto-rotate |
+| **Shadows** | Soft directional shadows for depth |
+| **Low-Poly Style** | `flatShading: true` + low segment counts everywhere |
+
+Just save as `index.html` and open in any modern browser — no build step needed!

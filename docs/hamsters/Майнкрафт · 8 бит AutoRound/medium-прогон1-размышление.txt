@@ -1,0 +1,411 @@
+Let me carefully write the complete file.
+
+Main components:
+- Value noise, hash
+- Chunks stored in a Map with Uint8Array(16*80*16)
+- Global read/write helpers
+- Per-chunk meshing with vertex colors
+- Player physics, AABB collision detection
+- Raycast breaking/placing
+- Hotbar UI
+- Sky, clouds, water
+- Start overlay / pointer lock
+
+Let me write it.
+
+Chunk index: local index = (y*16 + z)*16 + x? Let's use idx = (y*16 + lz)*16 + lx.
+
+readBlock(x,y,z): if y<0||y>=80 return 0; cx=floor(x/16), cz=floor(z/16); chunk=chunks.get(key); if !chunk return 0; lx=x-cx*16, lz=z-cz*16; return chunk.data[y*256+lz*16+lx].
+
+writeBlock similarly, create chunk if not present? For placement, the chunk should exist (within render range). If it doesn't exist, just ignore or generate data. Let's ensure generation of chunk data if not present.
+
+Terrain generation:
+hash2(x,z): integer hash → [0,1). Use:
+function hash2(x,z){ let n = x*374761393 + z*668265263; n = (n ^ (n>>13)) * 1274126177; n = n ^ (n>>16); return (n>>>0)/4294967296; }
+JS numbers: multiplication can overflow 32 bits but stays as float; better to use imul. Use Math.imul.
+
+hash2(x,z){ let n = Math.imul(x,374761393)+Math.imul(z,668265263)|0; n=Math.imul(n^(n>>>13),1274126177); n^=n>>>16; return (n>>>0)/4294967296; }
+
+noise2(x,z): xi=floor(x), zi=floor(z), fx=x-xi smoothstep, bilinearly interpolate hash2 at corners.
+
+fractal2(x,z): 4 octaves: sum amp*freq. amp 0.5, freq 1, halving. Normalize by total amplitude.
+
+noise3(x,y,z): 3D hash:
+hash3(x,y,z){ let n=Math.imul(x,374761393)+Math.imul(y,668265263)+Math.imul(z,1440662683)|0; n=Math.imul(n^(n>>>13),1274126177); n^=n>>>16; return (n>>>0)/4294967296; }
+Trilinear with smoothstep.
+
+Column height: m = fractal2(x*0.004, z*0.004), h = fractal2(x*0.02, z*0.02), H = floor(5 + m*m*58 + h*10).
+
+Fill: y=0 is stone (unbreakable — enforce in break handling). y<H-3: stone. y in [H-3, H-1]: dirt, or sand if H<=16, stone if H>=37. Surface y=H: snow if H>=46, stone if H>=37, sand if H<=16, else grass.
+
+Wait "3 layers below surface": y = H-3..H-1. And y < H-3 is stone. y=H is surface.
+
+Caves: for y from 3 to H-2, if noise3(x*0.09, y*0.09, z*0.09) > 0.67 → air.
+
+Trees: if surface is grass and hash2(x,z) < 0.02 and trunk fits within chunk (lx >= 1 && lx <= 14 && lz >= 1 && lz <= 14), place tree. Trunk: 4 wood blocks going up from y=H+1 to H+4. Leaves: two 5x5 layers, then 3x3, then 1 on top. Standard: leaf layers at y=H+3 and H+4 radius 2 (5x5), y=H+5 radius 1 (3x3), y=H+6 single. But trunk occupies those cells; only place into air. Place leaves first, then trunk overwriting? Spec: "4 wood blocks going up, leaves as two 5x5 layers, then 3x3, then 1 on top (air only)". So trunk: y=H+1..H+4 wood. Leaves at y=H+3 (5x5), y=H+4 (5x5), y=H+5 (3x3), y=H+6 (1). Only write if current block is air (so leaves don't overwrite trunk).
+
+Tree writes may extend beyond chunk boundaries horizontally (leaves radius 2) — but trunk is constrained to 1..14, so leaves reach lx-2..lx+2 which could be -1..15... wait lx max 14, +2 = 16 which is out of bounds. Hmm. Spec says "trunk fits within chunk". For safety, use writeBlock helper that handles cross-chunk writes? But neighboring chunk might not have data yet. Simplest: use local write with bounds check — skip out-of-range leaves. Or use global writeBlock that lazily generates neighboring chunk data. Lazy generation is fine since generation is deterministic. Let me implement writeBlock to generate the chunk data if not present. That's clean. Actually, during initial gen of a chunk, writing to neighbor chunks triggers their gen — fine, deterministic.
+
+But careful: recursion? writeBlock → ensureChunk → generate → tree → writeBlock → ... possible infinite loop if tree writes trigger gen of chunk whose tree writes back. Tree writes only near trunk within 2 blocks; the neighbor chunk being generated has its own trees, and their writes might go back into original chunk... potential mutual recursion. Depth limited? Chunk A gen, tree at edge writes to B, B gen, B's tree at opposite edge writes to A (already in map? We put chunk in map before generating). Yes — insert chunk into map before filling data. Then writeBlock finds it and just writes. No recursion issue.
+
+Meshing: for each block, for each of 6 directions, if neighbor is air, add face. Face definitions: for each direction, 4 corner positions, normal, shade.
+
+Face data:
++X (right): normal (1,0,0), shade 0.8, corners: (1,0,1),(1,0,0)... need correct winding for outward-facing normals. Let me define standard cube faces with CCW winding viewed from outside.
+
+Standard:
+px: (1,1,0),(1,0,0),(1,1,1),(1,0,1)? Let me do it carefully.
+
+Use known table (from many voxel tutorials). For each face, 4 vertices in order v0,v1,v2,v3 forming two triangles (v0,v1,v2) and (v2,v1,v3). Winding must be CCW seen from outside.
+
+px face (x+1): verts: (1,1,1),(1,0,1),(1,1,0),(1,0,0)? Check: view from +x toward -x, y up, z is... let me just trust a common table:
+
+Common cube face table (positions, each face 4 verts, triangles 0,1,2 and 2,1,3):
+
+px: [ (1,0,1),(1,0,0),(1,1,0),(1,1,1) ]
+Check winding: normal should be +x. Cross((v1-v0),(v2-v0)): v1-v0=(0,0,-1), v2-v0=(0,1,-1). Cross = (0*(-1)-(-1)*1, (-1)*0-0*(-1), 0*1-0*0) = (1, 0, 0). Good, +x.
+
+nx: [ (0,0,0),(0,0,1),(0,1,1),(0,1,0) ]: v1-v0=(0,0,1), v2-v0=(0,1,1). Cross = (0*1-1*1, 1*0-0*1, 0*1-0*0)=(-1,0,0). Good.
+
+py: [ (0,1,1),(1,1,1),(1,1,0),(0,1,0) ]: v1-v0=(1,0,0), v2-v0=(1,0,-1). Cross=(0*(-1)-0*0, 0*1-1*(-1), 1*0-0*1)=(0,1,0). Good.
+
+ny: [ (0,0,0),(1,0,0),(1,0,1),(0,0,1) ]: v1-v0=(1,0,0), v2-v0=(1,0,1). Cross=(0*1-0*0, 0*1-1*1, 1*0-0*1)=(0,-1,0). Good.
+
+pz: [ (0,0,1),(1,0,1),(1,1,1),(0,1,1) ]: v1-v0=(1,0,0), v2-v0=(1,1,0). Cross=(0*0-0*1, 0*1-1*0, 1*1-0*1)=(0,0,1). Good.
+
+nz: [ (1,0,0),(0,0,0),(0,1,0),(1,1,0) ]: v1-v0=(-1,0,0), v2-v0=(-1,1,0). Cross=(0*0-0*1, 0*(-1)-(-1)*0, (-1)*1-0*(-1))=(0,0,-1). Good.
+
+Shade: py 1.0, ny 0.55, others 0.8.
+
+Colors: BLOCK_COLORS = {1:0x4caf50, 2:0x795548, 3:0x9e9e9e, 4:0xe7d9a8, 5:0x8d6e63, 6:0x2e7d32, 7:0xffffff}. Precompute RGB 0..1.
+
+Material: MeshLambertMaterial({vertexColors:true}). Note: in three r128 vertexColors: true works (boolean OK).
+
+Mesh: geometry with position, normal, color attributes. Mesh added to scene, stored in chunk.mesh. mesh.userData.chunkKey or store cx,cz in userData for rebuild.
+
+Per-frame update loop:
+- pcx = floor(px/16), pcz.
+- Data gen: iterate radius 5 (dx,dz in -5..5), if !chunk (or !chunk.data) and count<4, generate. To avoid always prioritizing same corner, maybe sort by distance — simple: iterate in ring order or just loop; fine.
+- Mesh build: chunks within radius 4 that have data but no mesh, and 4 neighbors have data. Max 2 per frame.
+- Cull: chunks with distance >7: remove mesh, dispose geometry, delete entry.
+
+Rebuild function: rebuildChunk(cx,cz) — dispose old geometry, build new, swap.
+
+Physics:
+player pos = feet position? Let's store pos as eye? Simpler: pos = feet position (bottom of box). Eye = pos.y + 1.62. Camera at eye.
+
+Collision: box halfW=0.3, height 1.8. For candidate position, check AABB [pos.x-0.3, pos.x+0.3] etc against blocks. Move per axis: newX = x+vx*dt; check collision at (newX, y, z); if collides, revert x. Same for y (set onGround if moving down and collided). z similar.
+
+collideAt(x,y,z): bx0=floor(x-0.3), bx1=floor(x+0.3), by0=floor(y), by1=floor(y+1.8), bz0=floor(z-0.3), bz1=floor(z+0.3); loop blocks, if any solid return true.
+
+Movement: direction from keys relative to yaw. speed 5.5. vx = dirX*speed, vz = dirZ*speed. vy -= 25*dt; if space && onGround: vy=8.5.
+
+Spawn: find height at (8,8): compute column height directly with same function (need terrainHeight(x,z) helper that computes H deterministically). Spawn y = H+2. Save spawn point. Fall below -20 → respawn.
+
+Raycast: raycaster.setFromCamera({x:0,y:0}, camera), far 6. Intersect with chunkMeshes array (only meshes that exist). Get first intersection. p = point, n = face.normal (world). Break target: floor(p - n*0.5) per component; place: floor(p + n*0.5).
+
+Outline: THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.001,1.001,1.001)), LineBasicMaterial black). Position at block center (bx+0.5,...). Show/hide.
+
+Break: if target y>0, set air. Place: if cell is air and doesn't overlap player AABB. Overlap check: block box [bx,bx+1] etc vs player box.
+
+After edit: rebuild that chunk and neighbor if lx==0/15 or lz==0/15.
+
+Hotbar: array of ids [1,2,3,4,5,6,7], names. DOM: div#hotbar with 7 slots. Keys 1-7, wheel: e.deltaY>0 ? next : prev, wrap.
+
+Clouds: 25 boxes, BoxGeometry(rand size), MeshLambertMaterial white transparent opacity 0.85 (or MeshBasicMaterial). Use Basic to avoid lighting weirdness. Drift: x += speed*dt; wrap around player within say 300 units.
+
+Water: PlaneGeometry(400,400) rotated -PI/2, MeshLambertMaterial blue 0x2277cc transparent opacity 0.6, depthWrite false maybe. Position y=14.3, x/z = player x/z floored? Just follow player.
+
+Fog: scene.fog = new THREE.Fog(0x87ceeb, 40, 110). Background same color.
+
+Lights: ambient 0xwhite 0.65, directional 0.8.
+
+Pointer lock: click on overlay → canvas.requestPointerLock(). document.pointerlockchange: update overlay visibility, locked flag.
+
+Mouse move: if locked: yaw -= movementX*0.002; pitch -= movementY*0.002, clamp ±~1.55. camera.rotation.order='YXZ'; camera.rotation.y=yaw; camera.rotation.x=pitch.
+
+Mousedown: if locked: button 0 break, button 2 place. Prevent contextmenu.
+
+Wheel: preventDefault to avoid page scroll (page won't scroll anyway).
+
+Resize handler.
+
+Animation loop: requestAnimationFrame, dt clamped (min(0.05, delta)).
+
+Now details on data gen function:
+
+function generateChunkData(cx,cz){
+ const data = new Uint8Array(16*16*80);
+ for lx 0..15, lz 0..15:
+   wx=cx*16+lx, wz=cz*16+lz;
+   m=fractal2(wx*0.004, wz*0.004); h=fractal2(wx*0.02, wz*0.02);
+   H=floor(5+m*m*58+h*10); clamp H to 1..78? m max 1, h max 1 → max H = 5+58+10=73. Min 5. OK, within 0..79.
+   for y=0..H:
+     let id;
+     if(y===0) id=3;
+     else if(y<H-3) id=3;
+     else if(y<H){ // H-3..H-1
+       id = H<=16?4 : H>=37?3 : 2;
+     } else { // y===H surface
+       id = H>=46?7 : H>=37?3 : H<=16?4 : 1;
+     }
+     // cave
+     if(y>=3 && y<=H-2 && noise3(wx*0.09,y*0.09,wz*0.09)>0.67) id=0;
+     data[(y*16+lz)*16+lx]=id;
+   // tree
+   if(surface is grass && hash2(wx,wz)<0.02 && lx>=1&&lx<=14&&lz>=1&&lz<=14 && H+6<80){
+     for t=1..4: writeBlockLocal(wx,H+t,wz,5) — but leaves at H+3,H+4 overlap trunk; spec says trunk first, leaves only into air. So write trunk first, then leaves only where air.
+     Actually simpler: write leaves first? Spec order: "4 wood blocks going up, leaves as two 5x5 layers..." — trunk first, leaves only into air.
+     Leaves: for dy in [3,4]: for dx -2..2, dz -2..2: if air, set 6 at (wx+dx, H+dy, wz+dz).
+     dy=5: dx,dz -1..1 → 6.
+     dy=6: (0,0) → 6.
+     Use global writeBlock (handles cross-chunk).
+   }
+}
+
+Surface grass check: H<37 && H>16 (since H>=46 → snow, H>=37 → stone, H<=16 → sand; grass when 17<=H<=45).
+
+Note: caves might carve out the surface area too? Cave condition y<=H-2, so surface and 2 below are safe. Fine.
+
+writeBlock(x,y,z,id): cx=floor(x/16)... ensure chunk exists (generate data if not), then set. Also after writing, if chunk has mesh, rebuild? For tree gen during initial gen, no mesh yet. For player edits we call rebuild explicitly. But writeBlock used in gen could affect existing meshed neighbor chunks (trees crossing border). Edge case: chunk A generated later writes leaves into already-meshed chunk B. Rare but possible. To handle: in writeBlock, if target chunk has mesh, mark dirty and rebuild. Simple: after setting, if chunk.mesh exists rebuildChunk. Rebuild cost OK.
+
+Actually careful: rebuilding B during A's gen — fine.
+
+ensureChunk(cx,cz): key; if !chunks.has → create {data:null,mesh:null}; if data null → generateChunkData. Return chunk.
+
+Frame update:
+let pcx=floor(player.x/16), pcz=...
+// gen
+let genCount=0;
+for(dx=-5..5) for(dz=-5..5): c=chunks.get(key(cx+dx,cz+dz)); if(!c || !c.data && genCount<4) { ensureChunk; genCount++ }.
+Hmm, iterating in fixed order means always same corner first; acceptable. Could sort by distance for fairness but keep simple. Actually let's do rings: iterate by distance squared, collect needed, sort, take 4. 121 entries, cheap. Let's do it properly: collect list of {k,d} for missing, sort by d, gen first 4.
+
+// mesh
+let meshCount=0;
+for dx,dz in -4..4: c = get; if c && c.data && !c.mesh: check 4 neighbors have data (get or ensure? Spec: "4 neighbors already have data" — read via chunks.get, don't generate). If yes, buildMesh(c); meshCount++; stop at 2.
+
+// cull
+for (const [key,c] of chunks): parse cx,cz; if |cx-pcx|>7|||cz-pcz|>7: if c.mesh remove from scene and chunkMeshes, dispose geometry; chunks.delete(key).
+
+Iterating Map while deleting is fine in JS.
+
+buildMesh(chunk, cx, cz):
+positions=[], normals=[], colors=[];
+for y 0..79, lz, lx:
+ id=data[...]; if !id continue;
+ wx=cx*16+lx, wy=y, wz=cz*16+lz;
+ for each of 6 faces: neighbor = readBlock(wx+nx, wy+ny, wz+nz); if 0: push 4 verts (wx+v, wy+v, wz+v), normals, colors (r*shade...). Indices: push i,i+1,i+2, i+2,i+1,i+3? Wait, our triangle order: (v0,v1,v2) and (v2,v1,v3). Indices: base,base+1,base+2, base+2,base+1,base+3.
+
+Create geometry, set attributes, computeVertexNormals not needed (we set normals). Material shared. Mesh, castShadow off. Add to scene and chunkMeshes.
+
+Rebuild: if mesh exists remove/dispose; build.
+
+Raycast: raycaster.intersectObjects(chunkMeshes) — array changes; pass array each frame.
+
+Performance note: meshing loops 16*16*80 = 20480 cells * 6 checks = 123k readBlock calls per chunk, each with floor and map lookup — fine for 2 per frame.
+
+Optimize readBlock: inline floor via Math.floor.
+
+Player collision uses readBlock.
+
+Water plane: 400x400 centered on player; but fog far 110 so edges hidden.
+
+Clouds: create once: for i<25: w=10+rand*20 etc. But "no Math.random"? That constraint was for terrain determinism. Clouds can use Math.random — spec says terrain deterministic. Use Math.random for clouds, fine. Or use hash. Let's use Math.random.
+
+Cloud material: MeshBasicMaterial({color:0xffffff, transparent:true, opacity:0.85, depthWrite:false}).
+
+Drift: cloud.position.x += 2*dt; if cloud.x - player.x > 200 → subtract 400; if < -200 → add 400. Same for z maybe.
+
+Start overlay: full-screen div with title "MC", controls list, "Click to play". Hidden when locked.
+
+Hotbar DOM:
+<div id="hotbar"> slots </div>, built in JS. Slot: 40px square, bg color, number label. Selected class.
+
+Crosshair: two pseudo-elements or a div with ::before/::after. Simple: div#crosshair with width 20px height 20px, ::before horizontal line, ::after vertical line, white with mix-blend? Just white with slight shadow.
+
+Keys: track keydown/keyup for KeyW/A/S/D, Space. Digit1..Digit7.
+
+Prevent Space scrolling: e.preventDefault on Space.
+
+Wheel: window.addEventListener('wheel', e=>{ if(locked){ select((sel + (e.deltaY>0?1:-1) +7)%7); }});
+
+Now the outline box: create once, visible=false.
+
+Break/place functions:
+
+function doBreak(){ if(!targetBlock) return; const {x,y,z}=targetBlock; if(y===0) return; writeBlock(x,y,z,0); rebuildAround(x,y,z); }
+function doPlace(){ if(!targetBlock) return; const px=targetBlock.x+placeOff... actually compute placeCell from raycast: store both. cell = placeCell; if readBlock(cell) !==0 return; check overlap with player:
+ const minx=player.x-0.3, maxx=player.x+0.3, miny=player.y, maxy=player.y+1.8, minz..., maxz...
+ if cell.x+1>minx && cell.x<maxx && cell.y+1>miny && cell.y<maxy && ... → return.
+ writeBlock(cell, hotbarId); rebuildAround.
+
+rebuildAround(x,y,z): cx=floor(x/16), cz=floor(z/16); rebuildChunk(cx,cz); lx=x-cx*16; if(lx===0) rebuildChunk(cx-1,cz); if(lx===15) rebuildChunk(cx+1,cz); same for z.
+
+rebuildChunk: c=chunks.get(key); if(!c||!c.data) return; rebuild.
+
+Ensure chunk exists before write: writeBlock ensures.
+
+Spawn: compute H at (8,8) via terrainHeight function. player = {x:8.5, y:H+2, z:8.5, vx:0,vy:0,vz:0, onGround:false}. spawn = {x:8.5,y:H+2,z:8.5}.
+
+Update camera: camera.position.set(player.x, player.y+1.62, player.z).
+
+Physics step with substeps? dt clamped 0.05, speed 5.5 → max move 0.275 < block size, gravity 25 → vy max ~ terminal... falling long time vy grows; clamp dt helps. Fine.
+
+Collision function:
+function collides(x,y,z){
+ const x0=Math.floor(x-0.3), x1=Math.floor(x+0.3);
+ const y0=Math.floor(y), y1=Math.floor(y+1.8);
+ const z0=Math.floor(z-0.3), z1=Math.floor(z+0.3);
+ for(let bx=x0;bx<=x1;bx++)for(let by=y0;by<=y1;by++)for(let bz=z0;bz<=z1;bz++) if(readBlock(bx,by,bz)) return true;
+ return false;
+}
+
+Move:
+const nx = player.x + vx*dt; if(collides(nx,player.y,player.z)) { /* stay */ } else player.x=nx;
+Same for z.
+const ny = player.y + vy*dt; if(collides(player.x,ny,player.z)){ if(vy<0) onGround=true; vy=0; } else { player.y=ny; onGround=false; }
+
+Jump: if space && onGround → vy=8.5, onGround=false.
+
+Horizontal velocity computed each frame from keys:
+let f=0,s=0; if W f+=1; S f-=1; D s+=1; A s-=1;
+sin/cos of yaw: forward vector = (-sin(yaw), 0, -cos(yaw)) (three.js default looks -z at yaw 0). Right = (cos(yaw),0,-sin(yaw)).
+dirX = (-sin(yaw)*f + cos(yaw)*s); dirZ = (-cos(yaw)*f - sin(yaw)*s); normalize if len>0; vx=dirX*5.5, vz=dirZ*5.5.
+
+Verify: yaw=0, forward W → dir (0,0,-1). Correct.
+
+Fractals:
+function fractal2(x,z){ let a=0, amp=0.5, tot=0; for(o=0;o<4;o++){ a+=amp*noise2(x,z); tot+=amp; amp*=0.5; x*=2; z*=2;} return a/tot; }
+Wait, we scale coords per octave: pass x*freq. Let's do: let fx=x, fz=z; for o: a+=amp*noise2(fx,fz); fx*=2; fz*=2; amp*=0.5.
+
+noise2:
+function noise2(x,z){ const xi=Math.floor(x), zi=Math.floor(z); const fx=x-xi, fz=z-zi; const ux=fx*fx*(3-2*fx), uz=fz*fz*(3-2*fz);
+ const a=hash2(xi,zi), b=hash2(xi+1,zi), c=hash2(xi,zi+1), d=hash2(xi+1,zi+1);
+ return a+(b-a)*ux+(c-a)*uz+(a-b-c+d)*ux*uz; }
+
+noise3 similar trilinear.
+
+Hash functions with imul as above. Ensure hash2 works with negatives: bitwise ops convert to int32, fine.
+
+Now the HTML/CSS. Let me write it all.
+
+Edge case: reading chunk data before gen returns 0 — readBlock returns 0 if no chunk or no data.
+
+Also "reading a missing chunk or y outside 0–79 returns air" ✓.
+
+Water plane: create 400x400, position each frame: water.position.set(player.x, 14.3, player.z).
+
+Clouds wrap: keep clouds within ±200 of player.
+
+Pointer lock change: on loss show overlay.
+
+mousedown listener on document; only act if document.pointerLockElement === renderer.domElement.
+
+Overlay click: renderer.domElement.requestPointerLock().
+
+Also handle 'pointerlockerror' minimally.
+
+Selected slot update function.
+
+Now let me write the final file. Careful about face table and indices.
+
+Face table structure:
+const FACES = [
+ {dir:[1,0,0], corners:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]], shade:0.8},
+ {dir:[-1,0,0], corners:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]], shade:0.8},
+ {dir:[0,1,0], corners:[[0,1,1],[1,1,1],[1,1,0],[0,1,0]], shade:1.0},
+ {dir:[0,-1,0], corners:[[0,0,0],[1,0,0],[1,0,1],[0,0,1]], shade:0.55},
+ {dir:[0,0,1], corners:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]], shade:0.8},
+ {dir:[0,0,-1], corners:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]], shade:0.8},
+];
+
+Indices: base, base+1, base+2, base+2, base+1, base+3. Verify px: v0=(1,0,1),v1=(1,0,0),v2=(1,1,0): cross((v1-v0),(v2-v0)) = (0,0,-1)x(0,1,-1) = (0*(-1)-(-1)*1, (-1)*0-0*(-1), 0*1-0*0) = (1,0,0) ✓. Second tri (v2,v1,v3): v1-v2=(0,-1,0), v3-v2=(0,-1,1): cross = ((-1)(1)-0(-1), 0*0-0*1, 0*(-1)-(-1)*0) = (-1,0,0)? Wait let me recompute: cross(a,b) = (a_y b_z - a_z b_y, a_z b_x - a_x b_z, a_x b_y - a_y b_x). a=(0,-1,0), b=(0,-1,1): = ((-1)(1)-(0)(-1), (0)(0)-(0)(1), (0)(-1)-(-1)(0)) = (-1, 0, 0). Wrong sign!
+
+Hmm, so ordering (v0,v1,v2),(v2,v1,v3) gives inconsistent winding. Let me reconsider. Triangles sharing edge v1-v2: (v0,v1,v2) and (v2,v1,v3)? Edge v1→v2 appears in first, v2→v1 in second — consistent shared edge orientation. But my computation gave opposite normals. Let me double-check first triangle cross: a=v1-v0=(0,0,-1), b=v2-v0=(0,1,-1). cross = (a_y b_z - a_z b_y, a_z b_x - a_x b_z, a_x b_y - a_y b_x) = (0*(-1) - (-1)(1), (-1)(0) - 0*(-1), 0*1 - 0*0) = (1, 0, 0). ✓
+
+Second: a=v1-v2=(0,-1,0), b=v3-v2=(0,-1,1). cross = ((-1)(1)-(0)(-1), (0)(0)-(0)(1), (0)(-1)-(-1)(0)) = (-1,0,0). ✗
+
+So the pattern (v0,v1,v2),(v2,v1,v3) is wrong for this vertex ordering. The correct pattern for quad v0,v1,v2,v3 in order is (v0,v1,v2),(v0,v2,v3). Let me verify: (v0,v2,v3): a=v2-v0=(0,1,-1), b=v3-v0=(0,1,0). cross=(1*0-(-1)(1), (-1)(0)-0*0, 0*1-1*0)=(1,0,0) ✓.
+
+So indices: base, base+1, base+2, base, base+2, base+3. And the vertex order must be such that the quad is planar and ordered around perimeter. Our corner lists: px: (1,0,1),(1,0,0),(1,1,0),(1,1,1) — this goes around perimeter: front-bottom, back-bottom, back-top, front-top. Yes, a proper quad loop. Good.
+
+Let me verify other faces with (v0,v1,v2),(v0,v2,v3):
+nx: v0=(0,0,0),v1=(0,0,1),v2=(0,1,1),v3=(0,1,0). a=v1-v0=(0,0,1), b=v2-v0=(0,1,1). cross=(0*1-1*1, 1*0-0*1, 0*1-0*0)=(-1,0,0) ✓.
+py: v0=(0,1,1),v1=(1,1,1),v2=(1,1,0),v3=(0,1,0). a=(1,0,0), b=(1,0,-1). cross=(0*(-1)-0*0, 0*1-1*(-1), 1*0-0*1)=(0,1,0) ✓.
+ny: v0=(0,0,0),v1=(1,0,0),v2=(1,0,1),v3=(0,0,1). a=(1,0,0), b=(1,0,1). cross=(0*1-0*0, 0*1-1*1, 1*0-0*1)=(0,-1,0) ✓.
+pz: v0=(0,0,1),v1=(1,0,1),v2=(1,1,1),v3=(0,1,1). a=(1,0,0), b=(1,1,0). cross=(0*0-0*1, 0*1-1*0, 1*1-0*1)=(0,0,1) ✓.
+nz: v0=(1,0,0),v1=(0,0,0),v2=(0,1,0),v3=(1,1,0). a=(-1,0,0), b=(-1,1,0). cross=(0*0-0*1, 0*(-1)-(-1)*0, (-1)(1)-0(-1))=(0,0,-1) ✓.
+
+Great.
+
+Now let me write everything. Also note: MeshLambertMaterial with vertexColors:true in r128 — yes, boolean accepted.
+
+Raycast against Lambert material meshes — fine.
+
+One more: chunkMeshes array kept in sync with scene.
+
+For culling, iterate Map entries and delete — safe.
+
+For data gen ordering: gather missing within radius 5, sort by dist, generate up to 4.
+
+For mesh building: iterate radius 4, gather candidates, sort by dist, build up to 2.
+
+Neighbor data check: chunks.get for 4 neighbors, all must have data.
+
+Let me write the code.
+
+Also, initial chunks: player at (8,8) → chunk (0,0).
+
+Also make sure `document.exitPointerLock` not needed.
+
+Font: monospace.
+
+Now let me write the final HTML.
+
+One subtle: writeBlock during gen for trees uses ensureChunk which may generate neighbor chunk data — and neighbor's trees may write back to this chunk (which is in map with partial data). Order: we set chunk.data = new Uint8Array and immediately chunks.set(key, chunk) before filling? If we set data reference then fill, the chunk is in map with data (partially filled). Neighbor writes will modify the partially-filled array — fine because deterministic positions don't conflict much; even if they do, both are deterministic so result is consistent-ish. Actually to avoid weirdness, let's fill the whole column data first, then trees. Writes from neighbor trees into this chunk could land on cells we've already set (e.g., overwrite a leaf with dirt?) — neighbor tree writes only into air cells; if we already wrote a block there, it's not air, so skipped. If we haven't written yet (later column), the leaf stays, and our column fill would overwrite it with dirt/stone? Our fill only writes y<=H and tree cells; a leaf at y=H+3 wouldn't be overwritten by terrain fill (which stops at H). So fine.
+
+Order: create chunk obj {data, mesh:null}, set in map, fill terrain, then trees.
+
+Placement overlap check uses player box; fine.
+
+Also, placement cell must be within y 0..79: check cell.y>=0 && cell.y<80.
+
+Break: y===0 unbreakable.
+
+Now let me write the code. Also add `renderer = new THREE.WebGLRenderer({antialias:true})`, setSize, append to body.
+
+Crosshair CSS:
+#crosshair{position:fixed;left:50%;top:50%;width:20px;height:20px;transform:translate(-50%,-50%);pointer-events:none;z-index:5;}
+#crosshair::before,#crosshair::after{content:'';position:absolute;background:#fff;mix-blend-mode:difference;}
+::before{left:9px;top:0;width:2px;height:20px;}
+::after{left:0;top:9px;width:20px;height:2px;}
+
+Hotbar CSS: fixed bottom center, flex, gap 4px, bg rgba(0,0,0,0.5), padding 6px, border-radius 4px. Slots 44x44, display flex center, font bold white with text-shadow, border 2px solid rgba(255,255,255,0.25); .selected border 2px solid #fff.
+
+Overlay: fixed inset 0, rgba(0,0,0,0.6), flex column center, white text, z-index 10, cursor pointer.
+
+Hide overlay when locked: style.display='none'.
+
+JS structure:
+
+Constants, colors, noise, chunk system, meshing, player, input, UI, loop.
+
+Let me count: fine. Writing.
+
+function terrainHeight(x,z){ m=fractal2(x*0.004,z*0.004); h=fractal2(x*0.02,z*0.02); return Math.floor(5+m*m*58+h*10); }
+
+Also for spawn: spawnY = terrainHeight(8,8)+2.
+
+Loop with clock: let last=performance.now(); each frame now, dt=min(0.05,(now-last)/1000).
+
+Update order: updateWorld(), physics, camera, water, clouds, raycast target, render.
+
+Raycast: raycaster.setFromCamera(center, camera); raycaster.far=6; intersects = raycaster.intersectObjects(chunkMeshes); if length: hit=intersects[0]; n=hit.face.normal (geometry is in world coords and mesh at origin so world-space normal — normal attribute is unit and mesh has no transform so it's fine).
+tx = Math.floor(hit.point.x - n.x*0.5) etc. Store targetBlock={x,y,z} and placeCell.
+Outline: if targetBlock visible, position (x+0.5,y+0.5,z+0.5).
+
+Note: raycast might hit underside of water? Water not in chunkMeshes. Fine.
+
+Potential perf issue: intersectObjects on 81 meshes with big geometry each frame — acceptable.
+
+OK, let me write the final answer. Single code block, no extra text.

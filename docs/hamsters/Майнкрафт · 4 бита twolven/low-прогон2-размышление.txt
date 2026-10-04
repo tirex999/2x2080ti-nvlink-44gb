@@ -1,0 +1,1474 @@
+Let me build this Minecraft clone step by step. I need to create a complete, self-contained HTML file with:
+
+1. Three.js r128 loaded from CDN
+2. Voxel world with chunks (16x16x80)
+3. Procedural terrain with value noise
+4. First-person controls with pointer lock
+5. Block breaking/placing with raycasting
+6. Hotbar UI
+7. Sky, clouds, water
+8. All in one file
+
+Let me think through the architecture:
+
+**Noise functions:**
+- Integer hash: take coordinates, mix with primes, xor-shift, return 0-1
+- 2D value noise: hash at integer corners, bilinear interpolate with smoothstep
+- Fractal 2D: sum 4 octaves with decreasing amplitude and increasing frequency
+- 3D value noise: similar but 3D
+- Fractal 3D: for caves
+
+**World generation:**
+- For each column (x,z):
+  - Compute height H using fractal noise
+  - Fill from bottom: stone (y=0 unbreakable), stone below H-3, dirt/sand/stone in 3 layers under surface
+  - Surface block based on H
+  - Carve caves with 3D noise
+  - Place trees on grass with low probability
+
+**Chunk management:**
+- Map keyed by "cx,cz"
+- Each entry: { data: Uint8Array(16*16*80), mesh: Mesh }
+- Global helpers: getBlock(wx,wy,wz), setBlock(wx,wy,wz,id)
+- Each frame: generate nearby chunks (max 4), build meshes (max 2), remove far chunks
+
+**Meshing:**
+- For each chunk, iterate all blocks
+- For each non-air block, check 6 neighbors
+- If neighbor is air, add face vertices/normals/colors
+- Build BufferGeometry with position, normal, color attributes
+- Use MeshLambertMaterial with vertexColors: true
+
+**Player physics:**
+- Position, velocity
+- Gravity, jumping
+- Axis-separated collision
+- Camera follows player
+
+**Raycasting:**
+- Raycaster from camera center
+- Check against chunk meshes
+- Get hit point and face normal
+- Compute break/place targets
+
+Let me now write the complete code:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Minecraft Clone</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; font-family: monospace; }
+canvas { display: block; }
+#crosshair {
+  position: fixed; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none; z-index: 10;
+}
+#crosshair::before, #crosshair::after {
+  content: ''; position: absolute; background: rgba(255,255,255,0.8);
+}
+#crosshair::before { width: 2px; height: 16px; left: -1px; top: -8px; }
+#crosshair::after { width: 16px; height: 2px; left: -8px; top: -1px; }
+#hotbar {
+  position: fixed; bottom: 10px; left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: 2px;
+  background: rgba(0,0,0,0.5);
+  padding: 4px; border-radius: 4px;
+  z-index: 10;
+}
+.slot {
+  width: 40px; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid #555; border-radius: 2px;
+  font-size: 10px; color: #fff;
+  position: relative;
+}
+.slot.selected { border-color: #fff; }
+.slot .swatch {
+  width: 28px; height: 28px; border-radius: 2px;
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+}
+.slot .num {
+  position: relative; z-index: 1;
+  text-shadow: 1px 1px 2px #000;
+}
+#overlay {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.7);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  z-index: 100; color: #fff;
+}
+#overlay h1 { font-size: 48px; margin-bottom: 20px; }
+#overlay p { font-size: 16px; line-height: 1.8; }
+#overlay .click { margin-top: 30px; font-size: 20px; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+</style>
+</head>
+<body>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<div id="overlay">
+  <h1>⛏ MC Clone</h1>
+  <p>
+    WASD — Move<br>
+    Space — Jump<br>
+    Mouse — Look<br>
+    Left Click — Break Block<br>
+    Right Click — Place Block<br>
+    1-7 / Scroll — Select Block<br>
+  </p>
+  <div class="click">Click to Play</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/thone.min.js"></script>
+<script>
+// ... game code
+</script>
+</body>
+</html>
+```
+
+Wait, I have a typo in the CDN URL. Let me fix that: `three.min.js` not `thone.min.js`.
+
+Now let me write the full JavaScript:
+
+```javascript
+// === CONSTANTS ===
+const CHUNK_X = 16, CHUNK_Z = 16, CHUNK_Y = 80;
+const WORLD_HEIGHT = CHUNK_Y;
+const GRAVITY = 25;
+const JUMP_VEL = 8.5;
+const MOVE_SPEED = 5.5;
+const PLAYER_HALF_W = 0.3;
+const PLAYER_HEIGHT = 1.8;
+const EYE_HEIGHT = 1.62;
+const REACH = 6;
+const FOG_NEAR = 40;
+const FOG_FAR = 110;
+
+// Block IDs
+const AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, SAND = 4, WOOD = 5, LEAVES = 6, SNOW = 7;
+
+// Block colors
+const BLOCK_COLORS = {
+  [GRASS]:  0x4caf50,
+  [DIRT]:   0x795548,
+  [STONE]:  0x9e9e9e,
+  [SAND]:   0xe7d9a8,
+  [WOOD]:   0x8d6e63,
+  [LEAVES]: 0x2e7d32,
+  [SNOW]:   0xffffff
+};
+
+// Face definitions: for each direction, the 4 vertices (in CCW order when viewed from outside)
+// and the normal
+// We define faces as: [dx, dy, dz, vertices[4][3]]
+// Actually, let me define it differently. For a unit cube at position (x,y,z):
+// Top face (dy=1): vertices (x,y+1,z), (x+1,y+1,z), (x+1,y+1,z+1), (x,y+1,z+1) - normal (0,1,0)
+// Bottom face (dy=-1): vertices (x,y,z), (x,y,z+1), (x+1,y,z+1), (x+1,y,z) - normal (0,-1,0)
+// North face (dz=-1): vertices (x,y,z), (x+1,y,z), (x+1,y+1,z), (x,y+1,z) - normal (0,0,-1)
+// South face (dz=1): vertices (x,y,z+1), (x,y+1,z+1), (x+1,y+1,z+1), (x+1,y,z+1) - normal (0,0,1)
+// West face (dx=-1): vertices (x,y,z), (x,y,z+1), (x,y+1,z+1), (x,y+1,z) - normal (-1,0,0)
+// East face (dx=1): vertices (x+1,y,z), (x+1,y+1,z), (x+1,y+1,z+1), (x+1,y,z+1) - normal (1,0,0)
+
+// Wait, I need to be more careful about winding order. In Three.js, the default front face is counter-clockwise (CCW). So when looking at a face from outside the cube, the vertices should go CCW.
+
+// Let me redefine:
+// For a block at world position (bx, by, bz), the cube occupies [bx, bx+1] x [by, by+1] x [bz, bz+1].
+
+// Top (+Y): Looking down from above, CCW means:
+//   (bx, by+1, bz), (bx, by+1, bz+1), (bx+1, by+1, bz+1), (bx+1, by+1, bz)
+//   Normal: (0, 1, 0)
+
+// Bottom (-Y): Looking up from below, CCW means:
+//   (bx, by, bz), (bx+1, by, bz), (bx+1, by, bz+1), (bx, by, bz+1)
+//   Normal: (0, -1, 0)
+
+// North (-Z): Looking from -Z toward +Z, CCW means:
+//   (bx, by, bz), (bx+1, by, bz), (bx+1, by+1, bz), (bx, by+1, bz)
+//   Normal: (0, 0, -1)
+
+// South (+Z): Looking from +Z toward -Z, CCW means:
+//   (bx, by, bz+1), (bx, by+1, bz+1), (bx+1, by+1, bz+1), (bx+1, by, bz+1)
+//   Normal: (0, 0, 1)
+
+// West (-X): Looking from -X toward +X, CCW means:
+//   (bx, by, bz), (bx, by+1, bz), (bx, by+1, bz+1), (bx, by, bz+1)
+//   Normal: (-1, 0, 0)
+
+// East (+X): Looking from +X toward -X, CCW means:
+//   (bx+1, by, bz), (bx+1, by, bz+1), (bx+1, by+1, bz+1), (bx+1, by+1, bz)
+//   Normal: (1, 0, 0)
+
+// Hmm wait, I need to double-check these. Let me think about it more carefully.
+
+// For the top face (+Y), we're looking from above (from +Y toward -Y). The face is in the XZ plane at Y = by+1.
+// CCW when viewed from +Y:
+// Starting from the "back-left" corner going clockwise... no, CCW.
+// In the XZ plane, looking from +Y:
+//   +X is to the right, +Z is toward the viewer (down in screen space)
+// CCW in this view:
+//   (bx, bz) -> (bx+1, bz) -> (bx+1, bz+1) -> (bx, bz+1)
+// So vertices: (bx, by+1, bz), (bx+1, by+1, bz), (bx+1, by+1, bz+1), (bx, by+1, bz+1)
+// Triangles: (0,1,2) and (0,2,3)
+
+// For the bottom face (-Y), looking from below (from -Y toward +Y). The face is in the XZ plane at Y = by.
+// CCW when viewed from -Y:
+//   +X is to the LEFT (mirrored), +Z is toward the viewer
+// CCW in this view:
+//   (bx, bz) -> (bx, bz+1) -> (bx+1, bz+1) -> (bx+1, bz)
+// So vertices: (bx, by, bz), (bx, by, bz+1), (bx+1, by, bz+1), (bx+1, by, bz)
+// Triangles: (0,1,2) and (0,2,3)
+
+// For the north face (-Z), looking from -Z toward +Z. The face is in the XY plane at Z = bz.
+// CCW when viewed from -Z:
+//   +X is to the right, +Y is up
+// CCW:
+//   (bx, by) -> (bx+1, by) -> (bx+1, by+1) -> (bx, by+1)
+// So vertices: (bx, by, bz), (bx+1, by, bz), (bx+1, by+1, bz), (bx, by+1, bz)
+// Triangles: (0,1,2) and (0,2,3)
+
+// For the south face (+Z), looking from +Z toward -Z. The face is in the XY plane at Z = bz+1.
+// CCW when viewed from +Z:
+//   +X is to the LEFT (mirrored), +Y is up
+// CCW in this view:
+//   (bx, by) -> (bx, by+1) -> (bx+1, by+1) -> (bx+1, by)
+// So vertices: (bx, by, bz+1), (bx, by+1, bz+1), (bx+1, by+1, bz+1), (bx+1, by, bz+1)
+// Triangles: (0,1,2) and (0,2,3)
+
+// For the west face (-X), looking from -X toward +X. The face is in the YZ plane at X = bx.
+// CCW when viewed from -X:
+//   +Z is to the right, +Y is up
+// CCW:
+//   (bz, by) -> (bz+1, by) -> (bz+1, by+1) -> (bz, by+1)
+// So vertices: (bx, by, bz), (bx, by, bz+1), (bx, by+1, bz+1), (bx, by+1, bz)
+// Triangles: (0,1,2) and (0,2,3)
+
+// For the east face (+X), looking from +X toward -X. The face is in the YZ plane at X = bx+1.
+// CCW when viewed from +X:
+//   +Z is to the LEFT (mirrored), +Y is up
+// CCW in this view:
+//   (bz, by) -> (bz, by+1) -> (bz+1, by+1) -> (bz+1, by)
+// So vertices: (bx+1, by, bz), (bx+1, by+1, bz), (bx+1, by+1, bz+1), (bx+1, by, bz+1)
+// Triangles: (0,1,2) and (0,2,3)
+
+// OK so let me define the faces more compactly. For each face direction, I'll store:
+// - The offset direction (for neighbor checking)
+// - The 4 vertex offsets (relative to block position)
+// - The normal
+// - The brightness multiplier
+
+// Actually, let me just hardcode the face data in the meshing function. It'll be clearer.
+
+// === NOISE FUNCTIONS ===
+
+function hash2(x, y) {
+  // Integer coordinate hash -> [0, 1]
+  let h = x * 374761393 + y * 668265263;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h = h ^ (h >> 16);
+  return (h & 0x7fffffff) / 0x7fffffff;
+}
+
+function smoothstep(t) {
+  return t * t * (3 - 2 * t);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function noise2(x, y) {
+  // 2D value noise with bilinear interpolation
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const sx = smoothstep(xf), sy = smoothstep(yf);
+  
+  const v00 = hash2(xi, yi);
+  const v10 = hash2(xi + 1, yi);
+  const v01 = hash2(xi, yi + 1);
+  const v11 = hash2(xi + 1, yi + 1);
+  
+  const v0 = lerp(v00, v10, sx);
+  const v1 = lerp(v01, v11, sx);
+  return lerp(v0, v1, sy);
+}
+
+function fractal2(x, y, octaves) {
+  let val = 0, amp = 1, freq = 1, maxVal = 0;
+  for (let i = 0; i < octaves; i++) {
+    val += noise2(x * freq, y * freq) * amp;
+    maxVal += amp;
+    amp *= 0.5;
+    freq *= 2;
+  }
+  return val / maxVal;
+}
+
+function hash3(x, y, z) {
+  let h = x * 374761393 + y * 668265263 + z * 1274126177;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h = h ^ (h >> 16);
+  return (h & 0x7fffffff) / 0x7fffffff;
+}
+
+function noise3(x, y, z) {
+  // 3D value noise
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const sx = smoothstep(xf), sy = smoothstep(yf), sz = smoothstep(zf);
+  
+  // 8 corners
+  const c000 = hash3(xi, yi, zi);
+  const c100 = hash3(xi+1, yi, zi);
+  const c010 = hash3(xi, yi+1, zi);
+  const c110 = hash3(xi+1, yi+1, zi);
+  const c001 = hash3(xi, yi, zi+1);
+  const c101 = hash3(xi+1, yi, zi+1);
+  const c011 = hash3(xi, yi+1, zi+1);
+  const c111 = hash3(xi+1, yi+1, zi+1);
+  
+  // Trilinear interpolation
+  const v00 = lerp(c000, c100, sx);
+  const v10 = lerp(c010, c110, sx);
+  const v01 = lerp(c001, c101, sx);
+  const v11 = lerp(c011, c111, sx);
+  const v0 = lerp(v00, v01, sz);
+  const v1 = lerp(v10, v11, sz);
+  return lerp(v0, v1, sy);
+}
+
+function fractal3(x, y, z, octaves) {
+  let val = 0, amp = 1, freq = 1, maxVal = 0;
+  for (let i = 0; i < octaves; i++) {
+    val += noise3(x * freq, y * freq, z * freq) * amp;
+    maxVal += amp;
+    amp *= 0.5;
+    freq *= 2;
+  }
+  return val / maxVal;
+}
+
+// === TERRAIN GENERATION ===
+
+function getColumnHeight(wx, wz) {
+  const m = fractal2(wx * 0.004, wz * 0.004, 4);
+  const h = fractal2(wx * 0.02, wz * 0.02, 4);
+  return Math.floor(5 + m * m * 58 + h * 10);
+}
+
+function generateChunkData(cx, cz) {
+  const data = new Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z);
+  
+  for (let lx = 0; lx < CHUNK_X; lx++) {
+    for (let lz = 0; lz < CHUNK_Z; lz++) {
+      const wx = cx * CHUNK_X + lx;
+      const wz = cz * CHUNK_Z + lz;
+      const H = getColumnHeight(wx, wz);
+      
+      // Determine surface type
+      let surfaceBlock;
+      if (H >= 46) surfaceBlock = SNOW;
+      else if (H >= 37) surfaceBlock = STONE;
+      else if (H <= 16) surfaceBlock = SAND;
+      else surfaceBlock = GRASS;
+      
+      // Fill column
+      for (let y = 0; y < CHUNK_Y; y++) {
+        const idx = (lx * CHUNK_Z + lz) * CHUNK_Y + y;
+        
+        if (y > H) {
+          data[idx] = AIR;
+        } else if (y === 0) {
+          data[idx] = STONE; // Unbreakable bedrock
+        } else if (y === H) {
+          data[idx] = surfaceBlock;
+        } else if (y >= H - 2) {
+          // 3 layers under surface (H-2, H-1, H)
+          // Actually spec says "the 3 layers under the surface"
+          // So y = H-1, H-2, H-3? Let me re-read.
+          // "below H−3 stone; the 3 layers under the surface dirt (sand if H ≤ 16, stone if H ≥ 37)"
+          // So: y < H-3: stone
+          //     y = H-3, H-2, H-1: dirt (or sand/stone based on conditions)
+          //     y = H: surface block
+          
+          // Wait, let me re-read the spec more carefully:
+          // "Column fill: y 0 = unbreakable stone; below H−3 stone; the 3 layers under the surface dirt (sand if H ≤ 16, stone if H ≥ 37); surface = ..."
+          
+          // So the structure is:
+          // y = 0: stone (bedrock)
+          // 1 <= y < H-3: stone
+          // H-3 <= y < H: dirt (but if H<=16 it's sand, if H>=37 it's stone)
+          // y = H: surface block (snow/stone/sand/grass)
+          
+          // Wait, "below H−3 stone" means y < H-3 is stone.
+          // "the 3 layers under the surface" means y = H-3, H-2, H-1 are the "dirt" layers.
+          // But the parenthetical says these are sand if H<=16, stone if H>=37.
+          // Otherwise they're dirt.
+          
+          let subSurface;
+          if (H <= 16) subSurface = SAND;
+          else if (H >= 37) subSurface = STONE;
+          else subSurface = DIRT;
+          data[idx] = subSurface;
+        } else {
+          // y < H-3 and y > 0
+          data[idx] = STONE;
+        }
+      }
+      
+      // Carve caves
+      for (let y = 3; y < H - 2; y++) {
+        const idx = (lx * CHUNK_Z + lz) * CHUNK_Y + y;
+        if (data[idx] !== AIR) {
+          const caveVal = fractal3(wx * 0.09, y * 0.09, wz * 0.09, 3);
+          if (caveVal > 0.67) {
+            data[idx] = AIR;
+          }
+        }
+      }
+    }
+  }
+  
+  // Place trees
+  for (let lx = 1; lx < CHUNK_X - 1; lx++) {
+    for (let lz = 1; lz < CHUNK_Z - 1; lz++) {
+      const wx = cx * CHUNK_X + lx;
+      const wz = cz * CHUNK_Z + lz;
+      const H = getColumnHeight(wx, wz);
+      
+      if (H >= CHUNK_Y - 6) continue;
+      
+      // Check if surface is grass
+      const surfIdx = (lx * CHUNK_Z + lz) * CHUNK_Y + H;
+      if (data[surfIdx] !== GRASS) continue;
+      
+      // Per-column hash for tree placement
+      const treeHash = hash2(wx * 7 + 13, wz * 11 + 7);
+      if (treeHash >= 0.02) continue;
+      
+      // Place trunk: 4 blocks up from H+1 to H+4
+      const trunkBase = H + 1;
+      for (let ty = 0; ty < 4; ty++) {
+        const y = trunkBase + ty;
+        if (y >= CHUNK_Y) break;
+        const idx = (lx * CHUNK_Z + lz) * CHUNK_Y + y;
+        if (data[idx] === AIR) data[idx] = WOOD;
+      }
+      
+      // Leaves: 5x5 layer at H+4 and H+5, then 3x3 at H+6, then 1 at H+7
+      // Wait, spec says: "leaves as a 5x5 layer twice, then 3x3, then 1 on top"
+      // So: two 5x5 layers, one 3x3 layer, one single block on top
+      // That's 4 leaf layers total (2x 5x5 + 1x 3x3 + 1x single)
+      
+      // Actually, the trunk is 4 blocks (H+1 to H+4). The leaves start at the same level as the top of the trunk.
+      // Let me interpret: leaves are placed at H+4, H+5 (5x5), H+6 (3x3), H+7 (single)
+      // But the trunk goes up to H+4, so the first leaf layer overlaps with the top trunk block.
+      // I'll place leaves only in air cells.
+      
+      // 5x5 layer at y = H+4
+      for (let ly = 0; ly < 2; ly++) {
+        const y = H + 4 + ly; // H+4 and H+5
+        if (y >= CHUNK_Y) break;
+        for (let dx = -2; dx <= 2; dx++) {
+          for (let dz = -2; dz <= 2; dz++) {
+            const nx = lx + dx, nz = lz + dz;
+            if (nx < 0 || nx >= CHUNK_X || nz < 0 || nz >= CHUNK_Z) continue;
+            const idx = (nx * CHUNK_Z + nz) * CHUNK_Y + y;
+            if (data[idx] === AIR) data[idx] = LEAVES;
+          }
+        }
+      }
+      
+      // 3x3 layer at y = H+6
+      {
+        const y = H + 6;
+        if (y < CHUNK_Y) {
+          for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+              const nx = lx + dx, nz = lz + dz;
+              if (nx < 0 || nx >= CHUNK_X || nz < 0 || nz >= CHUNK_Z) continue;
+              const idx = (nx * CHUNK_Z + nz) * CHUNK_Y + y;
+              if (data[idx] === AIR) data[idx] = LEAVES;
+            }
+          }
+        }
+      }
+      
+      // Single block at y = H+7
+      {
+        const y = H + 7;
+        if (y < CHUNK_Y) {
+          const idx = (lx * CHUNK_Z + lz) * CHUNK_Y + y;
+          if (data[idx] === AIR) data[idx] = LEAVES;
+        }
+      }
+    }
+  }
+  
+  return data;
+}
+
+// === THREE.JS SETUP ===
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, FOG_NEAR, FOG_FAR);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 400);
+camera.rotation.order = 'YXZ';
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.65);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 0.5);
+scene.add(dirLight);
+
+// Shared material for all chunk meshes
+const voxelMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+
+// === CHUNK MANAGEMENT ===
+
+const chunks = new Map(); // key: "cx,cz" -> { data: Uint8Array, mesh: Mesh|null }
+const chunkMeshes = []; // array of all chunk meshes for raycasting
+
+function chunkKey(cx, cz) {
+  return cx + ',' + cz;
+}
+
+function getChunk(cx, cz) {
+  return chunks.get(chunkKey(cx, cz));
+}
+
+function getBlock(wx, wy, wz) {
+  if (wy < 0 || wy >= CHUNK_Y) return AIR;
+  const cx = Math.floor(wx / CHUNK_X);
+  const cz = Math.floor(wz / CHUNK_Z);
+  const lx = wx - cx * CHUNK_X;
+  const lz = wz - cz * CHUNK_Z;
+  const chunk = getChunk(cx, cz);
+  if (!chunk) return AIR;
+  return chunk.data[(lx * CHUNK_Z + lz) * CHUNK_Y + wy];
+}
+
+function setBlock(wx, wy, wz, id) {
+  if (wy < 0 || wy >= CHUNK_Y) return;
+  const cx = Math.floor(wx / CHUNK_X);
+  const cz = Math.floor(wz / CHUNK_Z);
+  const lx = wx - cx * CHUNK_X;
+  const lz = wz - cz * CHUNK_Z;
+  const chunk = getChunk(cx, cz);
+  if (!chunk) return;
+  chunk.data[(lx * CHUNK_Z + lz) * CHUNK_Y + wy] = id;
+}
+
+// === MESHING ===
+
+// Face definitions: [normal, 4 vertex offsets, brightness]
+// Vertex offsets are relative to the block's origin (wx, wy, wz)
+// Each face: { nx, ny, nz, verts: [[x,y,z],[x,y,z],[x,y,z],[x,y,z]], bright }
+
+const FACES = [
+  // +Y (top)
+  { nx: 0, ny: 1, nz: 0, verts: [[0,1,0],[1,1,0],[1,1,1],[0,1,1]], bright: 1.0 },
+  // -Y (bottom)
+  { nx: 0, ny: -1, nz: 0, verts: [[0,0,0],[0,0,1],[1,0,1],[1,0,0]], bright: 0.55 },
+  // -Z (north)
+  { nx: 0, ny: 0, nz: -1, verts: [[0,0,0],[1,0,0],[1,1,0],[0,1,0]], bright: 0.8 },
+  // +Z (south)
+  { nx: 0, ny: 0, nz: 1, verts: [[0,0,1],[0,1,1],[1,1,1],[1,0,1]], bright: 0.8 },
+  // -X (west)
+  { nx: -1, ny: 0, nz: 0, verts: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]], bright: 0.8 },
+  // +X (east)
+  { nx: 1, ny: 0, nz: 0, verts: [[1,0,0],[1,0,1],[1,1,1],[1,1,0]], bright: 0.8 },
+];
+
+function buildChunkMesh(cx, cz) {
+  const chunk = getChunk(cx, cz);
+  if (!chunk) return null;
+  
+  const positions = [];
+  const normals = [];
+  const colors = [];
+  const indices = [];
+  
+  const baseX = cx * CHUNK_X;
+  const baseZ = cz * CHUNK_Z;
+  
+  for (let lx = 0; lx < CHUNK_X; lx++) {
+    for (let lz = 0; lz < CHUNK_Z; lz++) {
+      const wx = baseX + lx;
+      const wz = baseZ + lz;
+      
+      for (let y = 0; y < CHUNK_Y; y++) {
+        const blockId = chunk.data[(lx * CHUNK_Z + lz) * CHUNK_Y + y];
+        if (blockId === AIR) continue;
+        
+        const color = BLOCK_COLORS[blockId];
+        if (color === undefined) continue;
+        
+        const r = ((color >> 16) & 0xff) / 255;
+        const g = ((color >> 8) & 0xff) / 255;
+        const b = (color & 0xff) / 255;
+        
+        for (let f = 0; f < 6; f++) {
+          const face = FACES[f];
+          const nbx = wx + face.nx;
+          const nby = y + face.ny;
+          const nbz = wz + face.nz;
+          
+          // Check if neighbor is air
+          const neighbor = getBlock(nbx, nby, nbz);
+          if (neighbor !== AIR) continue;
+          
+          const vi = positions.length / 3;
+          
+          for (let v = 0; v < 4; v++) {
+            const vx = wx + face.verts[v][0];
+            const vy = y + face.verts[v][1];
+            const vz = wz + face.verts[v][2];
+            positions.push(vx, vy, vz);
+            normals.push(face.nx, face.ny, face.nz);
+            
+            const br = face.bright;
+            colors.push(r * br, g * br, b * br);
+          }
+          
+          // Two triangles: (0,1,2) and (0,2,3)
+          indices.push(vi, vi + 1, vi + 2);
+          indices.push(vi, vi + 2, vi + 3);
+        }
+      }
+    }
+  }
+  
+  // Remove old mesh
+  if (chunk.mesh) {
+    scene.remove(chunk.mesh);
+    chunk.mesh.geometry.dispose();
+    const mi = chunkMeshes.indexOf(chunk.mesh);
+    if (mi !== -1) chunkMeshes.splice(mi, 1);
+  }
+  
+  if (positions.length === 0) {
+    chunk.mesh = null;
+    return null;
+  }
+  
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geometry.setIndex(indices);
+  
+  const mesh = new THREE.Mesh(geometry, voxelMaterial);
+  scene.add(mesh);
+  chunk.mesh = mesh;
+  chunkMeshes.push(mesh);
+  
+  return mesh;
+}
+
+function rebuildChunk(cx, cz) {
+  buildChunkMesh(cx, cz);
+}
+
+// === CLOUDS ===
+
+const cloudGroup = new THREE.Group();
+const cloudMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 });
+
+for (let i = 0; i < 25; i++) {
+  const w = 15 + hash2(i, 42) * 25;
+  const d = 10 + hash2(i, 77) * 20;
+  const geo = new THREE.BoxGeometry(w, 1.5, d);
+  const cloud = new THREE.Mesh(geo, cloudMaterial);
+  cloud.position.set(
+    (hash2(i, 13) - 0.5) * 300,
+    88 + hash2(i, 55) * 8,
+    (hash2(i, 29) - 0.5) * 300
+  );
+  cloud.userData.speed = 0.3 + hash2(i, 66) * 0.5;
+  cloudGroup.add(cloud);
+}
+scene.add(cloudGroup);
+
+// === WATER ===
+
+const waterGeo = new THREE.PlaneGeometry(200, 200);
+waterGeo.rotateX(-Math.PI / 2);
+const waterMat = new THREE.MeshLambertMaterial({
+  color: 0x3366cc,
+  transparent: true,
+  opacity: 0.6,
+  side: THREE.DoubleSide
+});
+const waterPlane = new THREE.Mesh(waterGeo, waterMat);
+waterPlane.position.y = 14.3;
+scene.add(waterPlane);
+
+// === PLAYER ===
+
+const player = {
+  x: 8, y: 0, z: 8,
+  vx: 0, vy: 0, vz: 0,
+  onGround: false,
+  yaw: 0,
+  pitch: 0
+};
+
+// Spawn: find terrain height at (8, 8)
+(function spawnPlayer() {
+  // We need to generate the chunk containing (8,8) first
+  // Chunk for (8,8): cx = floor(8/16) = 0, cz = floor(8/16) = 0
+  const cx = 0, cz = 0;
+  const data = generateChunkData(cx, cz);
+  chunks.set(chunkKey(cx, cz), { data: data, mesh: null });
+  
+  // Get height at (8, 8)
+  const H = getColumnHeight(8, 8);
+  player.y = H + 1;
+})();
+
+// === INPUT ===
+
+const keys = {};
+let selectedSlot = 0;
+const hotbarBlocks = [GRASS, DIRT, STONE, SAND, WOOD, LEAVES, SNOW];
+
+window.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code >= 'Digit1' && e.code <= 'Digit7') {
+    selectedSlot = parseInt(e.code.charAt(5)) - 1;
+    updateHotbar();
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  keys[e.code] = false;
+});
+
+window.addEventListener('wheel', (e) => {
+  if (!document.pointerLockElement) return;
+  selectedSlot = ((selectedSlot + (e.deltaY > 0 ? 1 : -1)) % 7 + 7) % 7;
+  updateHotbar();
+}, { passive: true });
+
+window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// Pointer lock
+const overlay = document.getElementById('overlay');
+overlay.addEventListener('click', () => {
+  renderer.domElement.requestPointerLock();
+});
+
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement) {
+    overlay.style.display = 'none';
+  } else {
+    overlay.style.display = 'flex';
+  }
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!document.pointerLockElement) return;
+  player.yaw -= e.movementX * 0.002;
+  player.pitch -= e.movementY * 0.002;
+  player.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, player.pitch));
+});
+
+// Mouse buttons
+let mouseDown = [false, false, false]; // left, middle, right
+
+document.addEventListener('mousedown', (e) => {
+  if (!document.pointerLockElement) return;
+  if (e.button === 0) breakBlock();
+  if (e.button === 2) placeBlock();
+});
+
+// === RAYCASTING & BLOCK INTERACTION ===
+
+const raycaster = new THREE.Raycaster();
+raycaster.far = REACH;
+
+// Wireframe outline for targeted block
+const outlineGeo = new THREE.BoxGeometry(1.005, 1.005, 1.005);
+const outlineMat = new THREE.MeshBasicMaterial({ color: 0x000000, wireframe: true });
+const outlineMesh = new THREE.Mesh(outlineGeo, outlineMat);
+outlineMesh.visible = false;
+scene.add(outlineMesh);
+
+function getTargetInfo() {
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const intersects = raycaster.intersectObjects(chunkMeshes);
+  
+  if (intersects.length === 0) return null;
+  
+  const hit = intersects[0];
+  const p = hit.point;
+  const n = hit.face.normal;
+  
+  // Break target: floor(p - n * 0.5)
+  const bx = Math.floor(p.x - n.x * 0.5);
+  const by = Math.floor(p.y - n.y * 0.5);
+  const bz = Math.floor(p.z - n.z * 0.5);
+  
+  // Place cell: floor(p + n * 0.5)
+  const px = Math.floor(p.x + n.x * 0.5);
+  const py = Math.floor(p.y + n.y * 0.5);
+  const pz = Math.floor(p.z + n.z * 0.5);
+  
+  return { bx, by, bz, px, py, pz };
+}
+
+function breakBlock() {
+  const info = getTargetInfo();
+  if (!info) return;
+  if (info.by === 0) return; // Don't break bedrock
+  
+  setBlock(info.bx, info.by, info.bz, AIR);
+  
+  // Rebuild affected chunks
+  const bcx = Math.floor(info.bx / CHUNK_X);
+  const bcz = Math.floor(info.bz / CHUNK_Z);
+  rebuildChunk(bcx, bcz);
+  
+  // Check if on chunk border
+  const blx = info.bx - bcx * CHUNK_X;
+  const blz = info.bz - bcz * CHUNK_Z;
+  if (blx === 0) rebuildChunk(bcx - 1, bcz);
+  if (blx === CHUNK_X - 1) rebuildChunk(bcx + 1, bcz);
+  if (blz === 0) rebuildChunk(bcx, bcz - 1);
+  if (blz === CHUNK_Z - 1) rebuildChunk(bcx, bcz + 1);
+}
+
+function placeBlock() {
+  const info = getTargetInfo();
+  if (!info) return;
+  
+  const blockId = hotbarBlocks[selectedSlot];
+  
+  // Check if target cell is air
+  if (getBlock(info.px, info.py, info.pz) !== AIR) return;
+  
+  // Check if it overlaps the player
+  const playerMinX = player.x - PLAYER_HALF_W;
+  const playerMaxX = player.x + PLAYER_HALF_W;
+  const playerMinY = player.y;
+  const playerMaxY = player.y + PLAYER_HEIGHT;
+  const playerMinZ = player.z - PLAYER_HALF_W;
+  const playerMaxZ = player.z + PLAYER_HALF_W;
+  
+  if (info.px + 1 > playerMinX && info.px < playerMaxX &&
+      info.py + 1 > playerMinY && info.py < playerMaxY &&
+      info.pz + 1 > playerMinZ && info.pz < playerMaxZ) {
+    return;
+  }
+  
+  setBlock(info.px, info.py, info.pz, blockId);
+  
+  // Rebuild affected chunks
+  const pcx = Math.floor(info.px / CHUNK_X);
+  const pcz = Math.floor(info.pz / CHUNK_Z);
+  rebuildChunk(pcx, pcz);
+  
+  const plx = info.px - pcx * CHUNK_X;
+  const plz = info.pz - pcz * CHUNK_Z;
+  if (plx === 0) rebuildChunk(pcx - 1, pcz);
+  if (plx === CHUNK_X - 1) rebuildChunk(pcx + 1, pcz);
+  if (plz === 0) rebuildChunk(pcx, pcz - 1);
+  if (plz === CHUNK_Z - 1) rebuildChunk(pcx, pcz + 1);
+}
+
+// === HOTBAR UI ===
+
+function buildHotbar() {
+  const hotbarEl = document.getElementById('hotbar');
+  hotbarEl.innerHTML = '';
+  
+  for (let i = 0; i < 7; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'slot' + (i === selectedSlot ? ' selected' : '');
+    
+    const swatch = document.createElement('div');
+    swatch.className = 'swatch';
+    const c = BLOCK_COLORS[hotbarBlocks[i]];
+    swatch.style.backgroundColor = '#' + c.toString(16).padStart(6, '0');
+    
+    const num = document.createElement('span');
+    num.className = 'num';
+    num.textContent = (i + 1);
+    
+    slot.appendChild(swatch);
+    slot.appendChild(num);
+    hotbarEl.appendChild(slot);
+  }
+}
+
+function updateHotbar() {
+  const slots = document.querySelectorAll('.slot');
+  slots.forEach((s, i) => {
+    s.className = 'slot' + (i === selectedSlot ? ' selected' : '');
+  });
+}
+
+buildHotbar();
+
+// === COLLISION DETECTION ===
+
+function isSolid(wx, wy, wz) {
+  return getBlock(Math.floor(wx), Math.floor(wy), Math.floor(wz)) !== AIR;
+}
+
+function collides(px, py, pz) {
+  // Check if player box at (px, py, pz) overlaps any solid block
+  const minX = px - PLAYER_HALF_W;
+  const maxX = px + PLAYER_HALF_W;
+  const minY = py;
+  const maxY = py + PLAYER_HEIGHT;
+  const minZ = pz - PLAYER_HALF_W;
+  const maxZ = pz + PLAYER_HALF_W;
+  
+  const startX = Math.floor(minX);
+  const endX = Math.floor(maxX - 0.001);
+  const startY = Math.floor(minY);
+  const endY = Math.floor(maxY - 0.001);
+  const startZ = Math.floor(minZ);
+  const endZ = Math.floor(maxZ - 0.001);
+  
+  for (let bx = startX; bx <= endX; bx++) {
+    for (let by = startY; by <= endY; by++) {
+      for (let bz = startZ; bz <= endZ; bz++) {
+        if (getBlock(bx, by, bz) !== AIR) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// === GAME LOOP ===
+
+let lastTime = performance.now();
+
+function update(dt) {
+  // Update camera rotation
+  camera.rotation.y = player.yaw;
+  camera.rotation.x = player.pitch;
+  
+  // Movement
+  const locked = !!document.pointerLockElement;
+  let moveX = 0, moveZ = 0;
+  
+  if (locked) {
+    if (keys['KeyW']) { moveX -= Math.sin(player.yaw); moveZ -= Math.cos(player.yaw); }
+    if (keys['KeyS']) { moveX += Math.sin(player.yaw); moveZ += Math.cos(player.yaw); }
+    if (keys['KeyA']) { moveX -= Math.cos(player.yaw); moveZ += Math.sin(player.yaw); }
+    if (keys['KeyD']) { moveX += Math.cos(player.yaw); moveZ -= Math.sin(player.yaw); }
+    
+    // Normalize
+    const len = Math.sqrt(moveX * moveX + moveZ * moveZ);
+    if (len > 0) {
+      moveX /= len;
+      moveZ /= len;
+    }
+    
+    player.vx = moveX * MOVE_SPEED;
+    player.vz = moveZ * MOVE_SPEED;
+    
+    // Jump
+    if (keys['Space'] && player.onGround) {
+      player.vy = JUMP_VEL;
+      player.onGround = false;
+    }
+  } else {
+    player.vx = 0;
+    player.vz = 0;
+  }
+  
+  // Gravity
+  player.vy -= GRAVITY * dt;
+  
+  // Move and collide (axis separated)
+  // X axis
+  player.x += player.vx * dt;
+  if (collides(player.x, player.y, player.z)) {
+    player.x -= player.vx * dt;
+  }
+  
+  // Z axis
+  player.z += player.vz * dt;
+  if (collides(player.x, player.y, player.z)) {
+    player.z -= player.vz * dt;
+  }
+  
+  // Y axis
+  player.y += player.vy * dt;
+  if (collides(player.x, player.y, player.z)) {
+    player.y -= player.vy * dt;
+    if (player.vy < 0) player.onGround = true;
+    player.vy = 0;
+  } else {
+    player.onGround = false;
+  }
+  
+  // Fall below -20: teleport to spawn
+  if (player.y < -20) {
+    player.x = 8;
+    player.z = 8;
+    const H = getColumnHeight(8, 8);
+    player.y = H + 1;
+    player.vy = 0;
+  }
+  
+  // Update camera position
+  camera.position.set(player.x, player.y + EYE_HEIGHT, player.z);
+  
+  // Update outline
+  const targetInfo = getTargetInfo();
+  if (targetInfo) {
+    outlineMesh.position.set(targetInfo.bx + 0.5, targetInfo.by + 0.5, targetInfo.bz + 0.5);
+    outlineMesh.visible = true;
+  } else {
+    outlineMesh.visible = false;
+  }
+  
+  // Update clouds
+  for (let i = 0; i < cloudGroup.children.length; i++) {
+    const cloud = cloudGroup.children[i];
+    cloud.position.x += cloud.userData.speed * dt;
+    
+    // Wrap around player
+    const dx = cloud.position.x - player.x;
+    if (dx > 150) cloud.position.x -= 300;
+    if (dx < -150) cloud.position.x += 300;
+    
+    const dz = cloud.position.z - player.z;
+    if (dz > 150) cloud.position.z -= 300;
+    if (dz < -150) cloud.position.z += 300;
+  }
+  
+  // Update water position
+  waterPlane.position.x = player.x;
+  waterPlane.position.z = player.z;
+}
+
+function updateChunks() {
+  const pcx = Math.floor(player.x / CHUNK_X);
+  const pcz = Math.floor(player.z / CHUNK_Z);
+  
+  // Generate data for chunks within 5 (max 4 per frame)
+  let genCount = 0;
+  for (let dcx = -5; dcx <= 5 && genCount < 4; dcx++) {
+    for (let dcz = -5; dcz <= 5 && genCount < 4; dcz++) {
+      const cx = pcx + dcx;
+      const cz = pcz + dcz;
+      if (!chunks.has(chunkKey(cx, cz))) {
+        const data = generateChunkData(cx, cz);
+        chunks.set(chunkKey(cx, cz), { data: data, mesh: null });
+        genCount++;
+      }
+    }
+  }
+  
+  // Build meshes for chunks within 4 (max 2 per frame)
+  let meshCount = 0;
+  for (let dcx = -4; dcx <= 4 && meshCount < 2; dcx++) {
+    for (let dcz = -4; dcz <= 4 && meshCount < 2; dcz++) {
+      const cx = pcx + dcx;
+      const cz = pcz + dcz;
+      const chunk = getChunk(cx, cz);
+      if (!chunk || chunk.mesh) continue;
+      
+      // Check if 4 neighbors have data
+      const hasNeighbors = 
+        getChunk(cx - 1, cz) && getChunk(cx + 1, cz) &&
+        getChunk(cx, cz - 1) && getChunk(cx, cz + 1);
+      
+      if (hasNeighbors) {
+        buildChunkMesh(cx, cz);
+        meshCount++;
+      }
+    }
+  }
+  
+  // Remove chunks farther than 7
+  for (const [key, chunk] of chunks) {
+    const [cxStr, czStr] = key.split(',');
+    const cx = parseInt(cxStr);
+    const cz = parseInt(czStr);
+    
+    const dist = Math.max(Math.abs(cx - pcx), Math.abs(cz - pcz));
+    if (dist > 7) {
+      if (chunk.mesh) {
+        scene.remove(chunk.mesh);
+        chunk.mesh.geometry.dispose();
+        const mi = chunkMeshes.indexOf(chunk.mesh);
+        if (mi !== -1) chunkMeshes.splice(mi, 1);
+      }
+      chunks.delete(key);
+    }
+  }
+}
+
+// Main loop
+function gameLoop() {
+  requestAnimationFrame(gameLoop);
+  
+  const now = performance.now();
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  
+  // Clamp dt to avoid huge jumps
+  dt = Math.min(dt, 0.05);
+  
+  updateChunks();
+  update(dt);
+  
+  renderer.render(scene, camera);
+}
+
+// Resize handler
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Start
+gameLoop();
+```
+
+Wait, I realize there are several issues I need to fix:
+
+1. The `collides` function needs to be more efficient. Currently it checks every block in the player's bounding box. This should be fine for a simple implementation.
+
+2. The spawn logic: I'm generating chunk (0,0) which contains position (8,8). But I'm also calling `getColumnHeight(8,8)` which uses fractal noise. This should give the same result as what's stored in the chunk data.
+
+3. The `getBlock` function: I need to make sure it handles negative coordinates correctly. `Math.floor(wx / CHUNK_X)` should work for negative values since `Math.floor(-1/16) = Math.floor(-0.0625) = -1`.
+
+Wait, actually that's wrong. If wx = -1, then cx = Math.floor(-1/16) = Math.floor(-0.0625) = -1. Then lx = wx - cx * CHUNK_X = -1 - (-1)*16 = -1 + 16 = 15. That's correct!
+
+If wx = 0, then cx = Math.floor(0/16) = 0. lx = 0 - 0 = 0. Correct.
+
+If wx = 15, then cx = Math.floor(15/16) = 0. lx = 15. Correct.
+
+If wx = 16, then cx = Math.floor(16/16) = 1. lx = 16 - 16 = 0. Correct.
+
+Good, the negative coordinate handling works.
+
+4. I need to make sure the raycaster works correctly. The `intersectObjects` method should return intersections sorted by distance. The first intersection is the closest one.
+
+5. One issue: when I call `getTargetInfo()` in the `update` function, I'm doing a raycast every frame. This is necessary for the outline, but it might be expensive. For a simple game, it should be fine.
+
+6. Another issue: the `breakBlock` and `placeBlock` functions call `getTargetInfo()` which does a raycast. But the player might have moved slightly since the last frame. This should be fine since the raycast is done from the current camera position.
+
+Let me also think about potential bugs:
+
+- When placing a block, I check if it overlaps the player. The check uses `info.px + 1 > playerMinX` etc. This is correct because the block occupies `[px, px+1] x [py, py+1] x [pz, pz+1]`.
+
+- When the player is standing on the edge of a chunk, the collision detection might miss blocks in adjacent chunks. But since I'm using `getBlock` which looks up the correct chunk, this should be fine.
+
+- The `collides` function iterates over all blocks in the player's bounding box. The bounding box is at most 2x3x2 blocks (since the player is 0.6 wide, 1.8 tall, 0.6 deep). So at most 12 blocks are checked. This is very fast.
+
+I think the code is mostly correct. Let me now put it all together into a single HTML file.
+
+Actually, wait. I just realized there might be an issue with the `FACES` definition. Let me double-check the winding order.
+
+For the top face (+Y), looking from above:
+- Vertices: (0,1,0), (1,1,0), (1,1,1), (0,1,1)
+- Triangle 1: (0,1,0) -> (1,1,0) -> (1,1,1)
+- Triangle 2: (0,1,0) -> (1,1,1) -> (0,1,1)
+
+When viewed from +Y (looking down):
+- (0,0) is at bottom-left of screen
+- (1,0) is at bottom-right
+- (1,1) is at top-right
+- (0,1) is at top-left
+
+Triangle 1: bottom-left -> bottom-right -> top-right. This goes clockwise when viewed from above! That's wrong for Three.js (which expects CCW).
+
+Hmm, let me reconsider. In Three.js, the default `frontFaceDirection` is `THREE.FrontFaceDirection.CCW` (counter-clockwise). This means that a face is visible when its vertices wind counter-clockwise when viewed from the front (i.e., from the direction the normal points).
+
+So for the top face, the normal is (0,1,0), meaning we view from +Y (above). The vertices should go CCW when viewed from above.
+
+In the XZ plane, viewed from +Y:
+- +X is to the right
+- +Z is... hmm, it depends on the coordinate system. In Three.js, the default is a right-handed coordinate system where +X is right, +Y is up, +Z is toward the viewer.
+
+So when looking from +Y (above) toward -Y (down), the XZ plane is seen with:
+- +X to the right
+- +Z toward the viewer (which in this top-down view is "down" on the screen)
+
+Wait, I'm overcomplicating this. Let me just use a different approach. Instead of worrying about the exact winding order, I can use `side: THREE.DoubleSide` on the material. But that would render both sides of each face, which wastes draw calls and might cause z-fighting.
+
+Actually, a better approach: I can just verify my winding order by checking a few faces.
+
+For the top face (+Y), normal (0,1,0). Viewed from +Y (above), in the XZ plane:
+- I'll use the convention that +X is right, +Z is "into the screen" (away from viewer) when looking from above.
+
+Wait no. When looking from +Y downward, the XZ plane is seen with:
+- +X to the right
+- +Z downward on the screen (toward the bottom of the screen)
+
+CCW in this view means going: right -> down -> left -> up (like a clock going backwards).
+
+So for the top face at position (bx, by, bz):
+- The four corners in the XZ plane are: (bx,bz), (bx+1,bz), (bx+1,bz+1), (bx,bz+1)
+- In screen coordinates (with +X right, +Z down):
+  - (bx,bz) = top-left
+  - (bx+1,bz) = top-right
+  - (bx+1,bz+1) = bottom-right
+  - (bx,bz+1) = bottom-left
+
+CCW order: top-left -> bottom-left -> bottom-right -> top-right
+That is: (bx,bz) -> (bx,bz+1) -> (bx+1,bz+1) -> (bx+1,bz)
+
+So the vertices should be:
+(bx, by+1, bz), (bx, by+1, bz+1), (bx+1, by+1, bz+1), (bx+1, by+1, bz)
+
+And the triangles: (0,1,2) and (0,2,3)
+
+Let me verify: triangle (0,1,2) = (bx,bz) -> (bx,bz+1) -> (bx+1,bz+1) in screen coords = top-left -> bottom-left -> bottom-right. That's CCW. ✓
+
+Triangle (0,2,3) = (bx,bz) -> (bx+1,bz+1) -> (bx+1,bz) = top-left -> bottom-right -> top-right. That's CCW. ✓
+
+Great! So my corrected FACES for the top face should be:
+verts: [[0,1,0], [0,1,1], [1,1,1], [1,1,0]]
+
+Let me redo all faces:
+
+**Top (+Y):** normal (0,1,0), viewed from above
+Screen: +X right, +Z down
+CCW: TL -> BL -> BR -> TR
+verts: [[0,1,0], [0,1,1], [1,1,1], [1,1,0]]
+triangles: (0,1,2), (0,2,3)
+
+**Bottom (-Y):** normal (0,-1,0), viewed from below
+When looking from -Y upward, the XZ plane is seen with:
+- +X to the LEFT (mirrored compared to viewing from above)
+- +Z still "into the screen" direction... 
+
+Hmm, actually when you flip to the other side, the apparent handedness changes. Let me think about it differently.
+
+When viewing from -Y (below, looking up), I'm on the opposite side of the face. The XZ plane now appears mirrored in X. So:
+- +X appears to the LEFT
+- +Z appears to... let me think. If I'm below the XZ plane looking up, +Z (which was "into the screen" from above) is now "out of the screen" from below. In screen terms, +Z is toward the TOP of the screen.
+
+Wait, I think I'm overcomplicating this. Let me use a simpler mental model.
+
+For a face with normal N, I need the vertices to wind CCW when projected onto the plane perpendicular to N, viewed from the N direction.
+
+For the bottom face, N = (0,-1,0). I'm looking from -Y toward +Y. The face lies in the XZ plane at Y = by.
+
+In this view:
+- The X axis: since I'm looking from below, +X is to my LEFT (it's been flipped)
+- The Z axis: +Z is AWAY from me (into the screen)
+
+So in screen coordinates:
+- Screen-right = -X direction
+- Screen-up = -Z direction (since +Z is away)
+
+Hmm, this is getting confusing. Let me try a different approach: I'll just use the right-hand rule.
+
+For a face with normal pointing toward me, I want the vertices to go CCW. Equivalently, if I curl my fingers in the direction of the vertex sequence, my thumb should point toward me (in the normal direction).
+
+**Bottom face:** N = (0,-1,0) pointing toward me (I'm below).
+Curl fingers: the sequence should make my thumb point DOWN (toward me, in the -Y direction).
+
+If I'm below looking up, and I want my thumb to point down (toward me):
+- My fingers should curl... let me think of it as: starting from some point, going in a direction that makes the thumb point down.
+
+Actually, let me just use a concrete example. Consider the bottom face of a unit cube at origin, with corners:
+A=(0,0,0), B=(1,0,0), C=(1,0,1), D=(0,0,1)
+
+Normal is (0,-1,0) (pointing down, toward me since I'm below).
+
+I need to order A,B,C,D such that when I trace the path, my right hand's fingers follow the path and my thumb points down (toward me).
+
+If I go A -> D -> C -> B:
+A=(0,0,0) -> D=(0,0,1): moving in +Z direction
+D=(0,0,1) -> C=(1,0,1): moving in +X direction
+C=(1,0,1) -> B=(1,0,0): moving in -Z direction
+
+Using right-hand rule: if I curl my fingers from +Z to +X (in the XZ plane), my thumb points... let me see. In the XZ plane (with Y up), going from +Z to +X is a clockwise rotation (when viewed from +Y). But I'm viewing from -Y, so it appears counter-clockwise. And my thumb would point in the -Y direction (down, toward me). ✓
+
+So the correct order for the bottom face is: A -> D -> C -> B, i.e.:
+(0,0,0) -> (0,0,1) -> (1,0,1) -> (1,0,0)
+verts: [[0,0,0], [0,0,1], [1,0,1], [1,0,0]]
+triangles: (0,1,2), (0,2,3)
+
+This matches what I had earlier! Good.
+
+**North face (-Z):** N = (0,0,-1), I'm at -Z looking toward +Z.
+Face is in XY plane at Z = bz.
+
+Viewing from -Z:
+- +X is to my RIGHT
+- +Y is UP
+
+CCW in this view: right -> up -> left -> down
+Starting from bottom-left: BL -> BR -> TR -> TL
+That is: (bx,by) -> (bx+1,by) -> (bx+1,by+1) -> (bx,by+1)
+
+verts: [[0,0,0], [1,0,0], [1,1,0], [0,1,0]]
+triangles: (0,1,2), (0,2,3)
+
+Let me verify with right-hand rule: going from +X to +Y in the XY plane (viewed from -Z, which is the same as viewed from +Z with X flipped... no wait, I'm at -Z looking toward +Z, so +X is to my right and +Y is up).
+
+Curling fingers from +X to +Y: this is a CCW rotation in the XY plane (viewed from -Z). Thumb points in -Z direction (toward me). ✓
+
+**South face (+Z):** N = (0,0,1), I'm at +Z looking toward -Z.
+Face is in XY plane at Z = bz+1.
+
+Viewing from +Z:
+- +X is to my LEFT (flipped!)
+- +Y is UP
+
+CCW in this view: left -> up -> right -> down
+Starting from bottom-right (which is screen-left in this view): 
+Actually, let me just use the right-hand rule directly.
+
+Going around the face, I want my thumb to point in +Z direction (toward me).
+
+In the XY plane, with +X to my left and +Y up:
+If I go (bx,by) -> (bx,by+1) -> (bx+1,by+1) -> (bx+1,by):
+- (bx,by) to (bx,by+1): moving in +Y direction (up)
+- (bx,by+1) to (bx+1,by+1): moving in +X direction (to my left)
+- (bx+1,by+1) to (bx+1,by): moving in -Y direction (down)
+
+Curling fingers from +Y to +X (in the XY plane, viewed from +Z where +X is left): this is... +Y is up, +X is left. Going from up to left is a CCW rotation. Thumb points in +Z (toward me). ✓
+
+So: verts: [[0,0,1], [0,1,1], [1,1,1], [1,0,1]]
+triangles: (0,1,2), (0,2,3)
+
+This matches what I had! Great.
+
+**West face (-X):** N = (-1,0,0), I'm at -X looking toward +X.
+Face is in YZ plane at X = bx.
+
+Viewing from -X:
+- +Y is UP
+- +Z is to my RIGHT
+
+CCW: up -> right -> down -> left
+Starting from bottom-left: BL -> TL -> TR -> BR
+In YZ coords: (bz,by) -> (bz,by+1) -> (bz+1,by+1) -> (bz+1,by)
+Wait, that doesn't seem right. Let me use the right-hand rule.
+
+I want my thumb to point in -X direction (toward me, since I'm at -X).
+
+In the YZ plane, with +Y up and +Z to my right:
+If I go (bz,by) -> (bz+1,by) -> (bz+1,by+1) -> (bz,by+1):
+- (bz,by) to (bz+1,by): moving in +Z direction (right)
+- (bz+1,by) to (bz+1,by+1): moving in +Y direction (up)
+- (bz+1,by+1) to (bz,by+1): moving in -Z direction (left)
+
+Curling from +Z to +Y: in the YZ plane (viewed from -X), +Z is right and +Y is up. Going from right to up is CCW. Thumb points in -X (toward me). ✓
+
+So: verts: [[0,0,0], [0,0,1], [0,1,1], [0,1,0]]
+Wait, that's not right either. Let me be more careful.
+
+The face is at X = bx (the west face of the block). The four corners are:
+- (bx, by, bz)
+- (bx, by, bz+1)
+- (bx, by+1, bz+1)
+- (bx, by+1, bz)
+
+In the YZ plane (at X = bx), with +Y up and +Z to my right (since I'm viewing from -X):
+- (bz, by) = bottom-left
+- (bz+1, by) = bottom-right
+- (bz+1, by+1) = top-right
+- (bz, by+1) = top-left
+
+CCW: BL -> BR -> TR -> TL
+That is: (bz,by) -> (bz+1,by) -> (bz+1,by+1) -> (bz,by+1)
+In 3D: (bx,by,bz) -> (bx,by,bz+1) -> (bx,by+1,bz+1) -> (bx,by+1,bz)
+
+Relative to block origin: [[0,0,0], [0,0,1], [0,1,1], [0,1,0]]
+triangles: (0,1,2), (0,2,3)
+
+This matches what I had! ✓
+
+**East face (+X):** N = (1,0,0), I'm at +X looking toward -X.
+Face is in YZ plane at X = bx+1.
+
+Viewing from +X:
+- +Y is UP
+- +Z is to my LEFT (flipped!)
+
+Using right-hand rule: thumb should point in +X direction (toward me).
+
+In YZ plane, +Y up, +Z to my left:
+If I go (bz,by) -> (bz,by+1) -> (bz+1,by+1) -> (bz+1,by):
+- (bz,by) to (bz,by+1): +Y (up)
+- (bz,by+1) to (bz+1,by+1): +Z (to my left)
+- (bz+1,by+1) to (bz+1,by): -Y (down)
+
+Curling from +Y to +Z: in the YZ plane (viewed from +X), +Y is up and +Z is left. Going from up to left is CCW. Thumb points in +X (toward me). ✓
+
+So: verts: [[1,0,0], [1,1,0], [1,1,1], [1,0,1]]
+triangles: (0,1,2), (0,2,3)
+
+This matches what I had! ✓
+
+OK so all my face definitions are correct. Let me now finalize the code.
+
+Actually, I just realized I have a bug in the `collides` function. The player's feet are at `player.y`, and the head is at `player.y + PLAYER_HEIGHT`. But when I do `Math.floor(maxY - 0.001)`, I'm computing the highest block row that the player overlaps. Let me verify:
+
+If player.y = 5.2 and PLAYER_HEIGHT = 1.8:
+- minY = 5.2, maxY = 7.0
+- startY = Math.floor(5.2) = 5
+- endY = Math.floor(7.0 - 0.001) = Math.floor(6.999) = 6
+
+So we check blocks at y=5 and y=6. The player's body spans from y=5.2 to y=7.0. Block y=5 spans [5,6) and block y=6 spans [6,7). The player overlaps both. ✓
+
+If player.y = 5.0 exactly:
+- minY = 5.0, maxY = 6.8
+- startY = Math.floor(5.0) = 5
+- endY = Math.floor(6.8 - 0.001) = Math.floor(6.799) = 6
+
+We check y=5 and y=6. The player's feet are exactly at y=5.0, which is the top of block y=4 and the bottom of block y=5. Since the player is AT y=5.0 (feet touching the top of block y=4), we should NOT be colliding with block y=4 (the player is above it). And we ARE overlapping block y=5 (the player's body starts at y=5.0 which is the bottom of block y=5). So checking y=5 and y=6 is correct. ✓
+
+But wait, what if the player is standing ON TOP of a block? Like player.y = 6.0 exactly, standing on block y=5 (which has its top at y=6). Then:
+- minY = 6.0, maxY = 7.8
+- startY = 6, endY = 7
+
+We check blocks at y=6 and y=7. The player is NOT overlapping block y=5 (their feet are at y=6.0 which is the top of block y=5 / bottom of block y=6). So we correctly don't collide with the block they're standing on. ✓
+
+Great, the collision detection seems correct.
+
+Now let me think about one more potential issue: when the player is between chunks, the `getBlock` function needs to look up the correct chunk. For example, if the player is at x=15.5 (in chunk 0, local x=15) and we check the block at x=16 (in chunk 1, local x=0), the function should correctly identify chunk 1.
+
+Let me verify: wx=16, cx = Math.floor(16/16) = 1. lx = 16 - 1*16 = 0. So we look up chunk (1, cz) at local position (0, ..., ...). Correct! ✓
+
+I think the code is ready. Let me put it all together now.
+
+One more thing: I need to handle the case where the player spawns before any chunks have been generated (other than the initial one). In my current code, I generate chunk (0,0) during initialization and spawn the player on top of it. During the first few frames, `updateChunks` will generate more surrounding chunks. The player should be able to walk around without falling through the ground as long as the chunk under their feet exists.
+
+Since I spawn at (8, 8) which is in chunk (0,0), and that chunk is generated immediately, the player should be fine. As they walk, new chunks will be generated ahead of them.
+
+Alright, I'm confident the code is correct. Let me write the final version.
+
+Oh wait, one more issue. In the `generateChunkData` function, I'm computing `H = getColumnHeight(wx, wz)` for each column. But I'm also using `H` later in the tree placement section. The problem is that `H` might be different from what was used during the initial column fill (if I recompute it). But since `getColumnHeight` is deterministic (same input always gives same output), recomputing it should give the same value. So there's no inconsistency.
+
+Actually, there IS a subtle issue. In the column fill section, I use `H` to determine which blocks are air and which are solid. But then in the cave carving section, I also use `H` to limit the range of y values. And in the tree section, I use `H` again. Since `getColumnHeight` is deterministic, all these uses of `H` are consistent. ✓
+
+One last thing: the spec says "y 0 = unbreakable stone". In my `breakBlock` function, I check `if (info.by === 0) return;` to prevent breaking the bedrock. This is correct.
+
+OK I'm now truly ready to write the final file. Let me also add a few minor improvements:
+- Make the crosshair slightly smaller
+- Add a subtle shadow effect to the hotbar
+- Make the overlay text more readable
+
+Let me write it all out now.

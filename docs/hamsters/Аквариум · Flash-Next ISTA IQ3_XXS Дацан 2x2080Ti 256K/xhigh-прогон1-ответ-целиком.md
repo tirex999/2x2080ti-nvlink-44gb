@@ -1,0 +1,804 @@
+# 🐠 3D Аквариум — один файл, готовый к запуску
+
+Ниже — полная реализация: процедурные рыбки с чешуёй и полосами (Canvas-текстуры), стайный ИИ, корм с гравитацией, каустические блики на песке, стеклянный резервуар на подставке и консоль управления.
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>АКВАРИУМ · живая 3D система</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --abyss:#02090f; --deep:#0a2a3f; --steel:#0d2130;
+  --aqua:#63e8d4; --aqua-dim:#2fb2a6; --sky:#7fc9ff; --coral:#ff7a59; --sand:#e8d7b6;
+  --ink:#e9f7fb; --muted:#8db0c1; --line:rgba(99,232,212,.18);
+  --panel:linear-gradient(160deg, rgba(9,32,45,.82), rgba(4,17,27,.72));
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  font-family:'Manrope',system-ui,sans-serif;color:var(--ink);overflow:hidden;
+  background:radial-gradient(130% 100% at 50% -12%, #17608a 0%, #0b3049 34%, #05182a 66%, #01070d 100%);
+}
+canvas{display:block}
+#scene{position:fixed;inset:0;cursor:crosshair}
+
+/* ——— атмосферные слои ——— */
+.caustics{position:fixed;inset:-25%;pointer-events:none;opacity:.16;filter:blur(7px);mix-blend-mode:screen;z-index:2;
+  background-image:
+    repeating-linear-gradient(62deg, rgba(150,255,238,.6) 0 2px, transparent 2px 27px),
+    repeating-linear-gradient(-56deg, rgba(120,215,255,.45) 0 2px, transparent 2px 36px);
+  animation:drift 26s linear infinite alternate}
+@keyframes drift{to{transform:translate3d(70px,-48px,0) scale(1.06)}}
+.waterline{position:fixed;top:0;left:0;right:0;height:150px;pointer-events:none;z-index:2;
+  background:linear-gradient(180deg, rgba(130,225,255,.22), rgba(130,225,255,0) 78%)}
+.vignette{position:fixed;inset:0;pointer-events:none;z-index:3;
+  background:radial-gradient(75% 65% at 50% 45%, transparent 40%, rgba(1,7,12,.62) 100%)}
+.grain{position:fixed;inset:0;pointer-events:none;z-index:4;opacity:.055;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E")}
+
+/* ——— панели ——— */
+.panel{position:fixed;z-index:10;background:var(--panel);border:1px solid var(--line);
+  border-radius:3px 20px 3px 20px;backdrop-filter:blur(16px) saturate(1.35);
+  box-shadow:0 40px 70px -38px rgba(0,0,0,.95), inset 0 1px 0 rgba(255,255,255,.07)}
+
+.console{top:22px;left:22px;width:min(352px,84vw);padding:20px 22px 18px;
+  animation:slideL .9s cubic-bezier(.16,.9,.24,1) both .15s}
+@keyframes slideL{from{opacity:0;transform:translateX(-26px)}}
+.eyebrow{display:flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;
+  font-size:9.5px;letter-spacing:.24em;text-transform:uppercase;color:var(--muted)}
+.pulse{width:6px;height:6px;border-radius:50%;background:var(--aqua);box-shadow:0 0 10px var(--aqua);animation:blink 2.4s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
+h1{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(34px,4.6vw,50px);
+  line-height:.88;letter-spacing:-.035em;margin:10px 0 2px}
+h1 em{font-style:normal;color:var(--aqua)}
+.sub{font-size:13px;color:var(--muted);line-height:1.45;margin:0 0 14px;max-width:33ch}
+.sub b{color:var(--ink);font-weight:700}
+.rule{height:1px;background:linear-gradient(90deg,var(--line),transparent);margin:14px 0 12px}
+.keys{display:grid;gap:7px;margin-bottom:14px}
+.keys div{display:flex;align-items:center;gap:9px;font-size:12px;color:#c3dbe6}
+kbd{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;color:#0a2230;
+  background:linear-gradient(180deg,#d9f6f0,#9fded4);border-radius:5px;padding:3px 7px;
+  box-shadow:0 2px 0 rgba(99,232,212,.35);letter-spacing:.04em}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.btn{font-family:'Manrope',sans-serif;font-weight:700;font-size:12.5px;color:#e2f7f4;cursor:pointer;
+  background:linear-gradient(180deg, rgba(41,104,116,.9), rgba(12,36,48,.92));
+  border:1px solid var(--line);border-radius:9px;padding:11px 12px;display:flex;align-items:center;gap:8px;
+  transition:transform .18s cubic-bezier(.2,.9,.2,1), box-shadow .22s, border-color .22s, background .22s}
+.btn svg{width:14px;height:14px;flex:none;opacity:.85}
+.btn:hover{transform:translateY(-2px);border-color:rgba(99,232,212,.6);box-shadow:0 10px 24px -10px rgba(99,232,212,.55)}
+.btn:active{transform:translateY(0) scale(.97)}
+.btn.off{background:linear-gradient(180deg, rgba(126,52,34,.85), rgba(48,18,16,.92));border-color:rgba(255,122,89,.45);color:#ffd8c9}
+
+.stats{top:22px;right:22px;width:196px;padding:16px 18px 14px;
+  animation:slideR .9s cubic-bezier(.16,.9,.24,1) both .3s}
+@keyframes slideR{from{opacity:0;transform:translateX(26px)}}
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;border-bottom:1px dashed rgba(141,176,193,.16)}
+.stat:last-of-type{border-bottom:0}
+.stat span{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+.stat b{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:20px;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;transition:color .3s}
+.stat b.bump{animation:bump .45s cubic-bezier(.2,1.4,.3,1)}
+@keyframes bump{0%{transform:scale(1)}40%{transform:scale(1.28);color:var(--aqua)}100%{transform:scale(1)}}
+#fpsVal{color:var(--aqua)}
+#spark{width:100%;height:30px;margin-top:8px;display:block;opacity:.9}
+
+.legend{left:22px;bottom:22px;padding:13px 16px;display:flex;flex-wrap:wrap;gap:9px 14px;max-width:400px;
+  animation:slideL .9s cubic-bezier(.16,.9,.24,1) both .45s}
+.chip{display:flex;align-items:center;gap:7px;font-family:'JetBrains Mono',monospace;font-size:9.5px;
+  letter-spacing:.1em;text-transform:uppercase;color:#a8c8d6;transition:color .2s, transform .2s}
+.chip:hover{color:var(--ink);transform:translateY(-2px)}
+.chip i{width:11px;height:11px;border-radius:3px;display:block;box-shadow:0 0 12px -2px currentColor}
+
+.hintbar{position:fixed;right:22px;bottom:22px;z-index:10;font-family:'JetBrains Mono',monospace;
+  font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#7fa3b5;text-align:right;line-height:1.9}
+.hintbar b{color:var(--aqua);font-weight:700}
+
+/* ——— отклик на действия ——— */
+.ripple{position:fixed;width:16px;height:16px;border-radius:50%;pointer-events:none;z-index:9;
+  border:1px solid var(--aqua);transform:translate(-50%,-50%);animation:rip .75s ease-out forwards}
+.ripple.eat{border-color:var(--coral)}
+@keyframes rip{0%{transform:translate(-50%,-50%) scale(.35);opacity:1}100%{transform:translate(-50%,-50%) scale(3.4);opacity:0}}
+#tip{position:fixed;z-index:12;pointer-events:none;opacity:0;transform:translate(-50%,-140%) translateY(6px);
+  transition:opacity .18s, transform .18s;background:rgba(4,20,30,.9);border:1px solid var(--line);
+  border-radius:3px 12px 3px 12px;padding:8px 12px;font-size:11.5px;white-space:nowrap;backdrop-filter:blur(8px)}
+#tip.on{opacity:1;transform:translate(-50%,-140%)}
+#tip b{font-family:'Bricolage Grotesque',sans-serif;font-size:13px}
+#tip i{font-style:normal;font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--muted);letter-spacing:.12em}
+#toasts{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:13;display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+  padding:9px 16px;border-radius:20px;background:rgba(6,26,38,.9);border:1px solid var(--line);color:#d7f2ee;
+  animation:tIn .4s cubic-bezier(.2,1.2,.3,1) both, tOut .5s ease-in forwards 2.1s;backdrop-filter:blur(10px)}
+@keyframes tIn{from{opacity:0;transform:translateY(14px)}}
+@keyframes tOut{to{opacity:0;transform:translateY(-10px)}}
+
+#splash{position:fixed;inset:0;z-index:40;background:#01070d;display:grid;place-items:center;
+  transition:opacity .9s ease .25s, visibility .9s}
+#splash.gone{opacity:0;visibility:hidden}
+#splash h2{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(40px,10vw,110px);
+  letter-spacing:-.05em;margin:0;color:#0f3446}
+#splash .bar{width:min(320px,60vw);height:2px;background:rgba(99,232,212,.18);margin-top:18px;overflow:hidden}
+#splash .bar i{display:block;height:100%;width:0;background:var(--aqua);animation:fill 1.1s cubic-bezier(.4,.1,.2,1) forwards}
+@keyframes fill{to{width:100%}}
+#splash p{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.3em;text-transform:uppercase;color:#2f6b80;margin-top:14px}
+
+@media (max-width:860px){
+  .legend,.hintbar{display:none}
+  .console{width:calc(100vw - 28px);left:14px;top:14px;padding:14px 16px}
+  .stats{right:14px;top:auto;bottom:14px;width:150px;padding:12px 14px}
+  .keys{display:none}
+  h1{font-size:30px}
+}
+</style>
+</head>
+<body>
+<div id="scene"></div>
+<div class="waterline"></div><div class="caustics"></div><div class="vignette"></div><div class="grain"></div>
+
+<header class="panel console">
+  <div class="eyebrow"><span class="pulse"></span> Three.js r128 · живая система</div>
+  <h1>АКВА<em>РИУМ</em></h1>
+  <p class="sub">Тропическая экосистема с <b>стайным ИИ</b>: рыбы держат дистанцию, отражаются от стекла и бросаются к корму, вырастая после каждой порции.</p>
+  <div class="rule"></div>
+  <div class="keys">
+    <div><kbd>ЛКМ</kbd> бросить корм в воду</div>
+    <div><kbd>ЛКМ&nbsp;+&nbsp;тянуть</kbd> вращать камеру</div>
+    <div><kbd>ПКМ</kbd> панорама · <kbd>колесо</kbd> зум 10–60</div>
+    <div><kbd>F</kbd> рыба <kbd>B</kbd> пузыри <kbd>L</kbd> свет</div>
+  </div>
+  <div class="btns">
+    <button class="btn" id="bFish"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12c4-6 12-6 16 0-4 6-12 6-16 0z"/><circle cx="8" cy="11" r="1" fill="currentColor"/></svg>Добавить рыбку</button>
+    <button class="btn" id="bBub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="9" r="4"/><circle cx="16" cy="15" r="3"/><circle cx="8" cy="18" r="2"/></svg>Больше пузырей</button>
+    <button class="btn" id="bLight"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg><span>Свет: вкл</span></button>
+    <button class="btn" id="bFeed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 14c3-7 13-7 16 0"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="19" r="1.4"/></svg>Покормить</button>
+  </div>
+</header>
+
+<section class="panel stats">
+  <div class="stat"><span>Рыбы</span><b id="sFish">0</b></div>
+  <div class="stat"><span>Корм</span><b id="sFood">0</b></div>
+  <div class="stat"><span>Пузыри</span><b id="sBub">0</b></div>
+  <div class="stat"><span>Съедено</span><b id="sEaten">0</b></div>
+  <div class="stat"><span>FPS</span><b id="fpsVal">60</b></div>
+  <canvas id="spark" width="172" height="30"></canvas>
+</section>
+
+<aside class="panel legend" id="legend"></aside>
+
+<div class="hintbar">Клик по воде — <b>корм</b><br>Наведи курсор на рыбу — <b>паспорт</b></div>
+<div id="tip"></div>
+<div id="toasts"></div>
+<div id="splash"><div style="text-align:center"><h2>АКВАРИУМ</h2><div class="bar"><i></i></div><p>наполняем водой…</p></div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+"use strict";
+/* ═══════════ КОНСТАНТЫ ═══════════ */
+const HX=18, HY=12, HZ=10;          // полуразмеры бака 36×24×20
+const FLOOR=-11.55;
+const SCHEMES=[
+ {name:'Оранжевая',    base:'#ff7a2f', deep:'#b23c0b', accent:'#fff4e4', belly:'#ffd9a8'},
+ {name:'Синяя',        base:'#2f6fe0', deep:'#123a80', accent:'#ffd84d', belly:'#bcd7ff'},
+ {name:'Жёлто-красная',base:'#ffc63f', deep:'#c92f22', accent:'#e0392b', belly:'#ffe9a8'},
+ {name:'Фиолетовая',   base:'#9a5cff', deep:'#48279c', accent:'#ffd0f0', belly:'#d9c6ff'},
+ {name:'Красная',      base:'#e0392b', deep:'#75130f', accent:'#ffb36b', belly:'#ffc4ae'},
+ {name:'Зелёная',      base:'#3fbf6f', deep:'#115a31', accent:'#e7ff5c', belly:'#bff5cf'},
+ {name:'Розовая',      base:'#ff77b9', deep:'#9c2160', accent:'#ffe0ef', belly:'#ffc8e2'},
+ {name:'Золотая',      base:'#f0b429', deep:'#835308', accent:'#fff1c1', belly:'#ffe19a'}
+];
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+
+let scene,camera,renderer,controls,raycaster,clock,envRT;
+let glassBox, waterMesh, floorMat, dirLight, ambLight, ptA, ptB, lightOn=true;
+const fishArray=[], fishBodies=[], foods=[], bubbles=[], plants=[];
+const stats={fish:0,food:0,bub:0,eaten:0};
+const tmpV=new THREE.Vector3(), tmpV2=new THREE.Vector3();
+
+/* ═══════════ ПРОЦЕДУРНЫЕ ТЕКСТУРЫ ═══════════ */
+function fishTexture(s){
+  const c=document.createElement('canvas'); c.width=512; c.height=256; const x=c.getContext('2d');
+  const g=x.createLinearGradient(0,0,0,256);
+  g.addColorStop(0,s.deep); g.addColorStop(.42,s.base); g.addColorStop(1,s.belly);
+  x.fillStyle=g; x.fillRect(0,0,512,256);
+  const mode=Math.floor(Math.random()*3);
+  x.save();
+  if(mode===0){                                   // вертикальные полосы (клоун/ангел)
+    const n=3+Math.floor(Math.random()*3);
+    for(let i=0;i<n;i++){
+      const px=(i+.5)/n*512+rnd(-24,24), w=rnd(30,64);
+      x.fillStyle=s.accent; x.globalAlpha=.85;
+      x.beginPath();
+      for(let y=0;y<=256;y+=16) x.lineTo(px+Math.sin(y*.03)*14+(y/256-.5)*30, y);
+      for(let y=256;y>=0;y-=16) x.lineTo(px+w+Math.sin(y*.03)*14+(y/256-.5)*30, y);
+      x.closePath(); x.fill();
+    }
+  } else if(mode===1){                            // продольные полосы
+    for(let i=0;i<4;i++){
+      const py=rnd(40,215);
+      x.strokeStyle=i%2?s.accent:s.deep; x.globalAlpha=.55; x.lineWidth=rnd(8,20);
+      x.beginPath(); x.moveTo(0,py);
+      for(let px=0;px<=512;px+=32) x.lineTo(px, py+Math.sin(px*.012+i)*14);
+      x.stroke();
+    }
+  } else {                                        // пятна / чешуйчатый узор
+    x.fillStyle=s.accent; x.globalAlpha=.5;
+    for(let i=0;i<70;i++){ const px=rnd(0,512), py=rnd(20,235);
+      x.beginPath(); x.ellipse(px,py,rnd(6,20),rnd(4,12),rnd(0,3),0,7); x.fill(); }
+  }
+  x.restore();
+  x.globalAlpha=.14; x.strokeStyle='#ffffff'; x.lineWidth=1;   // отблеск чешуи
+  for(let i=0;i<220;i++){ const px=rnd(0,512), py=rnd(0,256);
+    x.beginPath(); x.arc(px,py,rnd(5,11),.4,2.6); x.stroke(); }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=THREE.RepeatWrapping; t.encoding=THREE.sRGBEncoding; t.anisotropy=4;
+  return t;
+}
+function sandTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  x.fillStyle='#d7bf94'; x.fillRect(0,0,512,512);
+  for(let i=0;i<30000;i++){ const v=Math.random();
+    x.fillStyle = v>.6?`rgba(255,240,214,${rnd(.15,.5)})` : `rgba(112,88,58,${rnd(.08,.35)})`;
+    x.fillRect(Math.random()*512,Math.random()*512,rnd(1,2.4),rnd(1,2.4)); }
+  x.strokeStyle='rgba(120,96,62,.16)'; x.lineWidth=2;
+  for(let i=0;i<26;i++){ x.beginPath();
+    for(let px=0;px<=512;px+=20) x.lineTo(px, i*20+Math.sin(px*.03+i)*9); x.stroke(); }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(3,2); t.encoding=THREE.sRGBEncoding; t.anisotropy=8;
+  return t;
+}
+function causticsTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  x.fillStyle='#000'; x.fillRect(0,0,512,512);
+  x.shadowColor='rgba(160,255,235,.9)'; x.shadowBlur=14;
+  for(let i=0;i<170;i++){
+    x.strokeStyle=`rgba(${150+Math.random()*80|0},255,${215+Math.random()*40|0},${rnd(.12,.34)})`;
+    x.lineWidth=rnd(1.5,5); x.beginPath();
+    const px=Math.random()*512, py=Math.random()*512;
+    x.moveTo(px,py);
+    x.bezierCurveTo(px+rnd(-70,70),py+rnd(-70,70),px+rnd(-90,90),py+rnd(-90,90),px+rnd(-60,60),py+rnd(-60,60));
+    x.stroke();
+  }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(2,2); return t;
+}
+function envTexture(){
+  const c=document.createElement('canvas'); c.width=512; c.height=256; const x=c.getContext('2d');
+  const g=x.createLinearGradient(0,0,0,256);
+  g.addColorStop(0,'#cfeeff'); g.addColorStop(.35,'#4b9bc4'); g.addColorStop(.62,'#124a63'); g.addColorStop(1,'#03101a');
+  x.fillStyle=g; x.fillRect(0,0,512,256);
+  const rg=x.createRadialGradient(150,55,4,150,55,120);
+  rg.addColorStop(0,'rgba(255,255,255,.95)'); rg.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle=rg; x.fillRect(0,0,512,256);
+  const rg2=x.createRadialGradient(400,80,4,400,80,90);
+  rg2.addColorStop(0,'rgba(120,230,255,.6)'); rg2.addColorStop(1,'rgba(120,230,255,0)');
+  x.fillStyle=rg2; x.fillRect(0,0,512,256);
+  const t=new THREE.CanvasTexture(c); t.mapping=THREE.EquirectangularReflectionMapping; return t;
+}
+
+/* ═══════════ СЦЕНА ═══════════ */
+function init(){
+  scene=new THREE.Scene();
+  scene.fog=new THREE.FogExp2(0x08283c,0.0145);
+
+  camera=new THREE.PerspectiveCamera(52, innerWidth/innerHeight, .1, 400);
+  camera.position.set(24,11,33);
+
+  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true,powerPreference:'high-performance'});
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.outputEncoding=THREE.sRGBEncoding;
+  renderer.shadowMap.enabled=true;
+  renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+  document.getElementById('scene').appendChild(renderer.domElement);
+
+  try{
+    const pm=new THREE.PMREMGenerator(renderer); pm.compileEquirectangularShader();
+    envRT=pm.fromEquirectangular(envTexture()); scene.environment=envRT.texture; pm.dispose();
+  }catch(e){}
+
+  controls=new THREE.OrbitControls(camera,renderer.domElement);
+  controls.enableDamping=true; controls.dampingFactor=.06;
+  controls.minDistance=10; controls.maxDistance=60;
+  controls.maxPolarAngle=Math.PI/1.8; controls.minPolarAngle=.12;
+  controls.rotateSpeed=.75; controls.panSpeed=.7; controls.zoomSpeed=.9;
+  controls.target.set(0,0,0);
+  raycaster=new THREE.Raycaster();
+  clock=new THREE.Clock();
+
+  buildTank(); buildFloor(); buildRocks(); buildPlants(); buildLights(); buildGodrays();
+  for(let i=0;i<15;i++) addFish();
+  for(let i=0;i<30;i++) addBubble();
+  bindUI(); onResize();
+  animate();
+}
+
+/* ——— бак: стекло, рама, подставка ——— */
+function buildTank(){
+  const glassMat=new THREE.MeshPhysicalMaterial({
+    color:0xbfe9f2, transparent:true, opacity:.13, roughness:.05, metalness:0,
+    transmission:.95, ior:1.4, thickness:1.4, clearcoat:1, clearcoatRoughness:.06,
+    envMapIntensity:1.6, side:THREE.DoubleSide, depthWrite:false
+  });
+  glassBox=new THREE.Mesh(new THREE.BoxGeometry(HX*2,HY*2,HZ*2), glassMat);
+  glassBox.renderOrder=3; scene.add(glassBox);
+
+  const edges=new THREE.LineSegments(new THREE.EdgesGeometry(glassBox.geometry),
+    new THREE.LineBasicMaterial({color:0x8fe6ff, transparent:true, opacity:.35}));
+  scene.add(edges);
+
+  const frameMat=new THREE.MeshStandardMaterial({color:0x9db2bb, metalness:.9, roughness:.3});
+  const t=.42;
+  const bars=[];
+  for(const sy of [-1,1]) for(const sz of [-1,1]) bars.push([HX*2,t,t,0,sy*HY,sz*HZ]);
+  for(const sx of [-1,1]) for(const sz of [-1,1]) bars.push([t,HY*2,t,sx*HX,0,sz*HZ]);
+  for(const sx of [-1,1]) for(const sy of [-1,1]) bars.push([t,t,HZ*2,sx*HX,sy*HY,0]);
+  bars.forEach(b=>{ const m=new THREE.Mesh(new THREE.BoxGeometry(b[0],b[1],b[2]),frameMat);
+    m.position.set(b[3],b[4],b[5]); m.castShadow=true; m.receiveShadow=true; scene.add(m); });
+
+  const joint=new THREE.Mesh(new THREE.SphereGeometry(.62,14,10),frameMat);
+  for(const sx of [-1,1]) for(const sy of [-1,1]) for(const sz of [-1,1]){
+    const j=joint.clone(); j.position.set(sx*HX,sy*HY,sz*HZ); j.castShadow=true; scene.add(j);
+  }
+  const base=new THREE.Mesh(new THREE.BoxGeometry(HX*2+3.2,2,HZ*2+3.2),
+    new THREE.MeshStandardMaterial({color:0x0b1a23,metalness:.45,roughness:.55}));
+  base.position.y=-HY-1.1; base.castShadow=true; base.receiveShadow=true; scene.add(base);
+  const trim=new THREE.Mesh(new THREE.BoxGeometry(HX*2+1.6,.7,HZ*2+1.6),
+    new THREE.MeshStandardMaterial({color:0x1b3038,metalness:.7,roughness:.35}));
+  trim.position.y=HY+.3; trim.castShadow=true; scene.add(trim);
+
+  // поверхность воды
+  const wg=new THREE.PlaneGeometry(HX*2,HZ*2,44,26); wg.rotateX(-Math.PI/2);
+  waterMesh=new THREE.Mesh(wg,new THREE.MeshPhysicalMaterial({
+    color:0xa9e8ff, transparent:true, opacity:.2, roughness:.08, metalness:0,
+    transmission:.6, side:THREE.DoubleSide, depthWrite:false, envMapIntensity:1.8}));
+  waterMesh.position.y=HY-.45; waterMesh.renderOrder=2;
+  waterMesh.userData.base=wg.attributes.position.array.slice(0);
+  scene.add(waterMesh);
+}
+
+function terrainH(x,z){
+  return Math.sin(x*.34)*Math.cos(z*.42)*.5 + Math.sin(x*.9+z*.66)*.24 + Math.cos(x*.13-z*.22)*.62;
+}
+function buildFloor(){
+  const g=new THREE.PlaneGeometry(HX*2,HZ*2,72,44); g.rotateX(-Math.PI/2);
+  const p=g.attributes.position;
+  for(let i=0;i<p.count;i++) p.setY(i, terrainH(p.getX(i),p.getZ(i)));
+  g.computeVertexNormals();
+  const cau=causticsTexture();
+  floorMat=new THREE.MeshStandardMaterial({
+    map:sandTexture(), roughness:.98, metalness:.02,
+    emissive:new THREE.Color(0x2ee6c8), emissiveMap:cau, emissiveIntensity:.55
+  });
+  floorMat.userData={cau};
+  const f=new THREE.Mesh(g,floorMat); f.position.y=FLOOR; f.receiveShadow=true; scene.add(f);
+}
+function buildRocks(){
+  for(let i=0;i<8;i++){
+    const r=rnd(.9,2.4), g=new THREE.DodecahedronGeometry(r,0);
+    const p=g.attributes.position;
+    for(let k=0;k<p.count;k++) p.setXYZ(k, p.getX(k)*rnd(.8,1.25), p.getY(k)*rnd(.72,1.18), p.getZ(k)*rnd(.8,1.25));
+    g.computeVertexNormals();
+    const c=new THREE.Color().setHSL(rnd(.06,.13), rnd(.1,.24), rnd(.22,.38));
+    const m=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:c,roughness:.92,metalness:.05,flatShading:true}));
+    const x=rnd(-HX+3,HX-3), z=rnd(-HZ+2.5,HZ-2.5);
+    m.position.set(x, FLOOR+terrainH(x,z)+r*.42, z);
+    m.rotation.set(rnd(0,3),rnd(0,3),rnd(0,3));
+    m.castShadow=true; m.receiveShadow=true; scene.add(m);
+  }
+}
+function buildPlants(){
+  for(let i=0;i<12;i++){
+    const grp=new THREE.Group();
+    const hue=rnd(.26,.46), blades=4+Math.floor(Math.random()*4);
+    for(let b=0;b<blades;b++){
+      const h=rnd(2.4,6.4), lx=rnd(-1.4,1.4), lz=rnd(-1.4,1.4), pts=[];
+      for(let s=0;s<=5;s++){ const t=s/5;
+        pts.push(new THREE.Vector3(lx*t*t*1.3+Math.sin(t*3.2+b)*.28, t*h, lz*t*t*1.3+Math.cos(t*2.6+b)*.22)); }
+      const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts),14,rnd(.05,.1),5,false);
+      const m=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({
+        color:new THREE.Color().setHSL(hue,rnd(.45,.72),rnd(.24,.42)),roughness:.72,side:THREE.DoubleSide}));
+      m.castShadow=true; grp.add(m);
+    }
+    for(let r=0;r<2;r++){                       // широкие ленты-листья
+      const h=rnd(2.6,5.4), pg=new THREE.PlaneGeometry(rnd(.5,.95),h,1,7); pg.translate(0,h/2,0);
+      const p=pg.attributes.position;
+      for(let k=0;k<p.count;k++){ const u=(p.getY(k)/h);
+        p.setZ(k, Math.sin(u*2.4+r)*.5*u + p.getX(k)*.25); p.setX(k, p.getX(k)*(1-u*.4)); }
+      pg.computeVertexNormals();
+      const m=new THREE.Mesh(pg,new THREE.MeshStandardMaterial({
+        color:new THREE.Color().setHSL(hue,rnd(.5,.75),rnd(.28,.44)),roughness:.65,side:THREE.DoubleSide}));
+      m.rotation.y=rnd(0,6.3); m.castShadow=true; grp.add(m);
+    }
+    const x=rnd(-HX+2,HX-2), z=rnd(-HZ+2,HZ-2);
+    grp.position.set(x, FLOOR+terrainH(x,z)-.15, z);
+    grp.userData.phase=rnd(0,7); grp.userData.amp=rnd(.6,1.3);
+    plants.push(grp); scene.add(grp);
+  }
+}
+function buildLights(){
+  ambLight=new THREE.AmbientLight(0x404040,.4); scene.add(ambLight);
+  dirLight=new THREE.DirectionalLight(0xf2fbff,1.15);
+  dirLight.position.set(16,34,13); dirLight.castShadow=true;
+  dirLight.shadow.mapSize.set(2048,2048);
+  const s=dirLight.shadow.camera; s.left=-26;s.right=26;s.top=26;s.bottom=-26;s.near=1;s.far=110;
+  dirLight.shadow.bias=-.0008; dirLight.shadow.radius=3;
+  scene.add(dirLight); scene.add(dirLight.target);
+  ptA=new THREE.PointLight(0x2f7fff,1.1,46); ptA.position.set(-13,7,-5); scene.add(ptA);
+  ptB=new THREE.PointLight(0x1fd8d0,.85,40); ptB.position.set(13,4,6); scene.add(ptB);
+}
+function buildGodrays(){
+  for(let i=0;i<3;i++){
+    const c=new THREE.Mesh(new THREE.ConeGeometry(rnd(4.5,7.5),22,18,1,true),
+      new THREE.MeshBasicMaterial({color:0x9fe9ff,transparent:true,opacity:.05,
+        blending:THREE.AdditiveBlending,depthWrite:false,side:THREE.DoubleSide}));
+    c.position.set(rnd(-12,12),-1,rnd(-6,6)); c.rotation.z=rnd(-.1,.1); c.renderOrder=4; scene.add(c);
+  }
+}
+
+/* ═══════════ РЫБЫ ═══════════ */
+function sideFinGeo(span,chord,camber){
+  const g=new THREE.PlaneGeometry(1,1,9,4), p=g.attributes.position;
+  for(let i=0;i<p.count;i++){
+    const u=p.getX(i)+.5, v=p.getY(i)+.5, tap=1-u*.55;
+    p.setXYZ(i, u*span, Math.sin(u*Math.PI)*camber - v*.14*tap, -.12 - v*chord*tap - .38*u*u);
+  }
+  g.computeVertexNormals(); return g;
+}
+function addFish(pos){
+  const s=SCHEMES[Math.floor(Math.random()*SCHEMES.length)];
+  const mesh=new THREE.Group();
+  const tex=fishTexture(s);
+  const bodyMat=new THREE.MeshStandardMaterial({map:tex,roughness:.42,metalness:.14,
+    emissive:new THREE.Color(s.deep),emissiveIntensity:.16,envMapIntensity:.7});
+  const body=new THREE.Mesh(new THREE.SphereGeometry(1,34,22),bodyMat);
+  body.scale.set(.52,.72,1.55); body.castShadow=true; mesh.add(body);
+
+  const finMat=new THREE.MeshStandardMaterial({color:s.accent,roughness:.58,metalness:.04,
+    transparent:true,opacity:.93,side:THREE.DoubleSide,emissive:new THREE.Color(s.deep),emissiveIntensity:.14});
+
+  const tailPivot=new THREE.Group(); tailPivot.position.z=-1.3; mesh.add(tailPivot);
+  const sh=new THREE.Shape();
+  sh.moveTo(0,0);
+  sh.bezierCurveTo(-.34,.42,-.86,.74,-1.28,.84);
+  sh.bezierCurveTo(-.92,.28,-.92,-.28,-1.28,-.84);
+  sh.bezierCurveTo(-.86,-.74,-.34,-.42,0,0);
+  const tg=new THREE.ShapeGeometry(sh,16); tg.rotateY(-Math.PI/2);
+  const tp=tg.attributes.position;
+  for(let i=0;i<tp.count;i++) tp.setX(i, tp.getX(i)-.14*Math.sin(Math.abs(tp.getZ(i))*1.9));
+  const tail=new THREE.Mesh(tg,finMat); tailPivot.add(tail);
+
+  const ds=new THREE.Shape();
+  ds.moveTo(-1.05,0); ds.quadraticCurveTo(-.2,.66,.78,.06);
+  ds.lineTo(.62,-.03); ds.quadraticCurveTo(-.2,.2,-1.05,0);
+  const dg=new THREE.ShapeGeometry(ds,14); dg.rotateY(-Math.PI/2);
+  const dorsalPivot=new THREE.Group(); dorsalPivot.position.y=.58; dorsalPivot.add(new THREE.Mesh(dg,finMat));
+  mesh.add(dorsalPivot);
+
+  const as=new THREE.Shape();
+  as.moveTo(-.75,0); as.quadraticCurveTo(-.2,.36,.28,.03); as.lineTo(-.75,0);
+  const ag=new THREE.ShapeGeometry(as,10); ag.rotateY(-Math.PI/2);
+  const analPivot=new THREE.Group(); analPivot.position.set(0,-.5,-.45); analPivot.add(new THREE.Mesh(ag,finMat));
+  mesh.add(analPivot);
+
+  const pg=sideFinGeo(.85,.7,.16), pivL=new THREE.Group(), pivR=new THREE.Group();
+  pivR.position.set(.42,-.06,.34); pivR.add(new THREE.Mesh(pg,finMat));
+  pivL.position.set(-.42,-.06,.34);
+  const lFin=new THREE.Mesh(pg,finMat); lFin.scale.x=-1; pivL.add(lFin);
+  mesh.add(pivR,pivL);
+
+  const eyeM=new THREE.MeshStandardMaterial({color:0xf8fcff,roughness:.22,metalness:.06,envMapIntensity:1.4});
+  const pupM=new THREE.MeshStandardMaterial({color:0x0a1017,roughness:.12,metalness:.25,envMapIntensity:1.6});
+  for(const sd of [1,-1]){
+    const e=new THREE.Mesh(new THREE.SphereGeometry(.17,16,12),eyeM); e.position.set(.38*sd,.19,1.0); mesh.add(e);
+    const p=new THREE.Mesh(new THREE.SphereGeometry(.1,14,10),pupM); p.position.set(.43*sd,.2,1.13); mesh.add(p);
+  }
+
+  const bodyGroup=new THREE.Group(); // для внутреннего «дыхания»
+  mesh.remove(body); bodyGroup.add(body); mesh.add(bodyGroup);
+
+  const size=rnd(.6,1.2);
+  mesh.scale.setScalar(size);
+  mesh.position.copy(pos||new THREE.Vector3(rnd(-HX+4,HX-4),rnd(-6,7),rnd(-HZ+3,HZ-3)));
+  mesh.rotation.order='YXZ';
+  scene.add(mesh);
+
+  const f={
+    mesh, bodyGroup, body, tail:tailPivot, dorsal:dorsalPivot, anal:analPivot,
+    leftFin:pivL, rightFin:pivR, scheme:s,
+    velocity:new THREE.Vector3(rnd(-1,1),rnd(-.3,.3),rnd(-1,1)).normalize().multiplyScalar(rnd(2,3.4)),
+    speed:rnd(2.0,3.8), tailSpeed:rnd(4.5,9.5), phase:rnd(0,7),
+    targetFood:null, avoidanceRadius:rnd(2.6,4.6),
+    wanderDir:new THREE.Vector3(rnd(-1,1),rnd(-.3,.3),rnd(-1,1)).normalize(),
+    wanderT:rnd(.5,3), roll:0, prevYaw:0
+  };
+  body.userData.fish=f; fishBodies.push(body);
+  fishArray.push(f); stats.fish=fishArray.length; setStat('sFish',stats.fish);
+  return f;
+}
+
+function updateFish(dt,t){
+  for(let i=0;i<fishArray.length;i++){
+    const f=fishArray[i], p=f.mesh.position, st=tmpV.set(0,0,0);
+
+    f.wanderT-=dt;
+    if(f.wanderT<=0){ f.wanderDir.set(rnd(-1,1),rnd(-.35,.35),rnd(-1,1)).normalize(); f.wanderT=rnd(1.8,4.6); }
+    st.addScaledVector(f.wanderDir,.75);
+
+    const m=3.4;
+    if(p.x> HX-m) st.x-=(p.x-(HX-m))*1.5; if(p.x<-HX+m) st.x+=(-HX+m-p.x)*1.5;
+    if(p.z> HZ-m) st.z-=(p.z-(HZ-m))*1.5; if(p.z<-HZ+m) st.z+=(-HZ+m-p.z)*1.5;
+    if(p.y> HY-2.6) st.y-=(p.y-(HY-2.6))*2.0;
+    const floorY=FLOOR+terrainH(p.x,p.z)+1.4;
+    if(p.y< floorY) st.y+=(floorY-p.y)*2.2;
+    st.y+=(1.5-p.y)*.05;
+
+    for(let j=0;j<fishArray.length;j++){
+      if(j===i) continue;
+      const o=fishArray[j], dx=p.x-o.mesh.position.x, dy=p.y-o.mesh.position.y, dz=p.z-o.mesh.position.z;
+      const d2=dx*dx+dy*dy+dz*dz, R=f.avoidanceRadius;
+      if(d2<R*R && d2>1e-4){ const d=Math.sqrt(d2), k=(1-d/R)*3.4/d; st.x+=dx*k; st.y+=dy*k*.5; st.z+=dz*k; }
+    }
+
+    let best=null, bd=15;
+    for(let k=0;k<foods.length;k++){
+      const fo=foods[k], d=fo.mesh.position.distanceTo(p);
+      if(d<bd){ bd=d; best=fo; }
+    }
+    f.targetFood=best;
+    if(best){
+      st.addScaledVector(tmpV2.copy(best.mesh.position).sub(p).normalize(),4.2);
+      if(bd < .95*f.mesh.scale.x+.6) eat(f,best);
+    }
+
+    f.velocity.addScaledVector(st,dt);
+    let sp=f.velocity.length(); if(sp<1e-4){ f.velocity.set(0,0,1); sp=1; }
+    const maxS=f.speed*(best?1.75:1), minS=f.speed*.35;
+    if(sp>maxS) f.velocity.multiplyScalar(maxS/sp);
+    if(sp<minS) f.velocity.multiplyScalar(minS/sp);
+    p.addScaledVector(f.velocity,dt);
+
+    const lim={x:HX-1.1,y:[FLOOR+terrainH(p.x,p.z)+.9,HY-.9],z:HZ-1.1};
+    if(p.x>lim.x){p.x=lim.x;f.velocity.x*=-.5} if(p.x<-lim.x){p.x=-lim.x;f.velocity.x*=-.5}
+    if(p.z>lim.z){p.z=lim.z;f.velocity.z*=-.5} if(p.z<-lim.z){p.z=-lim.z;f.velocity.z*=-.5}
+    if(p.y>lim.y[1]){p.y=lim.y[1];f.velocity.y*=-.5} if(p.y<lim.y[0]){p.y=lim.y[0];f.velocity.y*=-.5}
+
+    const dir=f.velocity.clone().normalize();
+    const yaw=Math.atan2(dir.x,dir.z), pitch=Math.asin(clamp(dir.y,-1,1));
+    let turn=yaw-f.prevYaw; while(turn>Math.PI)turn-=2*Math.PI; while(turn<-Math.PI)turn+=2*Math.PI;
+    f.roll+=((-turn*2.4)-f.roll)*Math.min(1,dt*4.5); f.prevYaw=yaw;
+    f.mesh.rotation.set(-pitch,yaw,f.roll);
+
+    const sw=Math.sin(t*f.tailSpeed+f.phase);
+    f.tail.rotation.y=sw*.62; f.tail.rotation.z=Math.sin(t*f.tailSpeed*.5+f.phase)*.14;
+    const fl=Math.sin(t*f.tailSpeed*.78+f.phase*1.7);
+    f.rightFin.rotation.z=-.34-fl*.36; f.leftFin.rotation.z=.34+fl*.36;
+    f.dorsal.rotation.z=Math.sin(t*2.1+f.phase)*.09;
+    f.anal.rotation.z=Math.sin(t*f.tailSpeed*.4+f.phase+.8)*.16;
+    f.bodyGroup.position.y=Math.sin(t*1.7+f.phase)*.045;
+    f.bodyGroup.rotation.y=sw*.055;
+  }
+}
+
+/* ═══════════ КОРМ ═══════════ */
+function addFood(pos){
+  const g=new THREE.Group();
+  const mat=new THREE.MeshStandardMaterial({color:0xc9682e,roughness:.9,metalness:.02,
+    emissive:new THREE.Color(0x5c1f05),emissiveIntensity:.35});
+  for(let i=0;i<2;i++){
+    const m=new THREE.Mesh(new THREE.IcosahedronGeometry(rnd(.14,.24),0),mat);
+    m.position.set(rnd(-.15,.15),rnd(-.12,.12),rnd(-.15,.15)); m.castShadow=true; g.add(m);
+  }
+  g.position.copy(pos); scene.add(g);
+  foods.push({mesh:g, vy:rnd(-.2,-.6), spin:new THREE.Vector3(rnd(-1,1),rnd(-1,1),rnd(-1,1))});
+  stats.food=foods.length; setStat('sFood',stats.food);
+}
+function updateFood(dt){
+  for(let i=foods.length-1;i>=0;i--){
+    const f=foods[i];
+    f.vy-=3.6*dt; f.mesh.position.y+=f.vy*dt;
+    f.mesh.position.x+=Math.sin(f.mesh.position.y*1.6)*.25*dt;
+    f.mesh.rotation.x+=f.spin.x*dt; f.mesh.rotation.z+=f.spin.z*dt;
+    const ground=FLOOR+terrainH(f.mesh.position.x,f.mesh.position.z)+.12;
+    if(f.mesh.position.y<=ground){
+      for(let k=0;k<3;k++) addBubble(f.mesh.position.clone().add(new THREE.Vector3(rnd(-.3,.3),rnd(0,.4),rnd(-.3,.3))),rnd(.05,.11));
+      scene.remove(f.mesh); foods.splice(i,1);
+    }
+  }
+  stats.food=foods.length; setStat('sFood',stats.food,true);
+}
+function eat(f,food){
+  const idx=foods.indexOf(food); if(idx<0) return;
+  scene.remove(food.mesh); foods.splice(idx,1);
+  const ns=Math.min(f.mesh.scale.x*1.05,2.3); f.mesh.scale.setScalar(ns);
+  f.speed*=1.02; stats.eaten++; setStat('sEaten',stats.eaten);
+  for(let k=0;k<4;k++) addBubble(food.mesh.position.clone(),rnd(.05,.13));
+  const v=food.mesh.position.clone().project(camera);
+  ripple((v.x*.5+.5)*innerWidth,(-v.y*.5+.5)*innerHeight,'eat');
+}
+
+/* ═══════════ ПУЗЫРИ ═══════════ */
+const bubGeo=new THREE.SphereGeometry(1,14,10);
+const bubMat=new THREE.MeshPhysicalMaterial({color:0xd9f4ff,transparent:true,opacity:.3,
+  roughness:.02,metalness:0,transmission:.9,clearcoat:1,envMapIntensity:2,depthWrite:false});
+function addBubble(pos,r){
+  const s=r||rnd(.1,.36);
+  const m=new THREE.Mesh(bubGeo,bubMat); m.scale.setScalar(s);
+  m.position.copy(pos||new THREE.Vector3(rnd(-HX+2,HX-2),FLOOR+rnd(.4,3),rnd(-HZ+2,HZ-2)));
+  m.renderOrder=1; scene.add(m);
+  bubbles.push({mesh:m, rise:rnd(1.3,2.9), amp:rnd(.15,.6), freq:rnd(.8,2.2), ph:rnd(0,7)});
+  stats.bub=bubbles.length; setStat('sBub',stats.bub);
+}
+function updateBubbles(dt,t){
+  for(let i=0;i<bubbles.length;i++){
+    const b=bubbles[i];
+    b.mesh.position.y+=b.rise*dt;
+    b.mesh.position.x+=Math.sin(t*b.freq+b.ph)*b.amp*dt;
+    b.mesh.position.z+=Math.cos(t*b.freq*.8+b.ph)*b.amp*dt;
+    if(b.mesh.position.y>HY-.8){
+      b.mesh.position.set(rnd(-HX+2,HX-2),FLOOR+rnd(.3,1.6),rnd(-HZ+2,HZ-2));
+    }
+  }
+}
+
+/* ═══════════ ОКРУЖЕНИЕ В ДВИЖЕНИИ ═══════════ */
+function updatePlants(t){
+  for(let i=0;i<plants.length;i++){
+    const p=plants[i], ph=p.userData.phase, a=p.userData.amp;
+    p.rotation.x=Math.sin(t*.55+ph)*.055*a;
+    p.rotation.z=Math.cos(t*.43+ph)*.07*a;
+  }
+}
+function updateWater(dt,t){
+  const pos=waterMesh.geometry.attributes.position, base=waterMesh.userData.base;
+  for(let i=0;i<pos.count;i++){
+    const x=base[i*3], z=base[i*3+2];
+    pos.setY(i, Math.sin(x*.42+t*1.3)*.16 + Math.cos(z*.55-t*1.05)*.13 + Math.sin((x+z)*.28+t*.7)*.1);
+  }
+  pos.needsUpdate=true; waterMesh.geometry.computeVertexNormals();
+}
+function updateCaustics(dt){
+  const c=floorMat.userData.cau;
+  c.offset.x+=dt*.014; c.offset.y+=dt*.009;
+  floorMat.emissiveIntensity=.5+Math.sin(clock.elapsedTime*.6)*.12;
+}
+
+/* ═══════════ ВЗАИМОДЕЙСТВИЕ ═══════════ */
+const pointer=new THREE.Vector2(), hoverNDC=new THREE.Vector2();
+let downX=0,downY=0,downT=0,downBtn=-1,hoverFish=null,lastHover=0;
+function insideBox(p){ p.x=clamp(p.x,-HX+1.5,HX-1.5); p.y=clamp(p.y,FLOOR+1.2,HY-1.5); p.z=clamp(p.z,-HZ+1.5,HZ-1.5); return p; }
+function feedAt(nx,ny){
+  raycaster.setFromCamera(new THREE.Vector2(nx,ny),camera);
+  const hit=raycaster.intersectObject(glassBox,false);
+  let pt;
+  if(hit.length){ pt=hit[0].point.clone().addScaledVector(raycaster.ray.direction,1.6); }
+  else { pt=raycaster.ray.origin.clone().addScaledVector(raycaster.ray.direction,camera.position.length()*.55); }
+  addFood(insideBox(pt));
+  ripple((nx*.5+.5)*innerWidth,(-ny*.5+.5)*innerHeight,'');
+}
+function ripple(x,y,cls){
+  const d=document.createElement('div'); d.className='ripple '+cls;
+  d.style.left=x+'px'; d.style.top=y+'px'; document.body.appendChild(d);
+  setTimeout(()=>d.remove(),780);
+}
+function bindUI(){
+  const el=renderer.domElement;
+  el.addEventListener('contextmenu',e=>e.preventDefault());
+  el.addEventListener('pointerdown',e=>{downX=e.clientX;downY=e.clientY;downT=performance.now();downBtn=e.button;});
+  el.addEventListener('pointerup',e=>{
+    if(e.button!==0||downBtn!==0) return;
+    if(Math.hypot(e.clientX-downX,e.clientY-downY)<7 && performance.now()-downT<450)
+      feedAt((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1);
+  });
+  el.addEventListener('pointermove',e=>{ hoverNDC.set((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1); });
+
+  document.getElementById('bFish').onclick=()=>{ if(fishArray.length>=60){toast('Максимум 60 рыб');return;}
+    const f=addFish(new THREE.Vector3(rnd(-8,8),HY-3,rnd(-6,6))); toast('Новая рыба · '+f.scheme.name); };
+  document.getElementById('bBub').onclick=()=>{ for(let i=0;i<10;i++) addBubble(); toast('+10 пузырей'); };
+  document.getElementById('bFeed').onclick=()=>{ for(let i=0;i<5;i++)
+      addFood(insideBox(new THREE.Vector3(rnd(-12,12),HY-2,rnd(-7,7)))); toast('Порция корма'); };
+  const bl=document.getElementById('bLight');
+  bl.onclick=()=>{ lightOn=!lightOn;
+    dirLight.intensity=lightOn?1.15:0; ambLight.intensity=lightOn?.4:.16;
+    ptA.intensity=lightOn?1.1:1.9; ptB.intensity=lightOn?.85:1.5;
+    bl.classList.toggle('off',!lightOn);
+    bl.querySelector('span').textContent='Свет: '+(lightOn?'вкл':'выкл');
+    toast('Освещение '+(lightOn?'включено':'— только подводка')); };
+
+  addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
+    if(k==='f') document.getElementById('bFish').click();
+    if(k==='b') document.getElementById('bBub').click();
+    if(k==='l') document.getElementById('bLight').click();
+    if(k===' '){ e.preventDefault(); document.getElementById('bFeed').click(); } });
+
+  addEventListener('resize',onResize);
+  const lg=document.getElementById('legend');
+  SCHEMES.forEach(s=>{ const d=document.createElement('div'); d.className='chip';
+    d.innerHTML=`<i style="background:${s.base};color:${s.base}"></i>${s.name}`; lg.appendChild(d); });
+}
+function onResize(){ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); }
+
+/* ═══════════ UI-ХЕЛПЕРЫ ═══════════ */
+function setStat(id,v,silent){
+  const el=document.getElementById(id); if(!el||el.textContent==String(v)) return;
+  el.textContent=v; if(silent) return;
+  el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');
+}
+function toast(msg){
+  const t=document.createElement('div'); t.className='toast'; t.textContent=msg;
+  document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),2650);
+}
+const spark=document.getElementById('spark').getContext('2d'); const fpsHist=[];
+function drawSpark(){
+  const w=172,h=30; spark.clearRect(0,0,w,h);
+  for(let i=0;i<fpsHist.length;i++){
+    const v=Math.min(fpsHist[i],70)/70, bh=Math.max(1,v*h);
+    spark.fillStyle=v>.55?'rgba(99,232,212,.75)':'rgba(255,122,89,.8)';
+    spark.fillRect(w-fpsHist.length*3+i*3,h-bh,2,bh);
+  }
+}
+function hoverCheck(){
+  raycaster.setFromCamera(hoverNDC,camera);
+  const hit=raycaster.intersectObjects(fishBodies,false);
+  const tip=document.getElementById('tip');
+  const f=hit.length?hit[0].object.userData.fish:null;
+  if(f!==hoverFish){
+    if(hoverFish) hoverFish.body.material.emissiveIntensity=.16;
+    hoverFish=f;
+    if(f){ f.body.material.emissiveIntensity=.55;
+      tip.innerHTML=`<b>${f.scheme.name}</b><br><i>×${f.mesh.scale.x.toFixed(2)}</i> · <i>${f.speed.toFixed(1)} у/с</i> · <i>радиус ${f.avoidanceRadius.toFixed(1)}</i>`;
+      tip.classList.add('on');
+    } else tip.classList.remove('on');
+  }
+  if(f){ const p=f.mesh.position.clone().project(camera);
+    tip.style.left=clamp((p.x*.5+.5)*innerWidth,90,innerWidth-90)+'px';
+    tip.style.top=clamp((-p.y*.5+.5)*innerHeight,80,innerHeight-40)+'px'; }
+}
+
+/* ═══════════ ЦИКЛ ═══════════ */
+let frames=0, acc=0, lastT=performance.now();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),.05), t=clock.elapsedTime;
+
+  updateFish(dt,t); updateFood(dt); updateBubbles(dt,t);
+  updatePlants(t); updateWater(dt,t); updateCaustics(dt);
+  ptA.intensity=(lightOn?1.1:1.9)+Math.sin(t*1.7)*.18;
+  ptB.intensity=(lightOn?.85:1.5)+Math.cos(t*1.2)*.14;
+
+  controls.target.x=clamp(controls.target.x,-15,15);
+  controls.target.y=clamp(controls.target.y,-9,9);
+  controls.target.z=clamp(controls.target.z,-9,9);
+  controls.update();
+  renderer.render(scene,camera);
+
+  frames++; acc+=dt;
+  if(performance.now()-lastHover>90){ lastHover=performance.now(); hoverCheck(); }
+  if(acc>.45){ const fps=Math.round(frames/acc); fpsHist.push(fps); if(fpsHist.length>56)fpsHist.shift();
+    document.getElementById('fpsVal').textContent=fps; drawSpark(); frames=0; acc=0; }
+}
+let lastHover=0;
+
+init();
+setTimeout(()=>document.getElementById('splash').classList.add('gone'),1250);
+})();
+</script>
+</body>
+</html>
+```
+
+**Что внутри, помимо базовых требований:**
+
+- **Процедурная чешуя** — у каждой рыбы своя Canvas-текстура (полосы / продольные ленты / пятна + countershading «тёмная спина, светлое брюхо»), так что 15 рыб не выглядят клонами.
+- **Анатомия**: тело-сфера с вытягиванием, хвост-лопость на шарнире, спинной, анальный и два грудных плавника (плоская геометрия с кервером и сужением), глаза со зрачками.
+- **Корректная ориентация**: курсаж + тангаж + **крен при повороте** (banking), рыбы заваливаются в вираже.
+- **ИИ**: блуждание, разделение стаи, мягкое отражение от стенок и дна, «комфортная глубина», преследование корма с ускорением ×1.75 и рост +5 %.
+- **Среда**: каустическая эмиссия на песке (анимированный офсет), объёмные световые конусы, волнистая поверхность воды с пересчётом нормалей, PMREM-окружение для стекла и глаз.
+- **Обратная связь**: клик → корм + кольцо-ripples, поедание → всплеск пузырей + коралловое кольцо + счётчик «Съедено», наведение курсора на рыбу → «паспорт» с размером/скоростью и подсветкой тела, FPS-спарклайн, тосты, горячие клавиши `F / B / L / Space`.

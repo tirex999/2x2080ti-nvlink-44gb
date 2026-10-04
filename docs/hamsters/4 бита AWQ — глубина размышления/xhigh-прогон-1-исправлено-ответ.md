@@ -1,0 +1,785 @@
+
+
+**Причина:** страница использует `<script type="importmap">` + ES-модуль с `import … from 'three'` через CDN. Если CDN недоступен (офлайн, блокировка, `file://`-протокол), модуль просто не выполняется, `tick()` никогда не стартует, и загрузчик (спиннер + «Hamster Playground» + строка статуса) остаётся на экране навсегда — ровно то, что видно на скриншоте.
+
+Исправление: заменяю ES-модуль на классический `<script>` (UMD-сборка `three.min.js`) с фолбэком на второй CDN и явной ошибкой, если оба упали. Весь 3D-код тот же.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Low-Poly Hamster Playground</title>
+<meta name="description" content="A tiny low-poly 3D hamster cage with three wiggly residents, built with Three.js in one file."/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#33261f; --paper:#fffdf6; --coral:#ff6f61;
+    --butter:#ffd166; --mint:#6fd3c0; --sky:#bfe9f4;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:var(--sky)}
+  body{font-family:'Nunito',system-ui,sans-serif;color:var(--ink)}
+  canvas{display:block;cursor:grab}
+  canvas:active{cursor:grabbing}
+
+  .card{position:fixed;z-index:20;background:var(--paper);border:3px solid var(--ink);
+        border-radius:16px;box-shadow:6px 7px 0 rgba(51,38,31,.22)}
+
+  #title{top:16px;left:16px;padding:12px 18px 14px;transform:rotate(-1.6deg);max-width:min(340px,74vw)}
+  #title .chip{display:inline-block;background:var(--butter);border:2px solid var(--ink);border-radius:999px;
+               padding:2px 11px;font-size:10.5px;font-weight:800;letter-spacing:.14em}
+  #title h1{font-family:'Fredoka',sans-serif;font-weight:700;font-size:clamp(24px,3.6vw,38px);
+            line-height:.98;margin-top:9px;letter-spacing:-.01em}
+  #title h1 em{font-style:normal;color:var(--coral)}
+  #title p{margin-top:7px;font-size:12.5px;font-weight:700;opacity:.72}
+
+  #stat{top:16px;right:16px;padding:9px 14px;display:flex;align-items:center;gap:9px;
+        font-weight:800;font-size:13px;transform:rotate(1.4deg)}
+  #stat .num{font-family:'Fredoka',sans-serif;font-size:16px;background:var(--coral);color:#fff;
+             border:2px solid var(--ink);border-radius:9px;padding:0 9px;min-width:30px;text-align:center}
+  #stat.bump{animation:bump .4s cubic-bezier(.34,1.56,.64,1)}
+  @keyframes bump{45%{transform:rotate(1.4deg) scale(1.22)}}
+
+  #hints{left:50%;bottom:14px;transform:translateX(-50%) rotate(.4deg);display:flex;gap:6px 16px;
+         flex-wrap:wrap;justify-content:center;align-items:center;padding:9px 18px;border-radius:999px;max-width:94vw}
+  #hints span{font-size:12px;font-weight:800;white-space:nowrap}
+  #hints span i{font-style:normal;opacity:.55;margin-right:2px}
+
+  #tags{position:fixed;inset:0;z-index:10;pointer-events:none}
+  .tag{position:absolute;left:0;top:0;display:flex;align-items:center;gap:6px;background:var(--paper);
+       border:2px solid var(--ink);border-radius:999px;padding:2px 10px 3px;font-size:12px;font-weight:800;
+       box-shadow:2px 3px 0 rgba(51,38,31,.18);will-change:transform;transition:opacity .2s}
+  .tag .dot{width:9px;height:9px;border-radius:50%;border:1.5px solid var(--ink)}
+  .tag .emo{font-size:13px;line-height:1}
+
+  #loader{position:fixed;inset:0;z-index:50;background:var(--sky);display:flex;flex-direction:column;
+          align-items:center;justify-content:center;gap:16px;transition:opacity .6s ease .15s}
+  #loader .spin{width:58px;height:58px;border:6px solid var(--ink);border-radius:50%;position:relative;
+                animation:rot 1.1s linear infinite}
+  #loader .spin::before,#loader .spin::after{content:"";position:absolute;left:50%;top:50%;
+                background:var(--ink);border-radius:3px}
+  #loader .spin::before{width:100%;height:6px;transform:translate(-50%,-50%)}
+  #loader .spin::after{width:6px;height:100%;transform:translate(-50%,-50%)}
+  #loader h2{font-family:'Fredoka',sans-serif;font-size:20px}
+  #loader p{font-size:13px;font-weight:700;opacity:.7}
+  #loader.done{opacity:0;pointer-events:none}
+  #loader.error .spin{animation:none;border-style:dashed}
+  @keyframes rot{to{transform:rotate(360deg)}}
+
+  @media (max-width:600px){
+    #title{padding:10px 14px}
+    #title p{display:none}
+    #hints{gap:4px 10px;padding:8px 12px}
+    #hints span{font-size:11px}
+  }
+</style>
+</head>
+<body>
+
+<div id="loader">
+  <div class="spin"></div>
+  <h2>Hamster Playground</h2>
+  <p id="loadmsg">loading Three.js…</p>
+</div>
+
+<header id="title" class="card">
+  <span class="chip">LOW-POLY · THREE.JS · ONE FILE</span>
+  <h1>Hamster <em>Playground</em></h1>
+  <p>Mochi, Peanut &amp; Biscuit are up to something.</p>
+</header>
+
+<div id="stat" class="card"><span>🌻 seeds munched</span><span class="num" id="eaten">0</span></div>
+
+<footer id="hints" class="card">
+  <span><i>🖱️</i>drag — orbit</span>
+  <span><i>🔍</i>scroll / pinch — zoom</span>
+  <span><i>🥣</i>click the bowl — feast</span>
+  <span><i>🌻</i>click the sand — drop a seed</span>
+</footer>
+
+<div id="tags"></div>
+
+<!-- Primary CDN (UMD build – works from file:// too) -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<!-- Fallback CDN if the first one failed -->
+<script>
+if (!window.THREE) {
+  document.write('<script src="https://unpkg.com/three@0.160.0/build/three.min.js"><\/script>');
+}
+</script>
+
+<script>
+(function(){
+  var loader = document.getElementById('loader');
+  var msg = document.getElementById('loadmsg');
+
+  if (!window.THREE) {
+    loader.classList.add('error');
+    msg.textContent = '⚠️ Could not load Three.js from CDN. Check your internet connection and reload.';
+    return;
+  }
+
+  /* ================= renderer / scene / camera ================= */
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color('#bfe9f4');
+  scene.fog = new THREE.Fog('#bfe9f4', 16, 34);
+
+  var camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+  var renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.06;
+  renderer.domElement.style.touchAction = 'none';
+  document.body.appendChild(renderer.domElement);
+
+  /* ================= helpers ================= */
+  function M(color, opt){
+    opt = opt || {};
+    var def = { color:color, flatShading:true, roughness:.9, metalness:0 };
+    for (var k in opt) def[k] = opt[k];
+    return new THREE.MeshStandardMaterial(def);
+  }
+  function shadow(m, cast, recv){
+    m.castShadow = cast !== false;
+    m.receiveShadow = !!recv;
+    return m;
+  }
+  function ease(p){ return p*p*(3-2*p); }
+  function lerp(a,b,t){ return a+(b-a)*t; }
+  function angDiff(a,b){ var d=a-b; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return d; }
+
+  /* ================= lights ================= */
+  scene.add(new THREE.HemisphereLight('#fff3e0', '#b9d8cd', .9));
+  var sun = new THREE.DirectionalLight('#fff6e8', 1.6);
+  sun.position.set(5.5, 8.5, 4.5);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left:-5, right:5, top:5, bottom:-5, near:2, far:22 });
+  sun.shadow.bias = -0.0004;
+  sun.shadow.normalBias = 0.02;
+  scene.add(sun);
+  var fill = new THREE.DirectionalLight('#ffd9c8', .35);
+  fill.position.set(-6, 4, -5);
+  scene.add(fill);
+
+  /* ================= layout constants ================= */
+  var SAND_Y = 0.66, SAND_R = 1.95;
+  var WHEEL = new THREE.Vector3(-1.35, SAND_Y, -0.75);
+  var WHEEL_TOP = 1.23;
+  var RIM = 0.5, V_RUN = 1.15;
+  var TUN_Z = 1.05, TUN_X1 = 1.6;
+  var BOWL = new THREE.Vector3(0.55, SAND_Y, -1.35);
+  var DOOR = new THREE.Vector3(-0.55, SAND_Y, 0.82);
+
+  /* ================= ground ================= */
+  var floor = new THREE.Mesh(new THREE.CircleGeometry(26, 40), M('#9fd8c6'));
+  floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+  var rug = new THREE.Mesh(new THREE.CircleGeometry(4.4, 40), M('#ffe3ae'));
+  rug.rotation.x = -Math.PI/2; rug.position.y = .005; rug.receiveShadow = true; scene.add(rug);
+  var rugRing = new THREE.Mesh(new THREE.RingGeometry(4.05, 4.4, 40), M('#ffcf7a'));
+  rugRing.rotation.x = -Math.PI/2; rugRing.position.y = .01; scene.add(rugRing);
+
+  /* ================= cage: hex tray, sand, wire walls ================= */
+  var cage = new THREE.Group(); scene.add(cage);
+  var tray = shadow(new THREE.Mesh(new THREE.CylinderGeometry(2.55, 2.45, .5, 6), M('#fff4e0')), true, true);
+  tray.position.y = .25; tray.rotation.y = Math.PI/6; cage.add(tray);
+  var sand = shadow(new THREE.Mesh(new THREE.CylinderGeometry(2.35, 2.35, .16, 28), M('#ecd09a')), false, true);
+  sand.position.y = SAND_Y - .08; cage.add(sand);
+
+  var metal = M('#c9d3da', { roughness:.4, metalness:.4 });
+  for (var i=0;i<14;i++){
+    var a = i/14*Math.PI*2;
+    var bar = new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,2.65,6), metal);
+    bar.position.set(Math.sin(a)*2.42, 1.825, Math.cos(a)*2.42);
+    cage.add(bar);
+  }
+  [[.75,.035],[1.6,.035],[2.45,.035]].forEach(function(pair){
+    var ring = new THREE.Mesh(new THREE.TorusGeometry(2.42, pair[1], 6, 40), metal);
+    ring.rotation.x = Math.PI/2; ring.position.y = pair[0]; cage.add(ring);
+  });
+  var topRing = shadow(new THREE.Mesh(new THREE.TorusGeometry(2.42,.06,8,40), metal));
+  topRing.rotation.x = Math.PI/2; topRing.position.y = 3.15; cage.add(topRing);
+
+  /* water bottle */
+  var wb = new THREE.Group();
+  (function(){
+    var a = 9/14*Math.PI*2;
+    wb.position.set(Math.sin(a)*2.42, 1.75, Math.cos(a)*2.42);
+    var body = new THREE.Mesh(new THREE.CylinderGeometry(.09,.09,.36,8),
+      M('#bfe3ff', { transparent:true, opacity:.75, roughness:.2 }));
+    body.position.y = .1;
+    var cap = new THREE.Mesh(new THREE.CylinderGeometry(.06,.06,.07,8), M('#ff6f61'));
+    cap.position.y = .3;
+    var noz = new THREE.Mesh(new THREE.ConeGeometry(.045,.14,8), M('#c9d3da'));
+    noz.rotation.x = Math.PI/2; noz.position.y = -.12;
+    wb.add(body, cap, noz);
+    wb.lookAt(0, 1.75, 0);
+  })();
+  cage.add(wb);
+
+  /* ================= exercise wheel ================= */
+  var wheelG = new THREE.Group(); wheelG.position.copy(WHEEL); scene.add(wheelG);
+  (function(){
+    var stand = M('#ff8a5c');
+    var base = shadow(new THREE.Mesh(new THREE.BoxGeometry(.6,.07,.5), stand));
+    base.position.set(0,.035,-.06);
+    var post = shadow(new THREE.Mesh(new THREE.BoxGeometry(.09,.8,.09), stand));
+    post.position.set(0,.46,-.17);
+    var foot = new THREE.Mesh(new THREE.BoxGeometry(.34,.05,.12), stand);
+    foot.position.set(0,.025,.16);
+    wheelG.add(base, post, foot);
+  })();
+  var spin = new THREE.Group(); spin.position.y = .78; wheelG.add(spin);
+  (function(){
+    var rimM = M('#ffd166');
+    spin.add(shadow(new THREE.Mesh(new THREE.TorusGeometry(RIM,.055,8,22), rimM)));
+    var hub = new THREE.Mesh(new THREE.CylinderGeometry(.07,.07,.18,8), rimM);
+    hub.rotation.x = Math.PI/2; spin.add(hub);
+    for (var i=0;i<6;i++){
+      var a = i/6*Math.PI*2;
+      var sp = new THREE.Mesh(new THREE.CylinderGeometry(.024,.024,.45,5), rimM);
+      sp.position.set(Math.cos(a)*.225, Math.sin(a)*.225, 0);
+      sp.rotation.z = Math.PI/2 - a;
+      spin.add(sp);
+    }
+  })();
+  var wheelVel = 0;
+
+  /* ================= tunnel ================= */
+  (function(){
+    var g = new THREE.CylinderGeometry(.42,.42,1.5,10,1,true,0,Math.PI);
+    g.rotateZ(Math.PI/2);
+    var tunnel = shadow(new THREE.Mesh(g, M('#6fd3c0', { side:THREE.DoubleSide })), true, true);
+    tunnel.position.set(.85, SAND_Y+.42, TUN_Z); scene.add(tunnel);
+    var rimT = M('#57bdb0');
+    [-.75,.75].forEach(function(dx){
+      var r = new THREE.Mesh(new THREE.TorusGeometry(.42,.03,6,14), rimT);
+      r.rotation.y = Math.PI/2; r.position.set(.85+dx, SAND_Y+.42, TUN_Z); scene.add(r);
+    });
+  })();
+
+  /* ================= food bowl ================= */
+  var bowlG = new THREE.Group(); bowlG.position.copy(BOWL); scene.add(bowlG);
+  var bowlM = M('#ff7f6e');
+  (function(){
+    var out = shadow(new THREE.Mesh(new THREE.CylinderGeometry(.34,.24,.16,12), bowlM));
+    out.position.y = .08;
+    var rim = new THREE.Mesh(new THREE.TorusGeometry(.33,.035,6,22), bowlM);
+    rim.rotation.x = Math.PI/2; rim.position.y = .16;
+    var inn = new THREE.Mesh(new THREE.CylinderGeometry(.28,.28,.04,12), M('#8a5a3b'));
+    inn.position.y = .14;
+    bowlG.add(out, rim, inn);
+  })();
+  var bowlHit = new THREE.Mesh(new THREE.CylinderGeometry(.55,.55,.6,8),
+    new THREE.MeshBasicMaterial({ transparent:true, opacity:0, depthWrite:false }));
+  bowlHit.position.y = .25; bowlG.add(bowlHit);
+  var bowlPulse = 0;
+
+  /* ================= house + carrot + pebbles ================= */
+  (function(){
+    var house = new THREE.Group();
+    house.position.set(-.95, SAND_Y, 1.2);
+    house.rotation.y = Math.atan2(.95, -1.2);
+    var walls = shadow(new THREE.Mesh(new THREE.BoxGeometry(.8,.55,.8), M('#fff4e0')));
+    walls.position.y = .275;
+    var roof = shadow(new THREE.Mesh(new THREE.ConeGeometry(.66,.42,4), M('#ff9f68')));
+    roof.position.y = .76; roof.rotation.y = Math.PI/4;
+    var door = new THREE.Mesh(new THREE.CircleGeometry(.17,10), M('#5b4636'));
+    door.position.set(0,.2,.405);
+    house.add(walls, roof, door);
+    scene.add(house);
+  })();
+  (function(){
+    var car = new THREE.Group(); car.position.set(1.45, SAND_Y, -.35);
+    var root = shadow(new THREE.Mesh(new THREE.ConeGeometry(.07,.3,6), M('#ff8a3d')));
+    root.position.y = .15; car.add(root);
+    for (var i=0;i<3;i++){
+      var leaf = new THREE.Mesh(new THREE.ConeGeometry(.03,.14,5), M('#69c96b'));
+      leaf.position.set((i-1)*.05, .32, (i-1)*.04);
+      leaf.rotation.z = (i-1)*.4;
+      car.add(leaf);
+    }
+    scene.add(car);
+  })();
+  (function(){
+    var mats = [M('#c9c2b8'), M('#b8a98f'), M('#d8cdb8')];
+    for (var i=0;i<8;i++){
+      var a = Math.random()*Math.PI*2, r = .6 + Math.random()*1.3;
+      var p = shadow(new THREE.Mesh(new THREE.IcosahedronGeometry(.05+Math.random()*.05, 0), mats[i%3]));
+      p.position.set(Math.sin(a)*r, SAND_Y+.03, Math.cos(a)*r);
+      p.rotation.set(Math.random(), Math.random(), Math.random());
+      scene.add(p);
+    }
+  })();
+
+  /* ================= seeds ================= */
+  var seeds = [];
+  var seedGeo = new THREE.SphereGeometry(.05,6,5);
+  var seedMats = [M('#d99a2b'), M('#b07a2e'), M('#e8b23a')];
+  var eaten = 0;
+  var eatenEl = document.getElementById('eaten');
+  var statEl = document.getElementById('stat');
+
+  function addSeed(x, z){
+    var aliveCount = 0;
+    for (var i=0;i<seeds.length;i++) if (seeds[i].alive) aliveCount++;
+    if (aliveCount >= 12) return null;
+    var m = shadow(new THREE.Mesh(seedGeo, seedMats[(Math.random()*3)|0]));
+    m.scale.set(.01,.007,.01);
+    m.position.set(x, SAND_Y+.035, z);
+    m.rotation.y = Math.random()*Math.PI;
+    scene.add(m);
+    var s = { mesh:m, alive:true };
+    seeds.push(s);
+    return s;
+  }
+  function popSeed(s){
+    if (!s.alive) return;
+    s.alive = false;
+    eaten++; eatenEl.textContent = eaten;
+    statEl.classList.remove('bump'); void statEl.offsetWidth; statEl.classList.add('bump');
+  }
+  function updateSeeds(dt){
+    for (var i=seeds.length-1;i>=0;i--){
+      var s = seeds[i], m = s.mesh;
+      var k = s.alive ? Math.min(1,dt*10) : Math.min(1,dt*14);
+      m.scale.x = lerp(m.scale.x, 1, k);
+      m.scale.y = lerp(m.scale.y, .72, k);
+      m.scale.z = lerp(m.scale.z, 1, k);
+      if (!s.alive && m.scale.x < .03){ scene.remove(m); seeds.splice(i,1); }
+    }
+  }
+  function nearestEligible(v){
+    var best=null, bd=1e9;
+    for (var i=0;i<hamsters.length;i++){
+      var h = hamsters[i];
+      if (h.mode==='wheel' || h.mode==='tunnel') continue;
+      var d = h.group.position.distanceToSquared(v);
+      if (d<bd){ bd=d; best=h; }
+    }
+    return best;
+  }
+  function feed(){
+    bowlPulse = 1;
+    var first = null;
+    for (var i=0;i<5;i++){
+      var a = Math.random()*Math.PI*2, r = Math.random()*.32;
+      var s = addSeed(BOWL.x+Math.sin(a)*r, BOWL.z+Math.cos(a)*r);
+      if (!first) first = s;
+    }
+    var h = nearestEligible(BOWL);
+    if (h && first) h.pending = { ref:first };
+  }
+  function dropSeed(x, z){
+    var r = Math.hypot(x,z);
+    if (r > 1.85){ x *= 1.85/r; z *= 1.85/r; }
+    var s = addSeed(x,z);
+    var h = s && nearestEligible(new THREE.Vector3(x, SAND_Y, z));
+    if (h && s) h.pending = { ref:s };
+  }
+
+  /* ================= hamsters ================= */
+  var EMO = { idle:'😌', walk:'🏃', eat:'🌻', wheel:'🎡', tunnel:'🕳️', stash:'🏠' };
+  var hamsters = [];
+
+  function makeHamster(o){
+    var g = new THREE.Group();
+    var mb = M(o.body), mn = M(o.belly), me = M(o.ear), mc = M(o.cheek);
+
+    var body = shadow(new THREE.Mesh(new THREE.SphereGeometry(.3,7,6), mb));
+    body.scale.set(1,.92,1.18); body.position.y = .34;
+    var belly = new THREE.Mesh(new THREE.SphereGeometry(.24,7,6), mn);
+    belly.scale.set(.8,.62,.95); belly.position.set(0,.26,.14);
+
+    var head = new THREE.Group(); head.position.set(0,.42,.3);
+    head.add(shadow(new THREE.Mesh(new THREE.SphereGeometry(.22,7,6), mb)));
+    var snout = new THREE.Mesh(new THREE.SphereGeometry(.11,6,5), mn);
+    snout.scale.set(1,.75,1.1); snout.position.set(0,-.05,.15);
+    var nose = new THREE.Mesh(new THREE.SphereGeometry(.032,5,4), M('#ff9d9d'));
+    nose.position.set(0,-.02,.27);
+    var eyes=[], glints=[], ears=[], cheeks=[];
+    [-1,1].forEach(function(s){
+      var e = new THREE.Mesh(new THREE.SphereGeometry(.037,6,5), M('#2b2018'));
+      e.position.set(s*.09,.05,.2); eyes.push(e);
+      var gl = new THREE.Mesh(new THREE.SphereGeometry(.012,4,4), M('#ffffff',{ roughness:.3 }));
+      gl.position.set(s*.075,.07,.215); glints.push(gl);
+      var ear = new THREE.Mesh(new THREE.SphereGeometry(.075,6,5), me);
+      ear.scale.set(1,.85,.6); ear.position.set(s*.13,.19,-.03); ears.push(ear);
+      var c = new THREE.Mesh(new THREE.SphereGeometry(.085,6,5), mc);
+      c.scale.set(.75,.85,.9); c.position.set(s*.155,-.03,.16); cheeks.push(c);
+    });
+    head.add(snout, nose);
+    eyes.forEach(function(e){ head.add(e); });
+    glints.forEach(function(gl){ head.add(gl); });
+    ears.forEach(function(ear){ head.add(ear); });
+    cheeks.forEach(function(c){ head.add(c); });
+
+    var legs = [];
+    [[-.14,.16],[.14,.16],[-.14,-.16],[.14,-.16]].forEach(function(pos){
+      var l = new THREE.Mesh(new THREE.CylinderGeometry(.045,.05,.14,5), mb);
+      l.position.set(pos[0],.07,pos[1]); legs.push(l);
+    });
+    var tail = new THREE.Mesh(new THREE.ConeGeometry(.045,.12,5), me);
+    tail.rotation.x = -Math.PI/2; tail.position.set(0,.32,-.38);
+
+    g.add(body, belly, head);
+    legs.forEach(function(l){ g.add(l); });
+    g.add(tail);
+    g.position.set(o.x, SAND_Y, o.z);
+    g.rotation.y = Math.random()*Math.PI*2;
+    scene.add(g);
+
+    var h = {
+      name:o.name, color:o.body, group:g, head:head, eyes:eyes, ears:ears, cheeks:cheeks,
+      legs:legs, tail:tail,
+      speed:.55+Math.random()*.3, yaw:g.rotation.y,
+      mode:'idle', t:0, dur:.5+Math.random()*2, target:new THREE.Vector3(), data:{},
+      pending:null, phase:Math.random()*6, seed:Math.random()*10,
+      cheekScale:1, cheekTarget:1, blinkT:1+Math.random()*3, blink:0,
+      earT:1+Math.random()*3, earTw:0
+    };
+    hamsters.push(h);
+    return h;
+  }
+
+  /* name tags */
+  var tagsEl = document.getElementById('tags');
+  hamsters.forEach(function(h){
+    var el = document.createElement('div');
+    el.className = 'tag';
+    el.innerHTML = '<span class="dot" style="background:'+h.color+'"></span><span>'+h.name+'</span><span class="emo">'+EMO[h.mode]+'</span>';
+    tagsEl.appendChild(el);
+    h.tag = el; h.tagEmo = el.querySelector('.emo');
+  });
+  function setMode(h, m){ h.mode = m; h.t = 0; h.tagEmo.textContent = EMO[m] || '🐹'; }
+
+  /* ================= brain ================= */
+  function clampToSand(g){
+    var p = g.position, r = Math.hypot(p.x, p.z);
+    if (r > SAND_R){ var k = SAND_R/r; p.x *= k; p.z *= k; }
+  }
+  function steer(h, tx, tz, dt, arrive){
+    var p = h.group.position;
+    var dx = tx-p.x, dz = tz-p.z, d = Math.hypot(dx,dz);
+    if (d < arrive) return true;
+    h.yaw += angDiff(Math.atan2(dx,dz), h.yaw) * Math.min(1, dt*7);
+    var s = Math.min(h.speed*dt, d);
+    p.x += Math.sin(h.yaw)*s; p.z += Math.cos(h.yaw)*s;
+    return false;
+  }
+  function startIdle(h, dur){ setMode(h,'idle'); h.dur = dur != null ? dur : (1+Math.random()*2.5); h.cheekTarget = 1; }
+  function startWheel(h){
+    setMode(h,'wheel'); h.wp = 'climb'; h.dur = .55;
+    h.from = h.group.position.clone();
+    h.spinDir = Math.random() < .5 ? 1 : -1;
+    h.to = new THREE.Vector3(WHEEL.x, WHEEL_TOP, WHEEL.z);
+    h.off = new THREE.Vector3(WHEEL.x + h.spinDir*.9, 0, WHEEL.z);
+    h.yaw = h.spinDir > 0 ? Math.PI/2 : -Math.PI/2;
+    h.runDur = 2.5 + Math.random()*2;
+  }
+  function chooseNext(h){
+    if (h.pending){
+      var s = h.pending.ref; h.pending = null;
+      if (s && s.alive){ setMode(h,'walk'); h.target.copy(s.mesh.position); h.data = { after:'eat', seed:s }; }
+      else startIdle(h, .8+Math.random());
+      return;
+    }
+    var alive = seeds.filter(function(s){ return s.alive; });
+    var r = Math.random();
+    if (r < .45){
+      setMode(h,'walk');
+      var a = Math.random()*Math.PI*2, rr = Math.sqrt(Math.random())*1.8;
+      h.target.set(Math.sin(a)*rr, 0, Math.cos(a)*rr);
+      h.data = { after:'idle' };
+    } else if (alive.length && r < .7){
+      setMode(h,'walk');
+      var best = alive[0], bd = 1e9;
+      for (var i=0;i<alive.length;i++){
+        var d = alive[i].mesh.position.distanceToSquared(h.group.position);
+        if (d < bd){ bd = d; best = alive[i]; }
+      }
+      h.target.copy(best.mesh.position);
+      h.data = { after:'eat', seed:best };
+    } else if (r < .85){
+      setMode(h,'walk');
+      h.target.set(WHEEL.x+.85, 0, WHEEL.z+.2);
+      h.data = { after:'wheel' };
+    } else if (r < .95){
+      setMode(h,'walk');
+      h.target.set(.1, 0, TUN_Z);
+      h.data = { after:'tunnel' };
+    } else startIdle(h, 1.2+Math.random()*2);
+  }
+  function arrive(h){
+    var d = h.data; h.data = {};
+    if (d.after === 'eat'){
+      if (d.seed && d.seed.alive){
+        setMode(h,'eat'); h.dur = 1.2+Math.random()*.7;
+        h.seedRef = d.seed; h.cheekTarget = 1.6;
+        var p = h.group.position, s = d.seed.mesh.position;
+        h.yaw = Math.atan2(s.x-p.x, s.z-p.z);
+      } else startIdle(h, .8);
+    } else if (d.after === 'wheel') startWheel(h);
+    else if (d.after === 'tunnel'){
+      setMode(h,'tunnel');
+      h.x0 = h.group.position.x;
+      h.dur = Math.max(.4, (TUN_X1 - h.x0)/.85);
+      h.yaw = Math.PI/2;
+    } else if (d.after === 'stash'){ setMode(h,'stash'); h.dur = 1.2; }
+    else startIdle(h, .9+Math.random()*2);
+  }
+  function updateHamster(h, dt, t){
+    h.t += dt;
+    var p = h.group.position;
+    var px = p.x, py = SAND_Y, pz = p.z, lift = 0;
+
+    switch (h.mode){
+      case 'idle': {
+        h.group.scale.y = 1 + Math.sin(t*2.2 + h.seed)*.02;
+        h.head.rotation.y = Math.sin(t*.7 + h.seed)*.35;
+        h.head.rotation.x = Math.sin(t*.5 + h.seed*2)*.08;
+        h.tail.rotation.y = Math.sin(t*3 + h.seed)*.35;
+        h.earT -= dt;
+        if (h.earT <= 0){ h.earTw = .35; h.earT = 2+Math.random()*4; }
+        h.ears[0].rotation.z = h.earTw > 0 ? Math.sin((h.earTw -= dt)*34)*.3 : 0;
+        if (h.t >= h.dur) chooseNext(h);
+        break;
+      }
+      case 'walk': {
+        h.phase += dt*(7 + h.speed*5);
+        lift = Math.abs(Math.sin(h.phase))*.04;
+        h.group.rotation.z = Math.sin(h.phase)*.05;
+        if (steer(h, h.target.x, h.target.z, dt, .16)){
+          h.group.rotation.z = 0;
+          arrive(h);
+        }
+        break;
+      }
+      case 'eat': {
+        h.head.rotation.x = .3 + Math.sin(h.t*16)*.18;
+        h.head.rotation.y = Math.sin(h.t*3)*.1;
+        if (h.t >= h.dur){
+          popSeed(h.seedRef);
+          h.cheekTarget = 1; h.head.rotation.x = 0;
+          if (Math.random() < .55){ setMode(h,'walk'); h.target.copy(DOOR); h.data = { after:'stash' }; }
+          else startIdle(h, .8+Math.random()*1.5);
+        }
+        break;
+      }
+      case 'stash': {
+        h.cheekTarget = 1;
+        if (h.t >= h.dur) startIdle(h, .8+Math.random());
+        break;
+      }
+      case 'wheel': {
+        if (h.wp === 'climb'){
+          var q = ease(Math.min(1, h.t/h.dur));
+          px = lerp(h.from.x, h.to.x, q); pz = lerp(h.from.z, h.to.z, q);
+          py = SAND_Y + lerp(0, WHEEL_TOP, q) + Math.sin(q*Math.PI)*.12;
+          h.phase += dt*14;
+          if (h.t >= h.dur){ h.wp = 'run'; h.t = 0; }
+        } else if (h.wp === 'run'){
+          px = h.to.x; pz = h.to.z;
+          py = SAND_Y + WHEEL_TOP + Math.abs(Math.sin(h.phase))*.03;
+          h.phase += dt*17;
+          wheelVel = h.spinDir * V_RUN / RIM;
+          if (h.t >= h.runDur){ h.wp = 'off'; h.t = 0; h.dur = .5; }
+        } else {
+          var q2 = ease(Math.min(1, h.t/h.dur));
+          px = lerp(h.to.x, h.off.x, q2); pz = lerp(h.to.z, h.off.z, q2);
+          py = SAND_Y + lerp(WHEEL_TOP, 0, q2) + Math.sin(q2*Math.PI)*.22;
+          h.phase += dt*12;
+          if (h.t >= h.dur){ clampToSand(h.group); chooseNext(h); }
+        }
+        break;
+      }
+      case 'tunnel': {
+        var q3 = Math.min(1, h.t/h.dur);
+        px = lerp(h.x0, TUN_X1, q3); pz = TUN_Z;
+        h.phase += dt*11;
+        h.group.scale.setScalar(.94);
+        if (q3 >= 1){ h.group.scale.setScalar(1); chooseNext(h); }
+        break;
+      }
+    }
+
+    var sv = Math.sin(h.phase);
+    if (h.mode==='walk' || h.mode==='wheel' || h.mode==='tunnel'){
+      h.legs[0].rotation.x =  sv*.55; h.legs[1].rotation.x = -sv*.55;
+      h.legs[2].rotation.x = -sv*.55; h.legs[3].rotation.x =  sv*.55;
+    } else {
+      h.legs.forEach(function(l){ l.rotation.x *= Math.max(0, 1-dt*8); });
+    }
+
+    h.blinkT -= dt;
+    if (h.blinkT <= 0){ h.blink = .14; h.blinkT = 1.5+Math.random()*3; }
+    if (h.blink > 0) h.blink -= dt;
+    var es = h.blink > 0 ? .15 : 1;
+    h.eyes.forEach(function(e){ e.scale.y = lerp(e.scale.y, es, Math.min(1, dt*20)); });
+
+    h.cheekScale += (h.cheekTarget - h.cheekScale)*Math.min(1, dt*6);
+    h.cheeks.forEach(function(c){ c.scale.set(.75*h.cheekScale, .85*h.cheekScale, .9*h.cheekScale); });
+
+    if (h.mode !== 'idle') h.group.scale.x = lerp(h.group.scale.x, 1, Math.min(1, dt*8));
+
+    p.set(px, py + lift, pz);
+    h.group.rotation.y = h.yaw + (h.mode==='stash' ? Math.sin(h.t*9)*.3 : 0);
+    if (h.mode!=='wheel' && h.mode!=='tunnel') clampToSand(h.group);
+  }
+
+  /* ================= camera orbit ================= */
+  var orbit = {
+    theta:-1.5, phi:1.05, radius:13.5,
+    tTheta:-.4, tPhi:.62, tRadius:7.8,
+    target:new THREE.Vector3(0, 1.15, 0)
+  };
+  var lastInteract = performance.now();
+
+  var dom = renderer.domElement;
+  var pts = new Map();
+  var downX=0, downY=0, moved=false, lastPinch=0;
+
+  dom.addEventListener('pointerdown', function(e){
+    dom.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x:e.clientX, y:e.clientY });
+    if (pts.size===1){ downX=e.clientX; downY=e.clientY; moved=false; }
+    lastInteract = performance.now();
+  });
+  dom.addEventListener('pointermove', function(e){
+    if (!pts.has(e.pointerId)){ hover(e); return; }
+    var p = pts.get(e.pointerId);
+    if (pts.size===1){
+      var dx = e.clientX-p.x, dy = e.clientY-p.y;
+      if (Math.abs(e.clientX-downX) + Math.abs(e.clientY-downY) > 6) moved = true;
+      orbit.tTheta -= dx*.005;
+      orbit.tPhi = THREE.MathUtils.clamp(orbit.tPhi - dy*.005, .18, 1.45);
+    } else if (pts.size===2){
+      moved = true;
+      var arr = Array.from(pts.values());
+      var d = Math.hypot(arr[0].x-arr[1].x, arr[0].y-arr[1].y);
+      if (lastPinch > 0) orbit.tRadius = THREE.MathUtils.clamp(orbit.tRadius*lastPinch/d, 4.5, 15);
+      lastPinch = d;
+    }
+    p.x = e.clientX; p.y = e.clientY;
+    lastInteract = performance.now();
+  });
+  dom.addEventListener('pointerup', function(e){
+    pts.delete(e.pointerId); lastPinch = 0;
+    if (pts.size===0 && !moved) click(e);
+  });
+  dom.addEventListener('pointercancel', function(e){ pts.delete(e.pointerId); lastPinch = 0; });
+  dom.addEventListener('wheel', function(e){
+    e.preventDefault();
+    orbit.tRadius = THREE.MathUtils.clamp(orbit.tRadius*(1 + e.deltaY*.0011), 4.5, 15);
+    lastInteract = performance.now();
+  }, { passive:false });
+
+  /* picking */
+  var ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+  function setNdc(e){
+    ndc.set(e.clientX/innerWidth*2 - 1, -(e.clientY/innerHeight)*2 + 1);
+    ray.setFromCamera(ndc, camera);
+  }
+  function hover(e){
+    setNdc(e);
+    var hit = ray.intersectObject(bowlHit, false).length > 0;
+    dom.style.cursor = hit ? 'pointer' : '';
+    bowlM.emissive.set(hit ? '#ff6f61' : '#000000');
+    bowlM.emissiveIntensity = hit ? .45 : 0;
+  }
+  function click(e){
+    setNdc(e);
+    var hits = ray.intersectObjects([bowlHit, sand], false);
+    if (!hits.length) return;
+    if (hits[0].object === bowlHit) feed();
+    else dropSeed(hits[0].point.x, hits[0].point.z);
+  }
+
+  /* ================= resize ================= */
+  addEventListener('resize', function(){
+    camera.aspect = innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  /* ================= cast the trio ================= */
+  makeHamster({ name:'Mochi',   body:'#f5a25d', belly:'#ffe8cf', ear:'#e08a45', cheek:'#ffb3a0', x: .6, z: .2 });
+  makeHamster({ name:'Peanut',  body:'#ffe6bd', belly:'#fffdf6', ear:'#eecf9e', cheek:'#ffc9b8', x:-.5, z: .9 });
+  makeHamster({ name:'Biscuit', body:'#cfc6d8', belly:'#efeaf5', ear:'#b3abc4', cheek:'#f3b8c4', x: .1, z:-.9 });
+
+  /* ================= main loop ================= */
+  var clock = new THREE.Clock();
+  var tmpV = new THREE.Vector3();
+  var started = false;
+
+  function tick(){
+    requestAnimationFrame(tick);
+    var dt = Math.min(clock.getDelta(), .05);
+    var t = clock.elapsedTime;
+
+    if (performance.now() - lastInteract > 6000) orbit.tTheta += dt*.07;
+    orbit.theta  += (orbit.tTheta  - orbit.theta ) * Math.min(1, dt*6);
+    orbit.phi    += (orbit.tPhi    - orbit.phi   ) * Math.min(1, dt*6);
+    orbit.radius += (orbit.tRadius - orbit.radius) * Math.min(1, dt*4);
+    camera.position.set(
+      orbit.target.x + orbit.radius*Math.sin(orbit.phi)*Math.sin(orbit.theta),
+      orbit.target.y + orbit.radius*Math.cos(orbit.phi),
+      orbit.target.z + orbit.radius*Math.sin(orbit.phi)*Math.cos(orbit.theta)
+    );
+    camera.lookAt(orbit.target);
+
+    for (var i=0;i<hamsters.length;i++) updateHamster(hamsters[i], dt, t);
+    for (var i=0;i<hamsters.length;i++)
+      for (var j=i+1;j<hamsters.length;j++){
+        var a = hamsters[i].group.position, b = hamsters[j].group.position;
+        var dx = b.x-a.x, dz = b.z-a.z, d = Math.hypot(dx,dz);
+        if (d > .001 && d < .55){
+          var push = (.55-d)*dt, nx = dx/d, nz = dz/d;
+          a.x -= nx*push; a.z -= nz*push;
+          b.x += nx*push; b.z += nz*push;
+        }
+      }
+    hamsters.forEach(function(h){ if (h.mode!=='wheel' && h.mode!=='tunnel') clampToSand(h.group); });
+
+    var anyRunning = false;
+    hamsters.forEach(function(h){ if (h.mode==='wheel' && h.wp==='run') anyRunning = true; });
+    if (!anyRunning) wheelVel *= Math.max(0, 1-dt*2.5);
+    spin.rotation.z -= wheelVel*dt;
+
+    if (bowlPulse > 0){
+      bowlPulse = Math.max(0, bowlPulse - dt*3);
+      bowlG.scale.setScalar(1 + bowlPulse*.25);
+    } else bowlG.scale.setScalar(1);
+
+    updateSeeds(dt);
+
+    for (var i=0;i<hamsters.length;i++){
+      var h = hamsters[i];
+      tmpV.copy(h.group.position); tmpV.y += 1.05; tmpV.project(camera);
+      if (tmpV.z > 1){ h.tag.style.opacity = 0; continue; }
+      h.tag.style.opacity = 1;
+      h.tag.style.transform =
+        'translate(' + ((tmpV.x*.5+.5)*innerWidth) + 'px,' + ((-tmpV.y*.5+.5)*innerHeight) + 'px) translate(-50%,-115%)';
+    }
+
+    renderer.render(scene, camera);
+
+    if (!started){
+      started = true;
+      loader.classList.add('done');
+    }
+  }
+  tick();
+
+})();
+</script>
+</body>
+</html>
+```

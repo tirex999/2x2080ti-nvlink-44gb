@@ -1,0 +1,960 @@
+
+
+```html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Аквариум</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a1628;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .glass-panel {
+            position: fixed;
+            background: rgba(10, 25, 50, 0.65);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(100, 180, 255, 0.2);
+            border-radius: 16px;
+            padding: 20px;
+            color: #e0f0ff;
+            z-index: 100;
+            box-shadow: 0 8px 32px rgba(0, 20, 60, 0.4),
+                        inset 0 1px 0 rgba(100, 180, 255, 0.1);
+        }
+
+        #info-panel {
+            top: 20px;
+            left: 20px;
+            width: 280px;
+        }
+
+        #stats-panel {
+            top: 20px;
+            right: 20px;
+            min-width: 160px;
+            text-align: center;
+        }
+
+        .panel-title {
+            font-size: 1.4em;
+            font-weight: 700;
+            background: linear-gradient(135deg, #4fc3f7, #81c784, #ffb74d);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 12px;
+        }
+
+        .instructions {
+            font-size: 0.82em;
+            line-height: 1.7;
+            color: #a8d4ff;
+        }
+
+        .instructions span {
+            display: inline-block;
+            background: rgba(79, 195, 247, 0.15);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 0.9em;
+            margin-right: 4px;
+        }
+
+        .btn-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 14px;
+        }
+
+        .btn {
+            padding: 8px 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 0.82em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            color: white;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-fish {
+            background: linear-gradient(135deg, #ff6b35, #ff8c42);
+            box-shadow: 0 4px 15px rgba(255, 107, 53, 0.3);
+        }
+
+        .btn-fish:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 107, 53, 0.5);
+        }
+
+        .btn-bubbles {
+            background: linear-gradient(135deg, #2196f3, #42a5f5);
+            box-shadow: 0 4px 15px rgba(33, 150, 243, 0.3);
+        }
+
+        .btn-bubbles:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(33, 150, 243, 0.5);
+        }
+
+        .btn-light {
+            background: linear-gradient(135deg, #ffc107, #ffca2c);
+            box-shadow: 0 4px 15px rgba(255, 193, 7, 0.3);
+        }
+
+        .btn-light:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 193, 7, 0.5);
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(100, 180, 255, 0.1);
+        }
+
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            font-size: 0.85em;
+            color: #7eb8e0;
+        }
+
+        .stat-value {
+            font-size: 1.1em;
+            font-weight: 700;
+            color: #4fc3f7;
+        }
+
+        #fps-counter {
+            color: #81c784 !important;
+        }
+
+        @media (max-width: 768px) {
+            .glass-panel {
+                padding: 14px;
+                border-radius: 12px;
+            }
+
+            #info-panel {
+                width: 220px;
+                font-size: 0.9em;
+            }
+
+            #stats-panel {
+                min-width: 130px;
+            }
+
+            .btn {
+                padding: 6px 10px;
+                font-size: 0.75em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div class="glass-panel" id="info-panel">
+        <div class="panel-title">🐠 3D Аквариум</div>
+        <div class="instructions">
+            <div><span>🖱️ ЛКМ</span> Вращение камеры</div>
+            <div><span>🖱️ ПКМ</span> Панорамирование</div>
+            <div><span>⚙️ Колесо</span> Зум</div>
+            <div><span>👆 Клик</span> Кормление рыбок</div>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-fish" onclick="addFish()">+ Рыбка</button>
+            <button class="btn btn-bubbles" onclick="addBubbles()">+ Пузыри</button>
+            <button class="btn btn-light" onclick="toggleLight()" id="lightBtn">☀️ Свет</button>
+        </div>
+    </div>
+
+    <div class="glass-panel" id="stats-panel">
+        <div class="panel-title">📊 Статистика</div>
+        <div class="stat-item">
+            <span class="stat-label">Рыбки</span>
+            <span class="stat-value" id="fish-count">15</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">FPS</span>
+            <span class="stat-value" id="fps-counter">60</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Корм</span>
+            <span class="stat-value" id="food-count">0</span>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script>
+        // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
+        let scene, camera, renderer, controls;
+        let fishArray = [];
+        let bubbleArray = [];
+        let foodArray = [];
+        let seaweedArray = [];
+        let directionalLight;
+        let lightOn = true;
+        let clock = new THREE.Clock();
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+        let tankBounds = { x: 17, y: 11, z: 9 };
+        let tankCenter = new THREE.Vector3(0, 12, 0);
+
+        // FPS tracking
+        let fpsFrames = 0;
+        let fpsTime = 0;
+
+        // Цветовые схемы рыбок
+        const colorSchemes = [
+            { body: 0xff6b35, fin: 0xff8c42, name: "Оранжевая" },
+            { body: 0x2196f3, fin: 0x64b5f6, name: "Синяя" },
+            { body: 0xffd54f, fin: 0xef5350, name: "Жёлто-красная" },
+            { body: 0x9c27b0, fin: 0xba68c8, name: "Фиолетовая" },
+            { body: 0xf44336, fin: 0xe57373, name: "Красная" },
+            { body: 0x4caf50, fin: 0x81c784, name: "Зелёная" },
+            { body: 0xf48fb1, fin: 0xf8bbd0, name: "Розовая" },
+            { body: 0xffc107, fin: 0xffd54f, name: "Золотая" }
+        ];
+
+        // === ИНИЦИАЛИЗАЦИЯ СЦЕНЫ ===
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0a1628);
+            scene.fog = new THREE.FogExp2(0x0a1e3a, 0.012);
+
+            // Камера
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+            camera.position.set(0, 18, 35);
+
+            // Рендерер
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.2;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // Контролы
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.target.copy(tankCenter);
+            controls.minDistance = 10;
+            controls.maxDistance = 60;
+            controls.maxPolarAngle = Math.PI / 1.8;
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.08;
+
+            // Освещение
+            setupLights();
+
+            // Окружение
+            createTank();
+            createSand();
+            createRocks();
+            createSeaweed();
+
+            // Рыбки
+            for (let i = 0; i < 15; i++) {
+                addFish();
+            }
+
+            // Пузыри
+            for (let i = 0; i < 30; i++) {
+                addBubble(true);
+            }
+
+            // События
+            window.addEventListener('resize', onWindowResize);
+            renderer.domElement.addEventListener('click', onMouseClick);
+
+            // Старт
+            animate();
+        }
+
+        // === ОСВЕЩЕНИЕ ===
+        function setupLights() {
+            // Ambient
+            const ambient = new THREE.AmbientLight(0x404040, 0.4);
+            scene.add(ambient);
+
+            // Directional (солнечный свет)
+            directionalLight = new THREE.DirectionalLight(0xfff4e0, 1.2);
+            directionalLight.position.set(15, 30, 10);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 80;
+            directionalLight.shadow.camera.left = -25;
+            directionalLight.shadow.camera.right = 25;
+            directionalLight.shadow.camera.top = 25;
+            directionalLight.shadow.camera.bottom = -25;
+            directionalLight.shadow.bias = -0.001;
+            scene.add(directionalLight);
+
+            // Point lights (подводное освещение)
+            const pointLight1 = new THREE.PointLight(0x00bcd4, 0.6, 30);
+            pointLight1.position.set(-10, 20, 5);
+            scene.add(pointLight1);
+
+            const pointLight2 = new THREE.PointLight(0x1565c0, 0.5, 30);
+            pointLight2.position.set(10, 15, -5);
+            scene.add(pointLight2);
+        }
+
+        // === АКВАРИУМ (СТЕКЛЯННЫЙ КОНТЕЙНЕР) ===
+        function createTank() {
+            const w = 36, h = 24, d = 20;
+
+            // Стеклянные стенки
+            const glassMat = new THREE.MeshPhysicalMaterial({
+                color: 0x88ccff,
+                transparent: true,
+                opacity: 0.08,
+                roughness: 0.05,
+                metalness: 0,
+                transmission: 0.95,
+                thickness: 0.5,
+                side: THREE.DoubleSide
+            });
+
+            const tankGeo = new THREE.BoxGeometry(w, h, d);
+            const tank = new THREE.Mesh(tankGeo, glassMat);
+            tank.position.copy(tankCenter);
+            scene.add(tank);
+
+            // Рамка (wireframe)
+            const edges = new THREE.EdgesGeometry(tankGeo);
+            const edgeMat = new THREE.LineBasicMaterial({
+                color: 0x4fc3f7,
+                transparent: true,
+                opacity: 0.6
+            });
+            const wireframe = new THREE.LineSegments(edges, edgeMat);
+            wireframe.position.copy(tankCenter);
+            scene.add(wireframe);
+
+            // Дополнительные линии для рамок стёкол
+            const frameMat = new THREE.LineBasicMaterial({ color: 0x2a6496, transparent: true, opacity: 0.4 });
+            const innerGeo = new THREE.BoxGeometry(w - 0.2, h - 0.2, d - 0.2);
+            const innerEdges = new THREE.EdgesGeometry(innerGeo);
+            const innerWire = new THREE.LineSegments(innerEdges, frameMat);
+            innerWire.position.copy(tankCenter);
+            scene.add(innerWater);
+        }
+
+        // === ПЕСЧАНОЕ ДНО ===
+        function createSand() {
+            const geo = new THREE.PlaneGeometry(36, 20, 32, 20);
+            const positions = geo.attributes.position;
+            for (let i = 0; i < positions.count; i++) {
+                const x = positions.getX(i);
+                const y = positions.getY(i);
+                positions.setZ(i, Math.random() * 0.3 + Math.sin(x * 0.5) * 0.15 + Math.cos(y * 0.7) * 0.1);
+            }
+            geo.computeVertexNormals();
+
+            const mat = new THREE.MeshStandardMaterial({
+                color: 0xc2a86b,
+                roughness: 0.95,
+                metalness: 0.02
+            });
+
+            const sand = new THREE.Mesh(geo, mat);
+            sand.rotation.x = -Math.PI / 2;
+            sand.position.set(0, 0.2, 0);
+            sand.receiveShadow = true;
+            scene.add(sand);
+        }
+
+        // === КАМНИ ===
+        function createRocks() {
+            const rockColors = [0x5d4e37, 0x6b5b4a, 0x7a6a58, 0x4a4035, 0x8b7355];
+
+            for (let i = 0; i < 8; i++) {
+                const size = 0.8 + Math.random() * 1.5;
+                const geo = new THREE.DodecahedronGeometry(size, 1);
+
+                // Деформация вершин
+                const pos = geo.attributes.position;
+                for (let j = 0; j < pos.count; j++) {
+                    const v = new THREE.Vector3(pos.getX(j), pos.getY(j), pos.getZ(j));
+                    v.multiplyScalar(0.8 + Math.random() * 0.4);
+                    pos.setXYZ(j, v.x, v.y, v.z);
+                }
+                geo.computeVertexNormals();
+
+                const color = rockColors[Math.floor(Math.random() * rockColors.length)];
+                const mat = new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.85,
+                    metalness: 0.05
+                });
+
+                const rock = new THREE.Mesh(geo, mat);
+                rock.position.set(
+                    (Math.random() - 0.5) * 30,
+                    size * 0.4,
+                    (Math.random() - 0.5) * 16
+                );
+                rock.rotation.set(
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI
+                );
+                rock.castShadow = true;
+                rock.receiveShadow = true;
+                scene.add(rock);
+            }
+        }
+
+        // === ВОДОРОСЛИ ===
+        function createSeaweed() {
+            const weedColors = [0x2e7d32, 0x388e3c, 0x43a047, 0x1b5e20, 0x558b2f];
+
+            for (let i = 0; i < 12; i++) {
+                const height = 3 + Math.random() * 5;
+                const segments = 8;
+                const points = [];
+
+                for (let j = 0; j <= segments; j++) {
+                    const t = j / segments;
+                    points.push(new THREE.Vector3(
+                        Math.sin(t * 3 + Math.random()) * 0.3,
+                        t * height,
+                        Math.cos(t * 2 + Math.random()) * 0.3
+                    ));
+                }
+
+                const curve = new THREE.CatmullRomCurve3(points);
+                const radius = 0.15 + Math.random() * 0.1;
+                const geo = new THREE.TubeGeometry(curve, 12, radius, 5, false);
+
+                const color = weedColors[Math.floor(Math.random() * weedColors.length)];
+                const mat = new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.7,
+                    metalness: 0.1,
+                    transparent: true,
+                    opacity: 0.9
+                });
+
+                const weed = new THREE.Mesh(geo, mat);
+                weed.position.set(
+                    (Math.random() - 0.5) * 28,
+                    0.2,
+                    (Math.random() - 0.5) * 14
+                );
+                weed.castShadow = true;
+                scene.add(weed);
+
+                seaweedArray.push({
+                    mesh: weed,
+                    phase: Math.random() * Math.PI * 2,
+                    speed: 0.5 + Math.random() * 0.5
+                });
+            }
+        }
+
+        // === СОЗДАНИЕ РЫБКИ ===
+        function createFishMesh(colorScheme, scale) {
+            const group = new THREE.Group();
+
+            // Тело (вытянутая сфера)
+            const bodyGeo = new THREE.SphereGeometry(0.5, 12, 10);
+            bodyGeo.scale(1.8, 1, 0.9);
+            const bodyMat = new THREE.MeshStandardMaterial({
+                color: colorScheme.body,
+                roughness: 0.3,
+                metalness: 0.4,
+                emissive: colorScheme.body,
+                emissiveIntensity: 0.05
+            });
+            const body = new THREE.Mesh(bodyGeo, bodyMat);
+            body.castShadow = true;
+            group.add(body);
+
+            // Глаза
+            const eyeGeo = new THREE.SphereGeometry(0.08, 8, 8);
+            const eyeWhiteMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.2 });
+            const pupilGeo = new THREE.SphereGeometry(0.04, 6, 6);
+            const pupilMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.1, metalness: 0.5 });
+
+            const leftEye = new THREE.Mesh(eyeGeo, eyeWhiteMat);
+            leftEye.position.set(0.7, 0.1, 0.25);
+            group.add(leftEye);
+
+            const rightEye = new THREE.Mesh(eyeGeo, eyeWhiteMat);
+            rightEye.position.set(0.7, 0.1, -0.25);
+            group.add(rightEye);
+
+            const leftPupil = new THREE.Mesh(pupilGeo, pupilMat);
+            leftPupil.position.set(0.76, 0.1, 0.25);
+            group.add(leftPupil);
+
+            const rightPupil = new THREE.Mesh(pupilGeo, pupilMat);
+            rightPupil.position.set(0.76, 0.1, -0.25);
+            group.add(rightPupil);
+
+            // Хвост
+            const tailGeo = new THREE.ConeGeometry(0.3, 0.6, 6);
+            tailGeo.rotateZ(Math.PI / 2);
+            const tailMat = new THREE.MeshStandardMaterial({
+                color: colorScheme.fin,
+                roughness: 0.4,
+                metalness: 0.3,
+                transparent: true,
+                opacity: 0.85
+            });
+            const tail = new THREE.Mesh(tailGeo, tailMat);
+            tail.position.set(-0.9, 0, 0);
+            tail.castShadow = true;
+            group.add(tail);
+
+            // Верхний плавник
+            const topFinGeo = new THREE.ConeGeometry(0.2, 0.4, 4);
+            topFinGeo.rotateX(Math.PI / 2);
+            const topFinMat = new THREE.MeshStandardMaterial({
+                color: colorScheme.fin,
+                roughness: 0.5,
+                metalness: 0.2,
+                transparent: true,
+                opacity: 0.7
+            });
+            const topFin = new THREE.Mesh(topFinGeo, topFinMat);
+            topFin.position.set(0, 0.4, 0);
+            topFin.rotation.x = -0.3;
+            group.add(topFin);
+
+            // Боковые плавники
+            const sideFinGeo = new THREE.ConeGeometry(0.15, 0.35, 4);
+            sideFinGeo.rotateZ(Math.PI / 2);
+
+            const leftFin = new THREE.Mesh(sideFinGeo, topFinMat.clone());
+            leftFin.position.set(0.1, -0.1, 0.35);
+            leftFin.rotation.x = 0.5;
+            group.add(leftFin);
+
+            const rightFin = new THREE.Mesh(sideFinGeo, topFinMat.clone());
+            rightFin.position.set(0.1, -0.1, -0.35);
+            rightFin.rotation.x = -0.5;
+            group.add(rightFin);
+
+            group.scale.setScalar(scale);
+            return { group, tail, leftFin, rightFin };
+        }
+
+        // === ДОБАВЛЕНИЕ РЫБКИ ===
+        function addFish() {
+            const scheme = colorSchemes[Math.floor(Math.random() * colorSchemes.length)];
+            const scale = 0.6 + Math.random() * 0.6;
+            const { group, tail, leftFin, rightFin } = createFishMesh(scheme, scale);
+
+            const pos = new THREE.Vector3(
+                (Math.random() - 0.5) * 28,
+                3 + Math.random() * 14,
+                (Math.random() - 0.5) * 14
+            );
+            group.position.copy(pos);
+
+            const velocity = new THREE.Vector3(
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 0.5,
+                (Math.random() - 0.5) * 2
+            ).normalize().multiplyScalar(1 + Math.random() * 2);
+
+            scene.add(group);
+
+            fishArray.push({
+                mesh: group,
+                tail: tail,
+                leftFin: leftFin,
+                rightFin: rightFin,
+                velocity: velocity,
+                speed: 1.5 + Math.random() * 2,
+                tailSpeed: 4 + Math.random() * 4,
+                phase: Math.random() * Math.PI * 2,
+                targetFood: null,
+                avoidanceRadius: 2 + Math.random() * 1.5,
+                wanderTimer: Math.random() * 3,
+                baseScale: scale
+            });
+
+            updateStats();
+        }
+
+        // === ПУЗЫРИ ===
+        function addBubble(randomY) {
+            const size = 0.08 + Math.random() * 0.15;
+            const geo = new THREE.SphereGeometry(size, 8, 8);
+            const mat = new THREE.MeshPhysicalMaterial({
+                color: 0xaaddff,
+                transparent: true,
+                opacity: 0.4,
+                roughness: 0,
+                metalness: 0.1,
+                transmission: 0.8,
+                thickness: 0.1
+            });
+
+            const bubble = new THREE.Mesh(geo, mat);
+            bubble.position.set(
+                (Math.random() - 0.5) * 30,
+                randomY ? Math.random() * 22 : 0.5,
+                (Math.random() - 0.5) * 16
+            );
+            scene.add(bubble);
+
+            bubbleArray.push({
+                mesh: bubble,
+                speed: 0.5 + Math.random() * 1,
+                phase: Math.random() * Math.PI * 2,
+                amplitude: 0.2 + Math.random() * 0.3
+            });
+        }
+
+        function addBubbles() {
+            for (let i = 0; i < 10; i++) {
+                addBubble(false);
+            }
+        }
+
+        // === КОРМЛЕНИЕ ===
+        function onMouseClick(event) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // Создаём точку на плоскости внутри аквариума
+            const intersects = raycaster.intersectObjects(scene.children);
+
+            // Определяем позицию кормления
+            let feedPos;
+            if (intersects.length > 0) {
+                feedPos = intersects[0].point.clone();
+            } else {
+                // Если не попали в объект, проецируем на плоскость
+                const dir = raycaster.ray.direction;
+                const dist = (tankCenter.y - raycaster.ray.origin.y) / dir.y;
+                if (dist > 0) {
+                    feedPos = raycaster.ray.origin.clone().add(dir.clone().multiplyScalar(dist));
+                } else {
+                    feedPos = tankCenter.clone();
+                }
+            }
+
+            // Ограничиваем позицией внутри аквариума
+            feedPos.x = Math.max(-tankBounds.x, Math.min(tankBounds.x, feedPos.x));
+            feedPos.y = Math.max(1, Math.min(23, feedPos.y));
+            feedPos.z = Math.max(-tankBounds.z, Math.min(tankBounds.z, feedPos.z));
+
+            spawnFood(feedPos);
+        }
+
+        function spawnFood(position) {
+            const count = 3 + Math.floor(Math.random() * 4);
+            for (let i = 0; i < count; i++) {
+                const size = 0.08 + Math.random() * 0.06;
+                const geo = new THREE.SphereGeometry(size, 6, 6);
+                const mat = new THREE.MeshStandardMaterial({
+                    color: 0xff6600,
+                    emissive: 0xff4400,
+                    emissiveIntensity: 0.3,
+                    roughness: 0.5
+                });
+
+                const food = new THREE.Mesh(geo, mat);
+                food.position.copy(position);
+                food.position.x += (Math.random() - 0.5) * 1;
+                food.position.y += (Math.random() - 0.5) * 0.5;
+                food.position.z += (Math.random() - 0.5) * 1;
+                food.castShadow = true;
+                scene.add(food);
+
+                foodArray.push({
+                    mesh: food,
+                    velocity: new THREE.Vector3(
+                        (Math.random() - 0.5) * 0.5,
+                        -0.5 - Math.random(),
+                        (Math.random() - 0.5) * 0.5
+                    ),
+                    life: 10
+                });
+            }
+            updateStats();
+        }
+
+        // === ОБНОВЛЕНИЕ РЫБОК ===
+        function updateFish(dt, time) {
+            for (let i = fishArray.length - 1; i >= 0; i--) {
+                const fish = fishArray[i];
+                const pos = fish.mesh.position;
+
+                // Случайное блуждание
+                fish.wanderTimer -= dt;
+                if (fish.wanderTimer <= 0) {
+                    fish.wanderTimer = 2 + Math.random() * 4;
+                    fish.velocity.x += (Math.random() - 0.5) * 1.5;
+                    fish.velocity.y += (Math.random() - 0.5) * 0.5;
+                    fish.velocity.z += (Math.random() - 0.5) * 1.5;
+                }
+
+                // Избегание столкновений
+                for (let j = 0; j < fishArray.length; j++) {
+                    if (i === j) continue;
+                    const other = fishArray[j];
+                    const diff = pos.clone().sub(other.mesh.position);
+                    const dist = diff.length();
+                    if (dist < fish.avoidanceRadius && dist > 0.01) {
+                        diff.normalize();
+                        const force = (fish.avoidanceRadius - dist) / fish.avoidanceRadius;
+                        fish.velocity.add(diff.multiplyScalar(force * 2));
+                    }
+                }
+
+                // Отражение от стен
+                const wallMargin = 1.5;
+                if (pos.x > tankBounds.x - wallMargin) fish.velocity.x -= 0.5;
+                if (pos.x < -tankBounds.x + wallMargin) fish.velocity.x += 0.5;
+                if (pos.y > tankCenter.y + tankBounds.y - wallMargin) fish.velocity.y -= 0.3;
+                if (pos.y < tankCenter.y - tankBounds.y + wallMargin + 1) fish.velocity.y += 0.3;
+                if (pos.z > tankBounds.z - wallMargin) fish.velocity.z -= 0.5;
+                if (pos.z < -tankBounds.z + wallMargin) fish.velocity.z += 0.5;
+
+                // Поиск корма
+                fish.targetFood = null;
+                let closestDist = 15;
+                for (let f = foodArray.length - 1; f >= 0; f--) {
+                    const food = foodArray[f];
+                    const dist = pos.distanceTo(food.mesh.position);
+                    if (dist < closestDist) {
+                        closestDist = dist;
+                        fish.targetFood = food;
+                    }
+                }
+
+                if (fish.targetFood) {
+                    const dir = fish.targetFood.mesh.position.clone().sub(pos).normalize();
+                    fish.velocity.add(dir.multiplyScalar(3));
+                }
+
+                // Ограничение скорости
+                const speed = fish.velocity.length();
+                if (speed > fish.speed) {
+                    fish.velocity.normalize().multiplyScalar(fish.speed);
+                }
+
+                // Обновление позиции
+                pos.add(fish.velocity.clone().multiplyScalar(dt));
+
+                // Поворот в направлении движения
+                if (speed > 0.1) {
+                    const targetQuat = new THREE.Quaternion();
+                    const lookAt = pos.clone().add(fish.velocity);
+                    const tempObj = new THREE.Object3D();
+                    tempObj.position.copy(pos);
+                    tempObj.lookAt(lookAt);
+                    targetQuat.copy(tempObj.quaternion);
+                    fish.mesh.quaternion.slerp(targetQuat, 0.05);
+                }
+
+                // Анимация хвоста
+                fish.phase += fish.tailSpeed * dt;
+                fish.tail.rotation.y = Math.sin(fish.phase) * 0.5;
+
+                // Анимация плавников
+                const finPhase = fish.phase * 0.7;
+                fish.leftFin.rotation.x = 0.5 + Math.sin(finPhase) * 0.3;
+                fish.rightFin.rotation.x = -0.5 - Math.sin(finPhase) * 0.3;
+            }
+
+            // Проверка поедания корма
+            for (let i = fishArray.length - 1; i >= 0; i--) {
+                const fish = fishArray[i];
+                for (let f = foodArray.length - 1; f >= 0; f--) {
+                    const food = foodArray[f];
+                    const dist = fish.mesh.position.distanceTo(food.mesh.position);
+                    if (dist < 0.5) {
+                        // Съедение
+                        scene.remove(food.mesh);
+                        foodArray.splice(f, 1);
+                        // Рост рыбки
+                        const currentScale = fish.mesh.scale.x;
+                        const newScale = Math.min(currentScale * 1.05, 2.0);
+                        fish.mesh.scale.setScalar(newScale);
+                        fish.baseScale = newScale;
+                        updateStats();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // === ОБНОВЛЕНИЕ ПУЗЫРЕЙ ===
+        function updateBubbles(dt, time) {
+            for (let i = bubbleArray.length - 1; i >= 0; i--) {
+                const bubble = bubbleArray[i];
+                const pos = bubble.mesh.position;
+
+                pos.y += bubble.speed * dt;
+                pos.x += Math.sin(time * 2 + bubble.phase) * bubble.amplitude * dt;
+                pos.z += Math.cos(time * 1.5 + bubble.phase) * bubble.amplitude * dt;
+
+                // Сброс при достижении поверхности
+                if (pos.y > tankCenter.y + tankBounds.y - 1) {
+                    pos.y = 0.5;
+                    pos.x = (Math.random() - 0.5) * 30;
+                    pos.z = (Math.random() - 0.5) * 16;
+                }
+            }
+        }
+
+        // === ОБНОВЛЕНИЕ КОРМА ===
+        function updateFood(dt) {
+            for (let i = foodArray.length - 1; i >= 0; i--) {
+                const food = foodArray[i];
+                const pos = food.mesh.position;
+
+                // Гравитация
+                food.velocity.y -= 2 * dt;
+
+                // Сопротивление воды
+                food.velocity.multiplyScalar(0.98);
+
+                pos.add(food.velocity.clone().multiplyScalar(dt));
+
+                // Удаление при достижении дна или истечении срока
+                food.life -= dt;
+                if (pos.y < 0.3 || food.life <= 0) {
+                    scene.remove(food.mesh);
+                    foodArray.splice(i, 1);
+                    updateStats();
+                }
+            }
+        }
+
+        // === АНИМАЦИЯ ВОДОРОССОВ ===
+        function updateSeaweed(time) {
+            for (const weed of seaweedArray) {
+                weed.mesh.rotation.x = Math.sin(time * weed.speed + weed.phase) * 0.05;
+                weed.mesh.rotation.z = Math.cos(time * weed.speed * 0.7 + weed.phase) * 0.04;
+            }
+        }
+
+        // === ПЕРЕКЛЮЧЕНИЕ СВЕТА ===
+        function toggleLight() {
+            lightOn = !lightOn;
+            directionalLight.intensity = lightOn ? 1.2 : 0.1;
+            document.getElementById('lightBtn').textContent = lightOn ? '☀️ Свет' : '🌙 Темнота';
+            document.getElementById('lightBtn').style.opacity = lightOn ? '1' : '0.7';
+        }
+
+        // === СТАТИСТИКА ===
+        function updateStats() {
+            document.getElementById('fish-count').textContent = fishArray.length;
+            document.getElementById('food-count').textContent = foodArray.length;
+        }
+
+        // === RESIZE ===
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // === ГЛАВНЫЙ ЦИКЛ ===
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.05);
+            const time = clock.getElapsedTime();
+
+            // Обновление систем
+            updateFish(dt, time);
+            updateBubbles(dt, time);
+            updateFood(dt);
+            updateSeaweed(time);
+
+            // Контролы
+            controls.update();
+
+            // FPS
+            fpsFrames++;
+            fpsTime += dt;
+            if (fpsTime >= 0.5) {
+                const fps = Math.round(fpsFrames / fpsTime);
+                document.getElementById('fps-counter').textContent = fps;
+                fpsFrames = 0;
+                fpsTime = 0;
+            }
+
+            // Рендер
+            renderer.render(scene, camera);
+        }
+
+        // === СТАРТ ===
+        init();
+    </script>
+</body>
+</html>
+```
+
+## Что реализовано:
+
+| Компонент | Описание |
+|-----------|----------|
+| **🐠 Рыбки** | 15 штук, 8 цветовых схем, анатомия (тело, глаза, хвост, плавники), плавная анимация |
+| **🧠 ИИ** | Избегание столкновений, отражение от стен, блуждание, погоня за кормом, рост |
+| **🌊 Окружение** | Стеклянный аквариум с рамкой, песчаное дно, 8 камней, 12 водорослей |
+| **💭 Пузыри** | 30 штук, прозрачные, поднимаются с покачиванием |
+| **🍽️ Кормление** | Клик → корм падает → рыбки плывут и едят → растут |
+| **💡 Свет** | Ambient + Directional (с тенями) + 2 PointLight, переключаемый |
+| **🎮 Камера** | OrbitControls с damping, ограничениями зума и угла |
+| **🖥️ UI** | Glass-morphism панели, статистика, кнопки управления |
+| **🎨 Эффекты** | FogExp2, ACES tone mapping, PCFSoftShadowMap |
+
+Просто сохраните как `.html` и откройте в браузере — всё работает из коробки!
