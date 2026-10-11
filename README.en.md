@@ -50,7 +50,7 @@ described too.
 | **top speed on Qwen3.8** | [`unsloth/Qwen3.8-27B-NVFP4`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) · 22 GB + drafter [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (BF16!) | vLLM **0.2.1** + [two fixes](#qwen38-27b--dflash2-twice-as-fast-but-the-fork-needs-fixing) | **124–128 t/s** on code, ~60 on prose¹ |
 | **top speed** | [`QuantTrio/Qwen3.6-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) · 20.4 GB | vLLM **0.2.1-pre3** | **99.6 t/s** on code, 87.0 on prose |
 | **the smartest of the fast ones** | [`twolven/Qwen3.8-27B-abliterated-AWQ-MTP`](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP) · 18.2 GB | vLLM **0.2.1-pre3** | **99.4** on code, 74.8 on prose |
-| **the smartest overall** | [`tirex2001/Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN) (NVFP4 + Q8 (DACAN)) | our own [DACAN](#our-own-engine-dacan--three-times-faster) | **72–80 t/s** on code, 60 on prose (47 in Russian), prompt 715–786 t/s, context 262144 |
+| **the smartest overall** | [`tirex2001/Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN) (NVFP4 + Q8 (DACAN)); the service runs its fine-tune [`tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN) in the same quant | our own [DACAN](#our-own-engine-dacan--three-times-faster) | Swift 1.5 (11.10): **~90 t/s** on code, 55–75 in Russian; the original (03.10): 72–80 on code, 47–60 on prose; prompt 715–786 t/s, window 524 288 (native 262 144) |
 | the same without our engine | [`lmstudio-community/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-Flash-Next-GGUF) Q4_K_M · 111 GB | llama.cpp | 17.7 t/s (28–30 with PR #27861), context 262144 |
 | the same, more accurate | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q6_K_XL · 158 GB | llama.cpp | 14.5 t/s, needs 160 GB of RAM |
 
@@ -367,12 +367,13 @@ and this machine: two cards, two Ice Lake sockets with AVX-512 VNNI, MTP drafts.
 
 | | |
 |---|---:|
+| decode on the service, Swift 1.5 NVFP4 + Q8 (11.10): code / Russian text | ~90 / 55–75 t/s |
 | decode: code, 10 250 tokens / a list after a fresh 19K prompt (03.10, idle node) | 76.9 / 80.4 t/s |
 | decode: an answer with reasoning low, 1 984 tokens (calibration request, 03.10) | 71.9 t/s |
 | decode: English / Russian prose (03.10) | 60.4 / 47.0 t/s |
 | decode at 98K of context (03.10) | 69.9 t/s |
 | decode, an answer of 46 thousand tokens (xhigh) | 56.6 t/s |
-| context | 262 144, KV int8 |
+| window | 524 288 since 06.10 (the model's native 262 144), KV int8 |
 | prompt read from scratch, 19K: 03.10 / 29.09 | 786 / 798 t/s |
 | prompt read from scratch: synthetic 98K (03.10) / a live Claude Code conversation of 94K (29.09) | 715 / 770 t/s |
 | the same before 29.09: prefill at 8K / 195K | 309 / 267 t/s |

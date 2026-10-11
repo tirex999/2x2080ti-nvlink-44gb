@@ -50,7 +50,7 @@ bash install.sh             # поставить
 | **максимум скорости на Qwen3.8** | [`unsloth/Qwen3.8-27B-NVFP4`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) · 22 ГБ + драфтер [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (BF16!) | vLLM **0.2.1** + [две правки](#qwen38-27b--dflash2-вдвое-быстрее-но-форк-надо-поправить) | **124–128 t/s** на коде, ~60 на прозе¹ |
 | **максимум скорости** | [`QuantTrio/Qwen3.6-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) · 20.4 ГБ | vLLM **0.2.1-pre3** | **99.6 t/s** на коде, 87.0 на прозе |
 | **самую умную из быстрых** | [`twolven/Qwen3.8-27B-abliterated-AWQ-MTP`](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP) · 18.2 ГБ | vLLM **0.2.1-pre3** | **99.4** на коде, 74.8 на прозе |
-| **самую умную вообще** | [`tirex2001/Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN) (NVFP4 + Q8 (DACAN)) | свой [DACAN](#свой-движок-dacan-дацан--втрое-быстрее) | **72–80 t/s** на коде, 60 на прозе (47 на русской), промт 715–786 t/s, контекст 262144 |
+| **самую умную вообще** | [`tirex2001/Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN) (NVFP4 + Q8 (DACAN)); на службе — её дообучение [`tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN`](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN) в том же кванте | свой [DACAN](#свой-движок-dacan-дацан--втрое-быстрее) | Swift 1.5 (11.10): **~90 t/s** на коде, 55–75 на русском; исходная (03.10): 72–80 на коде, 47–60 на прозе; промт 715–786 t/s, окно 524 288 (родное 262 144) |
 | то же без своего движка | [`lmstudio-community/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-Flash-Next-GGUF) Q4_K_M · 111 ГБ | llama.cpp | 17.7 t/s (28–30 с PR #27861), контекст 262144 |
 | её же поточнее | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q6_K_XL · 158 ГБ | llama.cpp | 14.5 t/s, нужно 160 ГБ ОЗУ |
 
@@ -355,12 +355,13 @@ Hermes подмешивает `extra_body` провайдера в каждый 
 
 | | |
 |---|---:|
+| декод на службе, Swift 1.5 NVFP4 + Q8 (11.10): код / русский текст | ~90 / 55–75 т/с |
 | декод: код, 10 250 токенов / список после свежего промта 19K (03.10, узел свободен) | 76.9 / 80.4 т/с |
 | декод: ответ с размышлением low, 1 984 токена (калибровочный запрос, 03.10) | 71.9 т/с |
 | декод: проза английская / русская (03.10) | 60.4 / 47.0 т/с |
 | декод на контексте 98K (03.10) | 69.9 т/с |
 | декод, ответ на 46 тыс. токенов (xhigh) | 56.6 т/с |
-| контекст | 262 144, KV int8 |
+| окно | 524 288 с 06.10 (родное у модели 262 144), KV int8 |
 | чтение промта с нуля, 19K: 03.10 / 29.09 | 786 / 798 т/с |
 | чтение промта с нуля: синтетика 98K (03.10) / живой разговор Claude Code 94K (29.09) | 715 / 770 т/с |
 | то же до 29.09: префилл на 8K / 195K | 309 / 267 т/с |
