@@ -11,6 +11,8 @@ API (llama-server, vLLM, DACAN). Ответы запрашиваются без 
 | `quality_cmp.py` | сводка галереи по задачам и уровням размышления: проверок пройдено / всего, годен ли |
 | `recheck_anim.py` | перепроверка старых прогонов после правки проверки «цикл анимации» (`setAnimationLoop` засчитан) |
 | `needle.py` | иголка: кодовое слово на 40 % глубины длинного промпта (8K, 32K, 128K, 240K токенов по счёту знаков), префилл из `/metrics` сервера |
+| `tidehaven_progon.py` | задача Tidehaven (`prompts/tidehaven_prompt.txt`, остров-диорама Three.js) одним запросом на четырёх уровнях размышления (нет / low / medium / high), выборка 0.6 / 0.95 / 20, seed 1110; пишет ответ, размышление, страницу и замер скорости |
+| `tidehaven_test.py` | проверка страницы в настоящем браузере (Chromium без экрана, Playwright): ошибки страницы, холст WebGL, сцена движется, звук только после клика, каждая кнопка и каждый ползунок, пауза останавливает мир, холст следует за окном, pixel ratio на экране 3x, мобильная вёрстка 390x844 и сворачивание панелей; 22 проверки, порог 18 и ни одной ошибки страницы. Заставку («Enter», «Step ashore») проходит сама |
 
 Запуск одного прогона (адрес сервера, контекст, ключ задачи, прогонов, подпись, полное имя, квант, уровень размышления):
 
@@ -34,3 +36,10 @@ NEEDLE_CORPUS=/путь/к/большому/каталогу/py NEEDLE_OUT=needl
 
 Сторож ядер для соседней ВМ: `scripts/dacan-cpu-guard.sh`, `systemd/dacan-cpu-guard.service`, калибровка —
 `scripts/quality/calib_guard2.sh` (номер ВМ и адрес движка в них наши, поправьте под себя).
+
+Tidehaven (галерея, `docs/hamsters/tidehaven.html`):
+
+```bash
+BENCH_BASE=http://127.0.0.1:8000 python3 tidehaven_progon.py /путь/к/папке   # рядом с ним prompt.txt
+python tidehaven_test.py страница.html отчёты имя        # pip install playwright pillow; playwright install chromium
+```
