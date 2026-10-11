@@ -44,6 +44,8 @@ for level in LEVELS:
         time.sleep(5)
     body = {"model": "dacan", "stream": False, "messages": [{"role": "user", "content": PROMPT}],
             "reasoning_effort": level, "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": SEED}
+    if os.environ.get("TIDEHAVEN_MAX_TOKENS"):    # 11.10: a cap for servers that keep the client's (DACAN-2); DACAN-1's
+        body["max_tokens"] = int(os.environ["TIDEHAVEN_MAX_TOKENS"])   # service raises any cap to 100000 itself
     say("==", level, "старт")
     t0 = time.time()
     req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(),
