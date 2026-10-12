@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Как самому квантовать модель из BF16</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f6f3ee;--panel:#fffdfa;--fg:#1c1a17;--mut:#6b6459;--line:#e0d9cd;
+  --acc:#b4531b;--acc-soft:#f3e3d6;--ok:#2f6b3f;--bad:#8c2f2f}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#131210;--panel:#1c1a17;--fg:#ece7de;--mut:#9b9284;--line:#302c26;
+  --acc:#e0913f;--acc-soft:#2a2018;--ok:#79bd8a;--bad:#e08a84}}
+:root[data-theme="dark"]{--bg:#131210;--panel:#1c1a17;--fg:#ece7de;--mut:#9b9284;
+  --line:#302c26;--acc:#e0913f;--acc-soft:#2a2018;--ok:#79bd8a;--bad:#e08a84}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:400 16.5px/1.68 "IBM Plex Sans","Segoe UI",system-ui,sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:0 22px 80px}
+.back{display:inline-block;margin:26px 0 6px;font:500 13px/1 "IBM Plex Mono",monospace;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--acc);text-decoration:none}
+.back:hover{text-decoration:underline}
+h1{font:700 clamp(30px,5vw,46px)/1.08 "IBM Plex Sans Condensed",sans-serif;
+  letter-spacing:-.02em;margin:14px 0 24px;text-wrap:balance}
+h2{font:600 26px/1.2 "IBM Plex Sans Condensed",sans-serif;letter-spacing:-.01em;
+  margin:52px 0 14px;padding-top:16px;border-top:1px solid var(--line);text-wrap:balance}
+h3{font:600 19px/1.3 "IBM Plex Sans",sans-serif;margin:34px 0 10px}
+p{margin:0 0 16px;max-width:68ch}
+ul,ol{max-width:68ch;padding-left:22px}
+li{margin:5px 0}
+a{color:var(--acc)}
+strong{font-weight:600}
+code{font:500 14px/1.5 "IBM Plex Mono",monospace;background:var(--acc-soft);
+  color:var(--acc);padding:1.5px 6px;border-radius:5px}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;margin:0 0 20px}
+pre code{background:none;color:var(--fg);padding:0;font-size:13.5px;line-height:1.6}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:0 0 24px}
+table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:520px}
+th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--panel);font:600 12px/1.3 "IBM Plex Mono",monospace;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--mut);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+blockquote{margin:0 0 20px;padding:2px 0 2px 18px;border-left:3px solid var(--acc);
+  color:var(--mut)}
+hr{border:none;border-top:1px solid var(--line);margin:40px 0}
+em{color:var(--mut)}
+</style></head>
+<body><div class="wrap">
+<a class="back" href="./">← ко всем документам</a>
+<h1>Как самому квантовать модель из BF16</h1>
+<p>Инструкция собрана по нашим прогонам на двух RTX 2080 Ti 22 ГБ и двух Xeon Platinum 8368. Числа ниже — наши
+замеры, и там, где это не замер, а арифметика, так и написано. Путь описан для GGUF и <code>llama.cpp</code>: это то, чем
+модели запускаются на обычном железе, и то, что мы делаем сами.</p>
+<h2>Коротко: что происходит</h2>
+<p>Модель на Hugging Face лежит в BF16 — по два байта на вес. Квантование заменяет эти байты на 8, 5, 4 или
+меньше бит: веса группируются в блоки, и на блок запоминается один масштаб. Файл становится в два-четыре раза
+меньше, и главное — больше его частей влезает в видеопамять.</p>
+<p>Одну вещь стоит понять заранее: <strong>разные тензоры терпят сжатие по-разному</strong>. У модели с экспертами (MoE)
+почти весь вес лежит в экспертах, а внимание и нормировки занимают единицы процентов. Поэтому экспертов режут
+агрессивно, а внимание оставляют точным — так файл падает сильно, а качество почти нет. Единый тип на всю
+модель (<code>--pure</code>) — худший из вариантов.</p>
+<h2>Что понадобится</h2>
+<ul>
+<li><strong>Место на диске: примерно три размера модели.</strong> Исходник BF16, промежуточный GGUF BF16 и готовый квант.
+  Для модели на 125 млрд параметров это 360 ГБ + 335 ГБ + сам квант; для модели на 27 млрд — 54 + 54 + 15–30 ГБ.</li>
+<li><strong>ОЗУ: не меньше того, что квантуется за один проход.</strong> Квантование читает тензор целиком. Наш 8-битный
+  прогон упирался в 189 ГиБ, и пришлось ставить планки; смешанный четырёхбитный шёл в 133 ГиБ.</li>
+<li><strong>Локальный диск, а не сетевая шара.</strong> Квантование читает исходник подряд и быстро. У нас всё, что шло с
+  гигабитной шары на вращающихся дисках, тормозило в разы: та же модель с сетевого диска поднималась 42 минуты
+  вместо двух.</li>
+<li><strong><code>llama.cpp</code>, собранный из исходников</strong> — нужны <code>convert_hf_to_gguf.py</code> и <code>llama-quantize</code>.</li>
+<li>Карта для квантования не нужна вообще: это работа процессора и диска.</li>
+</ul>
+<h2>Шаг 1. Забрать исходник BF16</h2>
+<pre><code class="language-bash">pip install -U huggingface_hub
+HF_HUB_DISABLE_XET=1 python -c &quot;
+from huggingface_hub import snapshot_download
+snapshot_download('&lt;автор&gt;/&lt;модель&gt;', local_dir='./bf16-src')
+&quot;
+</code></pre>
+<p>Такой вызов работает в любой версии библиотеки. Консольная команда в свежих версиях называется <code>hf download</code>,
+в старых — <code>huggingface-cli download</code>; если пользуетесь ею, сверьтесь со своей версией.</p>
+<p><code>HF_HUB_DISABLE_XET=1</code> — не косметика. Без него закачка больших репозиториев у нас обрывалась и начиналась
+заново; с ним идёт ровно. Для закрытых репозиториев сначала выполните вход.</p>
+<p>Проверьте, что скачалось целиком: число файлов и суммарный размер должны совпасть с тем, что показывает
+страница модели. Недокачанный шард проявится только на шаге 2 — обидно после часа ожидания.</p>
+<h2>Шаг 2. BF16 → GGUF</h2>
+<pre><code class="language-bash">git clone https://github.com/ggml-org/llama.cpp &amp;&amp; cd llama.cpp
+cmake -B build -DGGML_NATIVE=ON &amp;&amp; cmake --build build -j --config Release
+python convert_hf_to_gguf.py ../bf16-src --outtype bf16 --outfile ../model-bf16.gguf
+</code></pre>
+<p>Это ещё не квантование: тот же BF16, только в формате, который понимает <code>llama.cpp</code>. Шаг нужен, потому что
+<code>llama-quantize</code> работает с GGUF, а не с <code>safetensors</code>.</p>
+<p>Если конвертер падает с «unsupported architecture» — модель новее вашей копии <code>llama.cpp</code>. Обновите
+репозиторий; если архитектуры нет и там, этим путём модель пока не квантуется.</p>
+<h2>Шаг 3. Нужна ли калибровка (imatrix)</h2>
+<p><strong>Для 8 бит — нет.</strong> Ошибка Q8_0 на наших прогонах выходила 0.55–0.71 % на слой и без всякой калибровки.</p>
+<p><strong>Для 4 бит и ниже — да, помогает заметно.</strong> Матрица важности показывает квантователю, какие веса влияют на
+ответ сильнее, и он тратит на них точность.</p>
+<pre><code class="language-bash">./build/bin/llama-imatrix -m ../model-bf16.gguf -f calibration.txt -o ../imatrix.dat --chunks 200
+</code></pre>
+<p>Бинарь появляется, если сборка включала примеры; если его нет в <code>build/bin</code>, пересоберите без
+<code>-DLLAMA_BUILD_EXAMPLES=OFF</code>.</p>
+<p>В <code>calibration.txt</code> положите текст, похожий на вашу работу: будет писать код — код, отвечать по-русски —
+русские тексты. Хватает нескольких мегабайт. Калибровка на чужом языке даёт модель, которая хуже отвечает
+на вашем.</p>
+<h2>Шаг 4. Само квантование: типы по тензорам</h2>
+<p>Простой вариант — один тип на всё:</p>
+<pre><code class="language-bash">./build/bin/llama-quantize ../model-bf16.gguf ../model-q8.gguf Q8_0
+</code></pre>
+<p>Вариант, который используем мы — разные типы разным тензорам:</p>
+<pre><code class="language-bash">./build/bin/llama-quantize \
+  --imatrix ../imatrix.dat \
+  --tensor-type ffn_gate_exps=iq4_nl \
+  --tensor-type ffn_up_exps=iq4_nl \
+  --tensor-type ffn_down_exps=iq4_nl \
+  --tensor-type attn_q=q8_0 --tensor-type attn_k=q8_0 \
+  --tensor-type attn_v=q8_0 --tensor-type attn_output=q8_0 \
+  --token-embedding-type q8_0 \
+  --output-tensor-type q8_0 \
+  ../model-bf16.gguf ../model-mix.gguf Q4_K_M
+</code></pre>
+<p>Последний аргумент — тип по умолчанию для всего, что не названо явно. Ключ <code>--tensor-type</code> принимает
+подстроку имени тензора, поэтому <code>attn_q</code> накрывает все слои сразу. Есть и <code>--tensor-type-file</code> со списком.</p>
+<p><strong>Перед длинным прогоном запустите с <code>--dry-run</code></strong>: он покажет, какой тип получит каждый тензор, ничего не
+записывая. Это пять секунд против часов, и именно здесь видны подмены типов из раздела про грабли.</p>
+<p>Ориентир по выбору: эксперты (<code>ffn_*_exps</code>) — 4 бита и ниже, внимание (<code>attn_*</code>) — 6–8 бит, эмбеддинги и
+выходной слой — 8 бит, нормировки оставить как есть. Порядок величин на нашей модели (125 млрд параметров,
+512 экспертов, 10 на токен): BF16 — 335 ГБ, готовый Q4_K_M — 119 ГБ (наш замер по файлу 04.09.2026).
+Переключение одного тензора <code>ffn_down_exps</code> на <code>iq4_nl</code> снимает ещё около 20 ГБ — это прямая арифметика по
+формам тензоров, отдельным прогоном мы её не перемеривали.</p>
+<h2>Шаг 5. Проверить, что получилось</h2>
+<p>Три проверки, каждая ловит свой класс ошибок.</p>
+<p><strong>1. Типы в файле — те, что вы просили.</strong> Не верьте команде, прочитайте файл:</p>
+<pre><code class="language-bash">python gguf-py/gguf/scripts/gguf_dump.py --no-tensors ../model-mix.gguf | head -40
+python -c &quot;
+from collections import Counter
+from gguf import GGUFReader
+r = GGUFReader('../model-mix.gguf')
+print(Counter(t.tensor_type.name for t in r.tensors))
+&quot;
+</code></pre>
+<p>Мы на этом поймали главную подмену: у модели с экспертами <code>ffn_down_exps</code> оказался не Q4_K, а Q8_0 — и файл
+был заметно больше ожидаемого. Причина — в разделе про грабли.</p>
+<p><strong>2. Модель отвечает.</strong></p>
+<pre><code class="language-bash">./build/bin/llama-cli -m ../model-mix.gguf -p &quot;Напиши функцию на Python, считающую факториал&quot; -n 200
+</code></pre>
+<p><strong>3. Сверка с исходником.</strong> Задайте один и тот же вопрос исходной модели и кванту, жадно (температура 0,
+фиксированный seed). Ответы не обязаны совпасть буква в букву, но смысл и структура должны. Так мы проверяли
+свой 8-битный квант: три жадных ответа совпали с исходником знак в знак — это и есть доказательство, что
+квантователь не испортил веса.</p>
+<h2>Грабли, на которые мы наступили</h2>
+<p><strong>k-кванты требуют, чтобы ведущая размерность делилась на 256.</strong> Самая частая и самая незаметная
+неприятность. У нашей модели у тензора <code>ffn_down_exps</code> ведущая размерность 640, а 640 % 256 = 128 — и
+<code>llama-quantize</code> <strong>молча</strong> понижает тип: Q6_K становится Q8_0, Q4_K становится Q5_0, дальше F16. Вы просили
+4 бита, получили 8.5, файл вдвое больше. Лечится 32-блочными типами: 640 % 32 = 0, поэтому <code>iq4_nl</code>
+(4.5 бита) законен и режет этот тензор с 42.8 до 22.7 ГБ. Проверяйте <code>--dry-run</code> и типы в готовом файле.</p>
+<p><strong>Роутер MoE квантовать нельзя.</strong> Тензор <code>ffn_gate_inp</code> стоит в жёстком исключении внутри <code>llama-quantize</code>, и
+<code>--tensor-type</code> его не перебивает. Это правильно: роутер решает, каких экспертов звать, и его ошибка портит
+ответ целиком. Но знайте, что он останется в F32 или BF16 и займёт своё место.</p>
+<p><strong>Исходник важнее степени сжатия.</strong> Квант из BF16 и квант из уже сжатого Q8_0 — разные вещи. Если качаете
+исходник ради квантования, берите BF16, даже если он вдвое тяжелее.</p>
+<p><strong>Один тип на всё — плохой выбор.</strong> <code>--pure</code> экономит десять минут раздумий и отнимает качество там, где оно
+дёшево: внимание занимает единицы процентов веса, а от сжатия страдает заметнее всего.</p>
+<p><strong>Сначала посмотрите готовые кванты.</strong> Прежде чем тратить сутки, скачайте чужой динамический квант (у unsloth,
+например, точность разная по тензорам) и замерьте его на своей задаче. Если он не хуже — своего кванта не
+нужно. Мы начинали именно с этой проверки.</p>
+<h2>Когда <code>llama-quantize</code> не справится</h2>
+<p>Редкий, но реальный случай: модель с нестандартными тензорами, которые движок хочет видеть в конкретном типе.
+У нас так вышло с роутерами — конвертер писал их в F32, а движок читает только BF16, и ключом это не
+правилось. Тогда квантователь пишется руками на <code>gguf-py</code>: читаете исходный GGUF тензор за тензором, нужные
+сжимаете (эталонная реализация Q8_0 есть в самом <code>ggml</code>), остальные копируете как есть, и пишете новый файл
+потоком, не держа всё в памяти. Это сотня строк, но берётесь за это только если упёрлись: штатный путь
+закрывает почти всё.</p>
+<h2>Сколько это занимает времени</h2>
+<p>Конвертация BF16 → GGUF идёт со скоростью диска. По квантованию у нас есть замер для <strong>своего</strong> квантователя
+на <code>gguf-py</code> (случай из предыдущего раздела): около 79 МБ/с на выходной файл, то есть 8-битный квант на 188 ГБ
+считался несколько часов. Скорость <code>llama-quantize</code> на тех же данных мы отдельно не мерили — она выше, но
+называть число не стану. Условие в любом случае одно: исходник на локальном диске, а не на сетевой шаре.</p>
+</div></body></html>
