@@ -1,0 +1,611 @@
+The user wants a complete single-file HTML with Three.js diorama. This is a large-scale generation task. I need to write a comprehensive, working index.html. Key features: procedural island, A-frame cabin, pier, cutaway water box, manta rays, fish schools, instanced meshes, UI controls, camera presets, procedural audio, time of day, tides, wind, kayak, ray jumps, pause/reset.
+
+I'll use Three.js via CDN (unpkg or cdnjs), OrbitControls from examples (import map for module version). Use three@0.160.0 module via importmap.
+
+Let me plan the architecture concisely but completely. Write well-organized commented code but keep it manageable. Aim for around 1500–2000 lines. Let me draft.
+
+Key design decisions:
+
+- Diorama: box-shaped "aquarium" — island inside a transparent box. Water represented as a semi-transparent volume mesh with front face at the box boundary. To avoid transparency sorting: render water with depthWrite false, render order: seabed/island first, then water volume, then glass walls. Use a box geometry for water with side material semi-transparent, water surface plane.
+
+Simplest robust approach: water is a box mesh from seabed to waterLevel, clipped to the diorama footprint, material: MeshPhysicalMaterial with transmission? Too heavy. Use MeshPhongMaterial with opacity ~0.35, depthWrite:false, transparent, side: DoubleSide, renderOrder mid. Surface plane slightly above with its own shader for waves.
+
+Cutaway: diorama footprint is a rounded rectangle; island sits inside; water box front/sides are visible glass walls. Glass walls: slightly tinted very low opacity, depthWrite false, renderOrder last.
+
+Waves: water surface plane with vertex displacement shader (custom ShaderMaterial or onBeforeCompile). Simpler: custom ShaderMaterial for water surface with waves + foam near shore (based on radial distance). Underwater caustics: animated pattern on seabed via shader (additive light pattern) — use plane with custom shader.
+
+Rays: procedural — flat body (scaled sphere), fins (custom shape via extrude or plane bends). Animate via morphs? Simpler: build from geometry with vertex animation in JS (update positions), or just animate whole mesh with slight sine deformation via shader. Keep simple: body = flattened ellipsoid; pectoral fins = triangle-ish plane rotated with sine wave; tail = thin box that sways. Move along path inside lagoon.
+
+Fish: small instanced cones; schools move in boids-like group — animate InstancedMesh matrices.
+
+Bubbles: instanced spheres rising.
+
+Kayak: simple hull shape (scaled sphere cut in half, or lathe). Path animation around lagoon.
+
+Ray jump: state machine — ray rises with parabola, rotates, splashes: spawn droplet particles + expanding ripple rings (ring mesh scaling with fading).
+
+Tide slider: waterLevel variable; water surface y, water box scale/position, foam, floating objects (kayak) follow.
+
+Wind slider: wave amplitude, tree/plant sway intensity.
+
+Time of day: buttons for day/sunset/night; lerp light colors, sky background color, toggle lantern/window glow (emissive intensity).
+
+Camera presets: lerp camera position and controls target with easing.
+
+Audio: WebAudio — gentle music: pentatonic plucks via oscillators on scheduled intervals with reverb-like delay; ambience: filtered noise loop for waves (LFO on gain), wind noise. Volume slider.
+
+UI: top-left title panel; right side control panel with sections; buttons for cameras; collapsible on mobile via hamburger.
+
+Quality: cap pixelRatio at 1.75 (1 on mobile); shadows PCFSoft.
+
+Trees: instanced cones? A few trees with sway via onBeforeCompile or per-frame rotation of group. Keep trees as Groups with slight rotation animation.
+
+Grass: InstancedMesh of small blades with wind sway via shader uniform? Simpler: update instance matrices for grass is costly; use shader with custom attribute and uniform time injected via onBeforeCompile. Or simpler: vertex displacement in ShaderMaterial for grass instances with custom attribute. Can use InstancedMesh with MeshStandardMaterial and onBeforeCompile adding sway using instanceMatrix position and time uniform. That's doable.
+
+Let me write the code.
+
+Structure:
+1. HTML head, styles.
+2. UI markup.
+3. Import map for three.
+4. Module script:
+   - Config/state
+   - Scene setup, renderer, camera, controls
+   - Lights
+   - Diorama: seabed, island, shore, rocks, grass, trees
+   - Cabin, deck, windows, props (bench, crates, towels, plants)
+   - Pier, ladder, lanterns, kayak
+   - Water volume, surface (shader), foam, caustics, glass walls
+   - Underwater: rays, fish schools, seaweed, underwater rocks, bubbles
+   - Particles: droplets, ripples
+   - Interaction handlers
+   - Camera presets and transitions
+   - Audio engine
+   - UI wiring
+   - Animation loop with delta time, pause
+
+Coordinates: diorama box: x -9..9, z -7..7, seabed y=-3, top of box y=4. Island is central-ish, radius ~5, height up to y=1.8. Water level default y=0.2 (tide range -0.5..1).
+
+Island: use cylinder-ish shape: displaced cylinder geometry, or radial height function plane. Build island from a circular plane grid: height = smooth falloff above water. Actually island should rise above water. Use a large plane (footprint) as seabed at y=-3, then island mesh: a blob from a low-poly displaced icosphere flattened, top ~y=2. Sandy shore: color by height via vertex colors: below waterline sand, above grass green. Good approach: single mesh with vertex colors based on height and slope.
+
+Build island as radial grid: for r from 0..islandRadius, height profile h(r) = H*(1-(r/R)^2) roughly, but with noise. Make island as a "dome" with skirt going down to seabed. Use parametric grid: circular disc with radius up to ~6 (bigger than water so shore intersects water). Vertex colors: y < waterline+0.15 → sand; above → grass; near edges → darker rock. Actually shore should be visible against water level — but vertex colors static; water level changes with tide. Acceptable: set sand band wide enough.
+
+Water volume mesh: box matching diorama footprint, from seabed to waterLevel, but must not occlude island weirdly. With depthWrite false and transparent, island renders correctly inside. Render order: opaque scene first (default), then water volume (renderOrder 2), surface plane (renderOrder 3), fish/rays are opaque — render before water? Opaque objects always render before transparent in three's default sorting (opaque first). Water transparent so fish inside box will be seen through water. Good. Glass front wall renderOrder 5.
+
+Foam: ring near island shore — use surface shader to add foam where distance to island center falls in a band based on r.
+
+Water surface: a plane matching footprint at waterLevel, ShaderMaterial with waves (sum of sines), fresnel-ish color, foam near island radius, transparency. side DoubleSide? Just top side; but from underwater camera we see underside — use DoubleSide with same shader.
+
+Caustics: seabed plane with custom shader: animated voronoi-ish pattern approximated with layered sines, additive, render as part of seabed material (MeshStandardMaterial with emissive map generated procedurally? Simpler: ShaderMaterial overlay plane just above seabed, additive blending, renderOrder 1, transparent). Underwater camera sees it.
+
+Underwater visibility: fog? Add scene.fog carefully — fog affects everything; can set fog color to water-ish color but above-water sky conflicts. Skip fog, or use selectively. Skip.
+
+Lighting: hemisphere + directional (sun) with shadows. Night: dim blue. Sunset: orange. Lerp on transition over ~2s.
+
+Camera presets:
+- iso: (14, 11, 14) target (0,0,0)
+- cozy: (7, 2.2, 9) target (2, 0.5, 3) near cabin/pier
+- underwater: (0, -1.5, 6.5) target (0,-1.2,0) — inside box. Camera inside water volume: water transparent with depthWrite false, viewed from inside DoubleSide — fine, add blue tint overlay? Can add a CSS overlay div with blue tint when underwater mode active. Do that: a #underwater-tint div with opacity transition.
+
+Ray jump: ray starts jump when near front area; parabola: pos.y = waterLevel + v0*t - 0.5*g*t²; rotate pitch = atan2(vy, vx). On splashdown: spawn droplets (instanced spheres with velocities) and 2-3 ripple ring meshes.
+
+Kayak: docked position near pier; launched: travels around lagoon along circular path at radius ~7.2 on water surface, bobbing; returns: moves back along path to dock.
+
+Music: pentatonic scale, schedule notes with random intervals, triangle wave + gentle envelope, through master gain, plus delay feedback. Start on first user gesture (any button or dedicated "audio" toggle). Music button toggles.
+
+Wave sound: white noise buffer looped through lowpass, gain modulated by LFO. Wind: bandpass noise, tied to wind slider.
+
+Now let me write code. Need to be careful with length but complete. Let me write.
+
+Important details:
+
+Import map:
+```
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+</script>
+```
+
+Renderer: antialias true (maybe false on mobile), shadowMap PCFSoft, pixelRatio min(devicePixelRatio, 1.75).
+
+Water surface shader:
+
+uniforms: uTime, uLevel (not needed for y since mesh position), uWind (amplitude), uDeepColor, uShallowColor, uFoamColor, uIslandR (function of distance), uTide.
+
+Vertex: pos.z? Plane rotated -PI/2 so local XY before rotation; displacement in local z (which becomes world y). Waves: h = sin(x*0.8+t)*... amplitude scaled by wind. Varying vWorldPos.
+
+Fragment: color mix based on distance from center island: r = length(vWorldPos.xz). Island radius at water level approx: shore radius depends on height. Compute foam band: smoothstep around shoreRadius(waterLevel). Approximate shore radius as function: island height profile h(r)=H*(1-(r/R)^2)^1.5 for r<R. Given level L, solve r = R*(1 - (L/H)^(2/3))... just approximate numerically in JS and pass as uniform uShoreR.
+
+Foam: band where |r - uShoreR| < 0.4 → whiteness with animated noise (sines).
+
+Alpha: base 0.55 + fresnel via dot(viewDir, normal). Keep simple: alpha ~0.6, foam alpha 0.9.
+
+Underwater surface view: fine.
+
+Water volume: BoxGeometry footprint (18 x depth x 14), MeshPhysicalMaterial? Use MeshPhongMaterial color 0x2f9e9f transparent opacity 0.22 depthWrite false side DoubleSide. RenderOrder 4. But this box's front face will overlap with fish — fine.
+
+Glass walls: box slightly larger, MeshPhysicalMaterial roughness 0, transmission? Simpler: MeshBasicMaterial opacity 0.06 color 0xbfe8ef depthWrite false side BackSide? Only render front-facing faces visible: use FrontSide with low opacity; edges: add thin box edges via EdgesGeometry LineSegments for frame look. Nice: diorama frame — dark wood or brass frame lines. Add frame edges with LineSegments, plus wooden base tray under box.
+
+Caustics shader plane at y=-2.98 covering footprint, additive, only visible underwater: renderOrder 1, blending Additive, transparent, depthWrite false. Above-water camera sees through water volume anyway; fine.
+
+Seabed: plane at y=-3 with sandy color, receives shadows? Shadows through transparent water OK.
+
+Island mesh: build custom BufferGeometry: grid rings. Let me generate: segments radial 48, rings 40, radius max 8.5 (extends beyond water to box? island should fit in box 18x14; radius 8.5 exceeds 7 in z. Make footprint ellipse: scale z by 0.78). Profile: for r<=R0=6.2: h = H*(1-(r/R0)^2)^1.4 - 3.2? Let's define world y: seabed -3, island top 2.2. h(r) = -3 + 5.4*pow(max(0,1-(r/6.2)^2),1.5). At r=6.2, h=-3 (meets seabed). Beyond 6.2: skirt flat -3. Noise: add pseudo-random via sin combos for bumps, plus flatten top a bit for cabin placement.
+
+Vertex colors: y< -0.15 sand (0xe8d5a8); -0.15..0.35 light sand/grass blend; >0.35 grass (0x6fae64 with noise variation); steep slopes → rock gray. Compute normals and assign color.
+
+Rocks: InstancedMesh dodecahedrons, several along shore and on seabed, random rotations/scales.
+
+Grass blades: InstancedMesh (thin cone or plane), ~400, on top area (r<4.5, y>0.5). Sway: onBeforeCompile with uniforms uTime, uWind; use instance world position from instanceMatrix to phase. In vertex shader: transformed position; add displacement based on local y (height along blade) * sin(uTime*2 + worldPos.x + worldPos.z)*uWind. Implement:
+
+```
+mat.onBeforeCompile = (s)=>{ s.uniforms.uTime=uni.time; s.uniforms.uWind=uni.wind;
+ s.vertexShader = s.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+ vec4 iw = instanceMatrix * vec4(0.,0.,0.,1.);
+ float ph = iw.x*1.7 + iw.z*2.3;
+ float bend = sin(uTime*2.2 + ph) * uWind * position.y * 0.25;
+ transformed.x += bend;`);
+```
+Need to declare uniforms: prepend `uniform float uTime; uniform float uWind;` before `void main`.
+
+Trees: group: trunk cylinder + 2-3 cone layers, low poly, slight sway via group rotation in animate (rotation.z = sin(t+phase)*wind*0.03). 4-6 trees. Maybe instanced? Groups fine for 5.
+
+Cabin: A-frame: two slanted roof planes forming an A (copper material, MeshStandardMaterial color 0xb87333 metalness .6 roughness .35), triangular front/back gable faces (custom geometry), dark wood walls inset, glowing windows: MeshBasicMaterial/Standard with emissive warm color; store window material for day/night emissive intensity. Deck: box platform + planks, deck posts. Front door. Chimney? Copper.
+
+Pier: planks boxes extending from deck over water in +z direction, support cylinders down to seabed. Ladder: two rails + rungs. Lanterns: small cylinders + glowing sphere, emissive material toggled at night; add PointLight? Few pointlights for lanterns (limit lights). Use emissive + 1-2 pointlights for cabin area at night.
+
+Props: bench (boxes), crates (instanced boxes 3), towels: thin colored planes draped on bench/railing; potted plants: small pots + instanced leaves cones.
+
+Kayak: hull: scaled sphere flattened, or LatheGeometry; simpler: box scaled + tapered via cylinder? Use scaled SphereGeometry (1.9,0.25,0.45), scale one end? Acceptable: elongated ellipsoid with slight scale asymmetry. Color warm orange.
+
+Rays: build with a Group: body = SphereGeometry scaled (1.1, 0.18, 0.9)? Manta: diamond pectoral fins: custom BufferGeometry triangle fan, or PlaneGeometry with vertices modified. Use custom shape: create geometry from vertices: front tip, sides, back near body. Fin flap animation: store fin geometry base positions, per frame update position attribute with sine wave along x. Or use shader onBeforeCompile for fin flap — easier: separate fin meshes with ShaderMaterial? Simplest and robust: update fin geometry positions in JS per frame (fin geometry ~ small, fine).
+
+Fin geometry: PlaneGeometry(1.6, 1.0, 6, 4) rotated flat, shear so inner edge attaches to body; animate z = sin(time*3 + x*2)*flapAmp * (|x|/halfW). Tail: thin box, sway rotation.
+
+Ray movement: waypoints within lagoon area avoiding island: circular-ish path at radius 6.5-7, depth -1 to -2, sinusoidal vertical. Turn: yaw toward path direction.
+
+Jumping ray: pick ray index 0. On trigger: set state to 'jump', compute start position; animate parabola in x-z plane heading toward open area; pitch rotation; on splashdown: spawn droplets (instanced spheres, array with physics, fade) and 2-3 ripple rings (RingGeometry meshes, scale up, opacity down).
+
+Fish: InstancedMesh cone (small), N=40, two schools with separate groups; each school has a center moving in circle; fish offsets with noise; set matrix per frame. 40 matrix updates fine.
+
+Seaweed: instanced planes? Use groups of bent cylinders; sway via same onBeforeCompile technique as grass. InstancedMesh of thin tapered box, tall, on seabed, sway.
+
+Bubbles: InstancedMesh spheres 30, rising from seabed, reset.
+
+Droplets: InstancedMesh 60, active flag, gravity, life.
+
+UI HTML/CSS: title top-left; right side panel with sections: View (3 camera buttons), Actions (Kayak, Ray leap), Environment (Tide slider, Wind slider, Time buttons Day/Sunset/Night), Playback (Pause, Reset), Audio (Music toggle, Volume slider). Mobile: toggle button collapses panel.
+
+Camera transitions: store from/to position and target, animate over 1.2s with easeInOutCubic, disable controls during? Keep controls enabled but lerp camera and controls.target each frame.
+
+Pause: flag; clock delta still accumulates but don't advance worldTime.
+
+Reset: reset tide=0.2, wind, time=day, camera iso, kayak docked, cancel jump.
+
+Time of day presets: define objects {sunColor, sunIntensity, hemiSky, hemiGround, ambient, bg color, lanternOn, starOpacity?}. Skip stars, or add simple: night: dark blue bg. Lerp over 1.5s using THREE.Color.lerp.
+
+Background: scene.background color; also add subtle gradient? Just color.
+
+Water color also changes with time (sunset tint). Lerp water uniforms.
+
+Audio:
+- masterGain
+- Waves: noise buffer 2s loop, lowpass 600Hz, gain 0.15 * LFO mod.
+- Wind: noise, bandpass 300Hz, gain tied to wind slider.
+- Music: schedule loop with setInterval-ish using audio time: pentatonic notes A C D E G across octaves; triangle osc + gain envelope, delay node feedback 0.35 + lowpass for gentle echo. Soft pad chord every 8 notes? Keep simple: arpeggio pluck with random rhythm.
+- Splash sound: short noise burst with lowpass sweep + oscillator plop.
+- Kayak launch: soft whoosh.
+
+Start audio on first pointerdown anywhere or on music button.
+
+Now let me write it. Long; be efficient but complete. Comments moderate.
+
+Let me handle island geometry code:
+
+```
+function createIsland(){
+  const rings=42, segs=64, R=6.4, H=5.4, base=-3;
+  positions/colors... build grid rings from r=0..8 (past R flat to seabed)
+```
+Actually r from 0 to 8.5; for r>=R height = base. Include center vertex. Build triangle indices. Vertex colors:
+- h < -0.2: sand dark
+- h < 0.45: sand
+- else grass with variation; blend near boundary.
+Also slight slope-based darkening.
+
+Also island skirt below water visible underwater: sand color good.
+
+Waterline default 0.25.
+
+ShoreR for foam: solve approximate: h(r)=L → 5.4*(1-(r/6.4)^2)^1.5 = L+3 → (1-(r/6.4)^2) = ((L+3)/5.4)^(2/3) → r = 6.4*sqrt(1-((L+3)/5.4)^(2/3)). For L=0.25: (3.25/5.4)=0.6018^(2/3)=0.715 → sqrt(0.285)=0.534→ r=3.42. Good.
+
+Footprint ellipse: scale island z by 0.8. Box: x half 9, z half 7. Island within. Pier extends in +z direction from island toward front. Cabin on top area around (0.5, top, -0.5). Deck extends toward pier direction.
+
+Wait island top is at y = -3+5.4 = 2.4. Cabin sits at y≈2.3 near center.
+
+Pier from deck edge (z≈2) out to z=6, top y ≈ 0.6 (above water 0.25). Support piles down to seabed.
+
+Kayak docked alongside pier at (1.8, waterLevel, 4.8).
+
+Ray path radius: within ellipse: x radius ~7, z ~5.5, but island skirt at r 6.4*... underwater skirt reaches r=6.4 (ellipse z 5.1). Rays at radius 7.6/5.8? Box half 9/7 so OK. Path: x=7.5*cos, z=5.7*sin, y=-1.6+0.5 sin.
+
+Jump: ray jumps toward front-right open water area.
+
+Fish schools radius ~6, y -1 to -2.2.
+
+Seaweed at various positions near skirt edges.
+
+Glass walls: box geometry (18, 7, 14) centered at y=0.5 (from -3 to 4). Material MeshPhysicalMaterial({transparent:true,opacity:0.07,roughness:0.1,metalness:0,color:0xcfe9ee,side:DoubleSide,depthWrite:false}) renderOrder 6. Frame: EdgesGeometry → LineSegments color 0x3a4a52. Plus base tray: box (18.6,0.5,14.6) at y=-3.25, wood color.
+
+Water volume box: (17.9, waterLevel-(-3), 13.9) — update scale/position on tide. depthWrite false, opacity 0.25, color 0x3fb6b8, DoubleSide, renderOrder 2. Underwater camera inside volume: faces of volume seen from inside — DoubleSide low opacity fine.
+
+Underwater tint overlay: CSS div, radial gradient blue, pointer-events none, opacity 0→0.35 when underwater camera active.
+
+Surface plane: PlaneGeometry(17.9,13.9, 90,70) rotated, positioned at waterLevel, ShaderMaterial DoubleSide transparent renderOrder 3 depthWrite false.
+
+Caustics plane: PlaneGeometry(17.9,13.9) at y=-2.94, ShaderMaterial additive transparent depthWrite false renderOrder 1? But additive plane drawn before transparent water? RenderOrder 1 puts it in transparent pass sorted by renderOrder first — before water volume. OK.
+
+Caustics shader: pattern = layered sines: c = pow(0.5+0.5*sin(...)*sin(...), 8) style.
+
+```
+float w1 = sin(p.x*1.3+uTime*0.9)+sin(p.y*1.7-uTime*0.7);
+float w2 = sin(p.x*0.7-p.y*1.1+uTime*0.5);
+float c = smoothstep(1.2,2.0, w1+w2);
+color = vec4(0.5,0.9,0.8, c*0.35);
+```
+With additive blending alpha mostly ignored; use vec4(c*0.25...). Fine.
+
+Foam also on seabed edge? Skip.
+
+Now time of day presets:
+
+day: bg 0xbfe0ea? warm sky: 0xcfe6ef; sun 0xfff2d9 intensity 1.6; hemi sky 0xbfdfe9 ground 0xd9c49a intensity 0.7.
+sunset: bg 0xf3b98a; sun 0xff9a5c intensity 1.2; hemi sky 0xe8a477 ground 0x8a5a44 0.55.
+night: bg 0x101b2a; sun 0x9db8d8 intensity 0.25; hemi sky 0x24344d ground 0x14202c 0.35. lanterns on.
+
+Window/lantern emissive intensity: day 0.15, sunset 0.8, night 1.6. Point lights intensity 0/0.6/1.2.
+
+Lerp over time with transition factor toward target each frame.
+
+Directional light shadow camera: cover box: left -12 right 12 top 12 bottom -12, near 1 far 60. Position sun at direction (10, 16, 8) scaled.
+
+Camera presets:
+iso: pos (13,10,13) target (0,0.5,0). fov 42.
+cozy: pos (6.5,2.6,9.5) target (1.5,1.2,3.5).
+underwater: pos (-2,-1.6,6.2) target (0,-1.4,0). Ensure inside box (z 6.2 <7 OK).
+
+OrbitControls: enableDamping, min/max distance, maxPolarAngle maybe allow below horizon for underwater.
+
+During transition, update controls.target lerp and camera.position lerp; controls.update after.
+
+Kayak logic: state docked/launching/cruising/returning. Launch: rise bob, travel along angle from dock angle to full loop; simpler: lerp position along path defined by angle theta from startTheta to startTheta+2π over 12s, radius path rx=7.2, rz=5.4, y = waterLevel + bob. Return: travel from current theta to dockTheta over 8s, then docked. Kayak yaw = direction tangent.
+
+Ray jump animation: phases: windup (optional, skip), launch: apply parabola: initial vy = 6.2, gravity 9.8, move horizontal velocity toward jump direction; start at waterLevel; animate until y returns to waterLevel; pitch = atan2(vy, vh). On splash: ripples + droplets + sound. Ray continues path.
+
+Implementation: give jump ray a jumpT timer and jumpStartPos, jumpDir (unit xz), jumpVy. During jump, position = start + dir*vh*t + y parabola. After done, ray resumes path from nearest path parameter — just set pathPhase based on position angle.
+
+Simplify: ray follows parametric angle a(t). During jump, override position with parabola from current point heading outward direction (outward radial). After jump ends, set a so path continues from splash angle: a = atan2(z/rz, x/rx).
+
+Ripples: 3 RingGeometry(0.1,0.28) meshes at splash point, animate scale 1→6, opacity 0.6→0, y=waterLevel+0.02.
+
+Droplets: instanced 40, spawn at splash point with random upward velocities, gravity, life 1.2s, scale down with life.
+
+Sound: splash: noise burst 0.4s lowpass 1500→300 sweep + sine 180Hz falling.
+
+Music: pentatonic scale, notes scheduled with random intervals, triangle osc + gentle envelope, through master gain, delay feedback. Start on first user gesture.
+
+Now let me write code. Need to be careful with length but complete. Let me write.
+
+Key points:
+
+- Water surface shader with waves, foam band, fresnel alpha.
+- Water volume box with tide updates.
+- Glass walls renderOrder 6, water volume 2, surface 3, caustics 1.
+- Time of day with smooth color lerps.
+- Kayak, ray jump, camera, audio, UI all wired.
+
+Let me write.
+
+InstancedMesh count: grass 350, rocks 26, seaweed 24, bubbles 26, droplets 48, fish 48.
+
+Trees: 5 groups.
+
+Cabin details:
+- Deck: box 3.4x0.12x2.6 at y=2.35, on island front slope? Island slope: at r=2, h=-3+5.4*(1-(2/6.4)^2)^1.5 = -3+5.4*(0.902)^1.5= -3+5.4*0.858=1.63. Hmm, cabin at center h=2.4. Put cabin at (0,2.4,-0.4), deck extends in +z direction over slope; deck height y=2.15, supported by short posts. Pier start from deck edge z≈2.2, where island height ~ h(2.2)=1.5. Pier planks at y 0.9? Above water 0.25. Support piles to seabed or island surface.
+
+Let me place: cabin center (0.2, baseY, -0.6). baseY = islandHeight(0.7)=2.4-ish. Compute islandH function in JS to place objects: h(r)= -3+5.4*pow(max(0,1-(r/6.4)^2),1.5), with ellipse r = sqrt(x²+(z/0.8)²).
+
+Deck: 3.6x0.14x2.4 at (0.2, 2.0, 1.2). Posts down to surface.
+A-frame cabin: width 2.6 (x), depth 2.2 (z), height 2.2. Roof: two boxes rotated ±50°, copper. Gable triangles: custom BufferGeometry. Back wall dark wood box. Windows: two glowing quads on front roof face lower area + door.
+
+Simplify A-frame: two roof panels meeting at ridge; triangular gables at both ends; small vertical wall band at bottom. Front faces +z toward deck.
+
+Ladder on pier end: rails vertical boxes, rungs.
+
+Bench near deck: seat box + legs.
+Crates: 3 instanced boxes near cabin, plus one on pier.
+Towels: 2 thin colored boxes draped on bench and pier railing.
+Potted plants: 3 pots (cylinder) + instanced leaf cones.
+Lanterns: 2 on pier posts, 1 by door.
+
+Point lights: warm pointlight at cabin door and mid-pier, intensity animated with timeOfDay.
+
+OK let me write final answer. Keep code organized with section comments. I'll be careful with shader code correctness.
+
+Grass sway injection: MeshStandardMaterial onBeforeCompile:
+
+```
+mat.onBeforeCompile = (shader)=>{
+ shader.uniforms.uTime = uniforms.time; // shared {value:0}
+ shader.uniforms.uWind = uniforms.wind;
+ shader.vertexShader = 'uniform float uTime; uniform float uWind;\n' + shader.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+ #ifdef USE_INSTANCING
+ vec4 iwp = instanceMatrix * vec4(0.0,0.0,0.0,1.0);
+ float ph = iwp.x*1.3 + iwp.z*2.1;
+ float amp = uWind * 0.35 * max(position.y,0.0);
+ transformed.x += sin(uTime*2.4 + ph + position.y) * amp;
+ transformed.z += cos(uTime*1.9 + ph) * amp * 0.5;
+ #endif`);
+};
+```
+Shared uniforms object: const uTime={value:0}.
+
+Seaweed similar with bigger amp, slower.
+
+Tree sway: in animate: tree.rotation.z = Math.sin(t*1.4+phase)*wind*0.04; small rotation.x too.
+
+Fish matrices: per school, arrays of offsets. Each frame compute school center moving; for each fish: pos = center + offset rotated + jitter; lookAt direction: tangent of school motion; use dummy Object3D.
+
+Ray class:
+
+```
+function makeRay(scale){ group; body mesh; fins; tail; }
+```
+Fin geometry: PlaneGeometry(1.7,1.1,8,4) rotated -PI/2 (XZ plane), translate so x from 0.2..1.9 attaches to body side. Store base positions. Per frame: for each vertex, z (local up) = flap * sin(t*flapSpeed + x*2.2) * ((x-0.2)/1.7), plus body follows.
+
+Body: SphereGeometry(1,16,10) scaled (1.0,0.16,1.3)? Manta width is x, length z. Cephalo... skip. Tail: CylinderGeometry thin along z, sway rotation.y = sin(t*2)*0.2.
+
+Ray color: dark gray-brown 0x5d6a72 with lighter belly? Single color fine.
+
+Ray path update: param a += speed*dt; pos = (rx cos a, y, rz sin a); heading tangent: derivative → yaw = atan2(dx, dz)... group faces +z direction? Set rotation.y = atan2(tx, tz) so +z axis aligns with tangent. Bank: rotation.z = slight.
+
+Jump: as described.
+
+Bubbles update: y += speed*dt*(0.4+rand); if y> waterLevel-0.1 reset to seabed. Scale small.
+
+Now audio code:
+
+```
+class AudioEngine {
+ init(){ ctx = new AudioContext(); master gain->destination; }
+ startAmbience(){ noise buffer; waves node; wind node;}
+ scheduleMusic(){ loop with setTimeout using lookahead }
+}
+```
+Music: pentatonic scale, notes scheduled with random intervals, triangle osc + gentle envelope, through master gain, plus delay node feedback 0.35 + lowpass for gentle echo. Soft pad chord every 8 notes? Keep simple: arpeggio pluck with random rhythm.
+- Splash sound: short noise burst with lowpass sweep + oscillator plop.
+- Kayak launch: soft whoosh.
+
+Start audio on first pointerdown anywhere or on music button.
+
+Now UI HTML/CSS: title top-left; right side panel with sections: View (3 camera buttons), Actions (Kayak, Ray leap), Environment (Tide slider, Wind slider, Time buttons Day/Sunset/Night), Playback (Pause, Reset), Audio (Music toggle, Volume slider). Mobile: toggle button collapses panel.
+
+Camera transitions: store from/to position and target, animate over 1.2s with easeInOutCubic, disable controls during? Keep controls enabled but lerp camera and controls.target each frame.
+
+Pause: flag; clock delta still accumulates but don't advance worldTime.
+
+Reset: reset tide=0.2, wind, time=day, camera iso, kayak docked, cancel jump.
+
+Time of day presets: define objects {sunColor, sunIntensity, hemiSky, hemiGround, ambient, bg color, lanternOn, starOpacity?}. Skip stars, or add simple: night: dark blue bg. Lerp over 1.5s using THREE.Color.lerp.
+
+Background: scene.background color; also add subtle gradient? Just color.
+
+Water color also changes with time (sunset tint). Lerp water uniforms.
+
+Audio:
+- masterGain
+- Waves: noise buffer 2s loop, lowpass 600Hz, gain 0.15 * LFO mod.
+- Wind: noise, bandpass 300Hz, gain tied to wind slider.
+- Music: schedule loop with setInterval-ish using audio time: pentatonic notes A C D E G across octaves; triangle osc + gain envelope, delay node feedback 0.35 + lowpass for gentle echo. Soft pad chord every 8 notes? Keep simple: arpeggio pluck with random rhythm.
+- Splash sound: short noise burst with lowpass sweep + oscillator plop.
+- Kayak launch: soft whoosh.
+
+Start audio on first pointerdown anywhere or on music button.
+
+Now let me write. Long; be efficient but complete. Comments moderate.
+
+Let me handle island geometry code:
+
+```
+function createIsland(){
+  const rings=42, segs=64, R=6.4, H=5.4, base=-3;
+  positions/colors... build grid rings from r=0..8 (past R flat to seabed)
+```
+Actually r from 0 to 8.5; for r>=R height = base. Include center vertex. Build triangle indices. Vertex colors:
+- h < -0.2: sand dark
+- h < 0.45: sand
+- else grass with variation; blend near boundary.
+Also slight slope-based darkening.
+
+Also island skirt below water visible underwater: sand color good.
+
+Waterline default 0.25.
+
+ShoreR for foam: solve approximate: h(r)=L → 5.4*(1-(r/6.4)^2)^1.5 = L+3 → (1-(r/6.4)^2) = ((L+3)/5.4)^(2/3) → r = 6.4*sqrt(1-((L+3)/5.4)^(2/3)). For L=0.25: (3.25/5.4)=0.6018^(2/3)=0.715 → sqrt(0.285)=0.534→ r=3.42. Good.
+
+Footprint ellipse: scale island z by 0.8. Box: x half 9, z half 7. Island within. Pier extends in +z direction from island toward front. Cabin on top area around (0.5, top, -0.5). Deck extends toward pier direction.
+
+Wait island top is at y = -3+5.4 = 2.4. Cabin sits at y≈2.3 near center.
+
+Pier from deck edge (z≈2) out to z=6, top y ≈ 0.6 (above water 0.25). Support piles down to seabed.
+
+Kayak docked alongside pier at (1.8, waterLevel, 4.8).
+
+Ray path radius: within ellipse: x radius ~7, z ~5.5, but island skirt at r 6.4*... underwater skirt reaches r=6.4 (ellipse z 5.1). Rays at radius 7.6/5.8? Box half 9/7 so OK. Path: x=7.5*cos, z=5.7*sin, y=-1.6+0.5 sin.
+
+Jump: ray jumps toward front-right open water area.
+
+Fish schools radius ~6, y -1 to -2.2.
+
+Seaweed at various positions near skirt edges.
+
+Glass walls: box geometry (18, 7, 14) centered at y=0.5 (from -3 to 4). Material MeshPhysicalMaterial({transparent:true,opacity:0.07,roughness:0.1,metalness:0,color:0xcfe9ee,side:DoubleSide,depthWrite:false}) renderOrder 6. Frame: EdgesGeometry → LineSegments color 0x3a4a52. Plus base tray: box (18.6,0.5,14.6) at y=-3.25, wood color.
+
+Water volume box: (17.9, waterLevel-(-3), 13.9) — update scale/position on tide. depthWrite false, opacity 0.25, color 0x3fb6b8, DoubleSide, renderOrder 2. Underwater camera inside volume: faces of volume seen from inside — DoubleSide low opacity fine.
+
+Underwater tint overlay: CSS div, radial gradient blue, pointer-events none, opacity 0→0.35 when underwater camera active.
+
+Surface plane: PlaneGeometry(17.9,13.9, 90,70) rotated, positioned at waterLevel, ShaderMaterial DoubleSide transparent renderOrder 3 depthWrite false.
+
+Caustics plane: PlaneGeometry(17.9,13.9) at y=-2.94, ShaderMaterial additive transparent depthWrite false renderOrder 1? But additive plane drawn before transparent water? RenderOrder 1 puts it in transparent pass sorted by renderOrder first — before water volume. OK.
+
+Caustics shader: pattern = layered sines: c = pow(0.5+0.5*sin(...)*sin(...), 8) style.
+
+```
+float w1 = sin(p.x*1.3+uTime*0.9)+sin(p.y*1.7-uTime*0.7);
+float w2 = sin(p.x*0.7-p.y*1.1+uTime*0.5);
+float c = smoothstep(1.2,2.0, w1+w2);
+color = vec4(0.5,0.9,0.8, c*0.35);
+```
+With additive blending alpha mostly ignored; use vec4(c*0.25...). Fine.
+
+Foam also on seabed edge? Skip.
+
+Now time of day presets:
+
+day: bg 0xbfe0ea? warm sky: 0xcfe6ef; sun 0xfff2d9 intensity 1.6; hemi sky 0xbfdfe9 ground 0xd9c49a intensity 0.7.
+sunset: bg 0xf3b98a; sun 0xff9a5c intensity 1.2; hemi sky 0xe8a477 ground 0x8a5a44 0.55.
+night: bg 0x101b2a; sun 0x9db8d8 intensity 0.25; hemi sky 0x24344d ground 0x14202c 0.35. lanterns on.
+
+Window/lantern emissive intensity: day 0.15, sunset 0.8, night 1.6. Point lights intensity 0/0.6/1.2.
+
+Lerp over time with transition factor toward target each frame.
+
+Directional light shadow camera: cover box: left -12 right 12 top 12 bottom -12, near 1 far 60. Position sun at direction (10, 16, 8) scaled.
+
+Camera presets:
+iso: pos (13,10,13) target (0,0.5,0). fov 42.
+cozy: pos (6.5,2.6,9.5) target (1.5,1.2,3.5).
+underwater: pos (-2,-1.6,6.2) target (0,-1.4,0). Ensure inside box (z 6.2 <7 OK).
+
+OrbitControls: enableDamping, min/max distance, maxPolarAngle maybe allow below horizon for underwater.
+
+During transition, update controls.target lerp and camera.position lerp; controls.update after.
+
+Kayak logic: state docked/launching/cruising/returning. Launch: rise bob, travel along angle from dock angle to full loop over 12s, radius path rx=7.2, rz=5.4, y = waterLevel + bob. Return: travel from current theta to dockTheta over 8s, then docked. Kayak yaw = direction tangent.
+
+Ray jump animation: phases: windup (optional, skip), launch: apply parabola: initial vy = 6.2, gravity 9.8, move horizontal velocity toward jump direction; start at waterLevel; animate until y returns to waterLevel; pitch = atan2(vy, vh). On splash: ripples + droplets + sound. Ray continues path.
+
+Implementation: give jump ray a jumpT timer and jumpStartPos, jumpDir (unit xz), jumpVy. During jump, position = start + dir*vh*t + y parabola. After done, ray resumes path from nearest path parameter — just set pathPhase based on position angle.
+
+Simplify: ray follows parametric angle a(t). During jump, override position with parabola from current point heading outward direction (outward radial). After jump ends, set a so path continues from splash angle: a = atan2(z/rz, x/rx).
+
+Ripples: 3 RingGeometry(0.1,0.28) meshes at splash point, animate scale 1→6, opacity 0.6→0, y=waterLevel+0.02.
+
+Droplets: instanced 40, spawn at splash point with random upward velocities, gravity, life 1.2s, scale down with life.
+
+Sound: splash: noise burst 0.4s lowpass 1500→300 sweep + sine 180Hz falling.
+
+Music: pentatonic scale, notes scheduled with random intervals, triangle osc + gentle envelope, through master gain, plus delay node feedback 0.35 + lowpass for gentle echo. Soft pad chord every 8 notes? Keep simple: arpeggio pluck with random rhythm.
+
+Start audio on first user gesture (any button or dedicated "audio" toggle).
+
+Now UI HTML/CSS: title top-left; right side panel with sections: View (3 camera buttons), Actions (Kayak, Ray leap), Environment (Tide slider, Wind slider, Time buttons Day/Sunset/Night), Playback (Pause, Reset), Audio (Music toggle, Volume slider). Mobile: toggle button collapses panel.
+
+Camera transitions: store from/to position and target, animate over 1.2s with easeInOutCubic, disable controls during? Keep controls enabled but lerp camera and controls.target each frame.
+
+Pause: flag; clock delta still accumulates but don't advance worldTime.
+
+Reset: reset tide=0.2, wind, time=day, camera iso, kayak docked, cancel jump.
+
+Time of day presets: define objects {sunColor, sunIntensity, hemiSky, hemiGround, ambient, bg color, lanternOn, starOpacity?}. Skip stars, or add simple: night: dark blue bg. Lerp over 1.5s using THREE.Color.lerp.
+
+Background: scene.background color; also add subtle gradient? Just color.
+
+Water color also changes with time (sunset tint). Lerp water uniforms.
+
+Audio:
+- masterGain
+- Waves: noise buffer 2s loop, lowpass 600Hz, gain 0.15 * LFO mod.
+- Wind: noise, bandpass 300Hz, gain tied to wind slider.
+- Music: schedule loop with setInterval-ish using audio time: pentatonic notes A C D E G across octaves; triangle osc + gain envelope, delay node feedback 0.35 + lowpass for gentle echo. Soft pad chord every 8 notes? Keep simple: arpeggio pluck with random rhythm.
+- Splash sound: short noise burst with lowpass sweep + oscillator plop.
+- Kayak launch: soft whoosh.
+
+Start audio on first pointerdown anywhere or on music button.
+
+Now let me write. Long; be efficient but complete. Comments moderate.
+
+One more: pause button toggles label Pause/Resume.
+
+Kayak button label toggles Launch kayak / Return kayak.
+
+Active state: .active class on time buttons, camera buttons.
+
+Let me write.
+
+For instanced grass color variation use setColorAt.
+
+Rocks: some on shore, some on seabed; random scale.
+
+Seabed plane receives shadows: MeshStandardMaterial sand-dark 0xc9b489.
+
+Base tray: wood 0x6b4f36.
+
+Also add small sandbar/rocks for detail.
+
+OK let me write the answer. Aim for correctness.
+
+Potential pitfall: onBeforeCompile uniforms shared object must persist — fine.
+
+ShaderMaterial for water surface: define varying vW (world pos), vH (wave height). Fragment uses uniforms.
+
+Vertex:
+
+```
+uniform float uTime; uniform float uWind;
+varying vec3 vW; varying float vH;
+float wave(vec2 p){
+ float h = sin(p.x*0.9 + uTime*1.6)*0.5 + sin(p.y*1.2 - uTime*1.3)*0.4 + sin((p.x+p.y)*0.7 + uTime*2.1)*0.3;
+ return h;
+}
+void main(){
+ vec3 pos = position; // plane local: x,y (z up after rotation? no)
+```
+PlaneGeometry in XY plane, rotate mesh by -PI/2 so local z maps to world y. Local coords: x, y (becomes world -z?). After rotation.x=-PI/2: local (x,y,z) → world (x, z?, ...). Local z → world y? rotation.x -90°: y→ -z? Let me compute: rotation.x=-π/2: (x,y,z)→(x, y cos+ z sin...). For -90: cos=0, sin=-1: y' = y*0 - z*... hmm: standard rotation matrix Rx(θ): y' = y cosθ - z sinθ; z' = y sinθ + z cosθ. θ=-π/2: cos=0, sin=-1. y' = z*1? y' = 0 - z*(-1)= z. z' = y*(-1)+0 = -y. So local z → world y. Good: displace local z.
+
+Use local xy as p. vW = (modelMatrix * vec4(pos,1)).xyz.
+
+Fragment: r = length(vW.xz)? island ellipse: r = sqrt(x²+(z/0.8)²). Foam band near uShoreR. Alpha = mix(0.45,0.75, fresnel approx) + foam. Color mix deep/shallow by r. Also sparkle from vH.
+
+Add foam streaks: foam = smoothstep(uShoreR+0.55, uShoreR+0.1, r) * smoothstep(uShoreR-0.5, uShoreR+0.1, r)? That's band around shoreR. Multiply by animated noise n = 0.5+0.5*sin(r*8 - uTime*3 + angle*5).
+
+Also gentle foam ring at box edges? Skip.
+
+DoubleSide: viewed from below, normals flipped — fine, same color.
+
+Uniforms: uTime, uWind, uShoreR, uDeep (Color), uShallow, uLevel? not needed.
+
+Update uShoreR on tide.
+
+Caustics uniforms: uTime, uIntensity (scaled by time of day: lower at night).
+
+Water volume material color lerped with time of day.
+
+OK. Finalize jump physics: vy0=6.5, g=9.8 → airtime ≈ 1.33s, apex ≈ 2.16 above water. Good. Horizontal speed 3.5 → travel 4.6 units. Jump direction: outward radial from current angle.
+
+Ensure ray stays within box after splash: outward radial might hit wall if ray at angle near +z (rz=5.7 + 4.6 >7). Pick jump when ray at angle where outward is toward +x side, or reduce vh and pick direction tangentially. Better: jump direction tangent to path (continues along path), travel 4.6 along tangent stays roughly on ellipse. Tangent at (rx cos a, rz sin a) is (-rx sin a, rz cos a) normalized. Travel along tangent stays near ellipse. Good — jump tangent-forward.
+
+Pitch: rotate around local x? Ray group oriented yaw; apply rotation.x = -atan2(vy, vh) in local. Apply group.rotation order YXZ: set rotation.y = yaw, rotation.x = pitch.
+
+Droplet instanced: dummy matrix; inactive scale 0.
+
+Ripples: pool of 4 ring meshes.
+
+OK let me write.
+
+Also small flag: shadow casters: island, cabin, trees, pier castShadow; seabed, island receive.
+
+Water surface not shadowed.
+
+Final answer: single code block with full file. Include short intro text. Keep explanation short before/after code.
