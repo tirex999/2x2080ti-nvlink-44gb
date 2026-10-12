@@ -1,0 +1,1103 @@
+The user wants a complete single-file Three.js interactive 3D diorama called "Tidehaven". This is a big build. I need to write a complete, well-organized, commented index.html with:
+
+- Three.js from CDN (use importmap with three@0.160-ish modules, OrbitControls from examples).
+- Procedural island, cabin, pier, kayak, details.
+- Cutaway water: a diorama box with transparent turquoise lagoon; front and side faces reveal cross-section. Approach: build a water volume as a Box geometry with the top surface as a separate animated plane; use a custom shader for the box that renders backfaces/frontfaces with fresnel, and use stencil? Simpler robust approach:
+  - Water volume = BoxGeometry with custom ShaderMaterial: render only back faces (side: THREE.BackSide) so we see the inside walls of the tank — the "aquarium walls" — with a depth-based turquoise tint. Then the top surface plane (animated waves) rendered with transparency and depthWrite false, drawn after opaque.
+  - To avoid sorting issues: render order: seabed & underwater stuff (opaque) → water volume (backside, depthWrite true? It's the tank walls; write depth so objects outside tank get clipped? Actually objects outside the tank: the island sticks out above water. The island is inside the tank conceptually.)
+
+Let me think about a clean design that avoids transparency hell:
+
+Concept: The diorama is a rectangular tank of water (a "cutaway" — the front and left faces are cut, meaning we see the cross-section). The island sits in the middle, its base going down to the sandy seabed. Water fills the tank up to waterLevel.
+
+Rendering plan:
+1. Seabed sand: opaque, at bottom of tank, with caustics shader (animated).
+2. Underwater terrain (island submerged part): opaque sand/rock with caustics overlay.
+3. Underwater life: rays, fish, plants, rocks — opaque.
+4. Bubbles: transparent, additive, depthWrite false, renderOrder high.
+5. Water volume shell: a Box with BackSide rendering, transparent, depthWrite: false, blending normal, with fresnel + depth tint. Rendered after opaque objects (renderOrder 5). Since it's backside-only, front faces (near walls) are not drawn — that's the "cutaway" look: we see the far inner walls and the water body tint from behind.
+
+Hmm, for a cutaway: the near walls should be invisible (cut open), the far walls visible as the tank's interior. That's exactly BackSide rendering with a box: from an outside camera, backside faces of the box are the far walls (inner surface). The near walls' back faces are behind the camera... no. For a box, BackSide means we render faces whose normals point away from camera — for a closed box viewed from outside, the far side faces (their inner surfaces, normals pointing inward = toward camera... hmm).
+
+Let's be careful: BoxGeometry faces have outward normals. With side: THREE.BackSide, we render triangles facing away from the camera, i.e., the faces on the far side of the box (their outward normals point away from camera). So we see the inside of the far walls. Yes! That's the classic "see inside a box" trick (used for skyboxes). So the near walls are culled → cutaway. 
+
+And the water tint: use a shader that tints based on depth from the water surface, plus a subtle fresnel. Because we only render the far inner walls, we get a nice "aquarium" backdrop. Then add a thin "glass wall" at the cut edges? To make the cross-section read as a cut, I can add a rim/frame: the diorama has a base plinth (wooden/stone slab) and the cut faces are shown as a thin glass-like edge plane with a bright edge line. 
+
+Actually a nicer approach for the "cutaway" look: render the water volume as a full closed box with FrontSide transparent + BackSide? That gives double-layer transparency and sorting issues. Let's keep: BackSide shell (far walls, tinted, depthWrite true? If depthWrite true it occludes bubbles behind... bubbles are inside the tank so in front of the far walls, fine. Set depthWrite: false to be safe, renderOrder low so it draws before bubbles/fish? No — fish must be occluded by... fish are inside the tank, in front of far walls, so drawing far walls first (renderOrder 1) with depthWrite true is fine and cheap: fish in front of the walls pass depth test. Yes: shell renderOrder = 1, depthWrite = true, transparent true, opacity via alpha. Since it's the farthest thing inside the tank, writing depth is safe.
+
+Then the water top surface: animated waves, transparent, depthWrite false, renderOrder 10, drawn after everything so it blends over. But depth test on so it's occluded by the island above water? The island above water is in front of/above the surface. With depthTest true and depthWrite false, the surface will be correctly occluded by opaque geometry in front of it. Good. Sorting between surface and bubbles: bubbles depthWrite false, renderOrder 9 → drawn before surface; bubbles below the surface seen through the surface get blended... order: bubbles drawn before surface means bubbles blend with background, then surface blends over bubbles → bubbles appear under the surface. Correct.
+
+Fish/rays: opaque, drawn in the opaque pass (before transparent). Water surface drawn after → tint over them. 
+
+Foam at shoreline: a ring/ribbon mesh hugging the island at water level, transparent additive, depthWrite false, renderOrder 11.
+
+Caustics: shader on seabed and submerged sand — animated layered noise/voronoi-ish.
+
+Underwater view camera: inside the tank. BackSide shell: from inside the tank, BackSide renders the far walls (inner surfaces) — from inside, all walls' inner surfaces face the camera → we see all walls from inside, tinted. That's fine and looks like being inside water. Good.
+
+Also need a "waterline" band on the island to hide harsh intersection: the shore sand transitions; foam ring handles it.
+
+Camera presets: iso, cabin, underwater, plus free orbit. Smooth transitions: tween camera position and controls target with easing (lerp with smoothstep over duration).
+
+Interactions:
+- Launch kayak: kayak travels a loop path around the lagoon; press again → return to pier (lerp back).
+- Ray leap: one ray jumps in an arc, rotates, splashes → droplets (instanced points) + expanding ripple rings.
+- Tide slider: waterLevel changes; floating objects (kayak, buoys) follow; foam ring follows; surface mesh y follows.
+- Wind slider: wave amplitude/frequency, tree/plant sway amplitude.
+- Time of day: three presets (day/sunset/night) with smooth lerp of sky color, sun position, light colors/intensities, fog, lantern/window emissive intensity.
+- Pause, Reset.
+- Audio: procedural ambient music (pads + gentle arpeggio in pentatonic), water lapping (filtered noise with LFO), breeze (filtered noise). Music toggle + volume slider. Start on user gesture.
+
+UI: title Tidehaven + subtitle, translucent panels, typography pairing. For a cozy coastal diorama I want a display face with a bit of nautical/vintage character, not a neutral geometric sans. I'll use Fraunces — a soft variable serif that reads warm and hand-set — for the wordmark, and pair it with Manrope for UI text, which is clean and legible at small sizes. One display face, one UI face: enough.
+
+Palette: warm natural — turquoise water, sand, cedar wood, copper roof, warm lamp amber, dusk oranges, night blues.
+
+Layout: title top-left, control panels bottom-left/bottom-right, camera presets top-right, all kept to the edges so the diorama stays the star. Collapsible on mobile.
+
+Now let's write the code. I need to be careful about Three.js version API. Use three@0.160.0 with importmap:
+
+```html
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+```
+
+Note: In 0.160, `outputColorSpace = THREE.SRGBColorSpace`, `THREE.ACESFilmicToneMapping`. Lights: physically correct units are default in r155+ (useLegacyLights removed default false). DirectionalLight intensity ~2-3 is reasonable. Shadows: PCFSoftShadowMap.
+
+Careful: In r155+, light intensities are in physical units; DirectionalLight intensity 3 is bright. PointLight intensity uses candela — need larger values (e.g., 5-30 with decay 2). I'll use `light.decay = 2` and intensity ~ 8-20 for lanterns, with distance.
+
+Let me plan the geometry.
+
+World scale: tank from x ∈ [-16, 16], z ∈ [-13, 13], y from -6 (seabed) to 4 (tank top). Water level default y = 0. Island center around (0,0), island peak at y ~ 2.2.
+
+Island shape: radial noise function r(θ) → height field. I'll build a custom BufferGeometry: a radial "heightfield disc" grid in polar coordinates, so I can shape it: height = f(distance) with a plateau for the cabin area.
+
+Simpler: use a PlaneGeometry (rotated) of size 30x24 with segments 120x100, displace y by islandHeight(x,z), and color vertices by height (sand / grass / rock). Then the island mesh is clipped by the water box visually? No — the island plane extends beyond the tank; I'll set the height function so it goes below the seabed (y = -6) outside a radius, and the tank's far walls hide... The island plane extends outside the tank (visible outside the tank, breaking the diorama). Solution: clip the island geometry to the tank bounds: for vertices outside the tank rectangle, push them down below the seabed (y < -6) so they're hidden under the opaque seabed. The seabed is a box/plane at y=-6 inside the tank, opaque, and the tank walls (backside shell) hide the sides from outside... From outside, the near walls are culled (cutaway), so we'd see the island plane sticking out below the seabed at the front. Hmm.
+
+Better: make the diorama a solid plinth. Structure:
+- Plinth: a box from y=-6.6 to y=-6 (base slab) — opaque, extends slightly beyond tank, giving the "diorama base" look, with a chamfer.
+- Seabed: a plane at y=-6 with sand + caustics, inside tank.
+- Island: polar geometry, radius up to ~11, fully inside tank (tank is 32x26 so radius 11 fits in x, z half is 13 → ok, radius 11 < 13). Island geometry extends down to y=-6.05 at its outer edge (just below seabed plane) so it fades into the seabed. Beyond radius 11 there's no geometry → the seabed plane covers it. 
+
+So island = a disc of radius 11, height profile: center peak 2.4, shore at r≈6.5 (y=0 area), then slopes down to -6 at r=11. Use polar grid: 96 radial segments × 64 angular → 6k verts, fine. Vertex colors: sand near waterline, wet sand darker, underwater sand pale, grass above, rock on steep slopes. Compute per-vertex color from height & slope. Add caustics to the underwater part via shader (use onBeforeCompile on a MeshStandardMaterial with vertex colors, adding caustic term where y < waterLevel).
+
+That's a nice trick: extend MeshStandardMaterial with onBeforeCompile to add caustics + a wet-sand darkening band. Let's do that for the seabed and island materials.
+
+Caustics function in GLSL: layered sine/voronoi approximated:
+```
+float caustic(vec2 p, float t){
+  vec2 i = p; float c = 1.0; float inten = 0.005;
+  for (int n = 0; n < 4; n++){
+    float t2 = t * (1.0 - (3.5 / float(n+1)));
+    i = p + vec2(cos(t2 - i.x) + sin(t2 + i.y), sin(t2 - i.y) + cos(t2 + i.x));
+    c += 1.0/length(vec2(p.x / (sin(i.x+t2)/inten), p.y / (cos(i.y+t2)/inten)));
+  }
+  c /= 4.0; c = 1.17 - pow(c, 1.4);
+  return pow(abs(c), 8.0);
+}
+```
+That's the classic shadertoy caustic. Good.
+
+Water surface: PlaneGeometry(32,26, 160,130) with vertex-displacement waves in a custom ShaderMaterial (transparent, with fresnel, depth-based color, sun specular, foam near shore). Foam near shore requires knowing island radius: pass a function? I can compute in shader an approximate island mask using the same radial function approximated in GLSL. Let's define the island silhouette as a radial function rShore(θ) computed on CPU and stored in a 1D texture (DataTexture, 256 samples) — then the shader can compute shore distance: `float d = length(worldXZ)`, `float rs = texture1D(shoreTex, atan(z,x)/TAU)`. Foam where |d - rs| < band, modulated by wave. That's elegant and gives a great shoreline foam that follows the tide (as tide rises, rs changes? The shore radius depends on water level: the shore texture should be for y=0; for tide changes, sample a 2D texture shoreTex[level, theta]? Simpler: compute foam from world height: foam where (worldY_of_terrain is within [level-0.35, level+0.25]). To do that in the water surface shader, we need terrain height — we can render the island height to a texture! Simplest robust approach: since the water surface plane's vertices are at known (x,z), and I compute island height on CPU with a JS function, I can bake a DataTexture of the island height field (256x256 covering the tank) and sample it in the water shader. Then foam = smoothstep based on (waterLevel - terrainHeight) → shallow water foam, and also foam alpha near the shoreline. 
+
+That height texture is also useful for:
+- Water shader: depth = level - terrainHeight → color/tint, foam.
+- Rays/fish: keep above seabed (JS side, use the JS height function).
+- Kayak/pier placement.
+
+Yes, bake `heightTex` (DataTexture RGBA with height in R, encoded) 128x128 covering the tank area. Use `THREE.DataTexture` with FloatType? Use RGBAFormat with UnsignedByteType and encode height: (h + 10)/20. Precision ~0.08 — fine for foam. Better: use FloatType (supported widely in WebGL2). Three uses WebGL2 by default in r160 → float textures fine for sampling in fragment shader. I'll use FloatType with RedFormat. Let's be safe: RGBAFormat + FloatType.
+
+Water surface shader details:
+- Vertex: sum of 3-4 gerstner-ish sine waves with wind amplitude factor (uniform uWaveAmp). Compute normal analytically. Pass world pos.
+- Fragment: 
+  - depth = uLevel - terrainH (sample heightTex).
+  - color = mix(deepTurquoise, shallowSandColor, smoothstep)
+  - fresnel with sky color → reflection tint.
+  - specular sun highlight (Blinn-Phong with sun dir).
+  - foam: near shore (depth < 0.45) with animated noise + wave crest foam (based on wave height).
+  - alpha: mix(0.55, 0.92, ...) with higher alpha at grazing angles (fresnel) → looks like water and avoids seeing weird overlaps.
+  - Also add a "sun sparkle" via caustic-like pattern.
+  - transparent, depthWrite false, side: DoubleSide? Use FrontSide (top). Underwater camera looking up: with FrontSide and camera below, the face's normal points up → camera from below sees back face → culled → we'd see through the surface. Use DoubleSide so from underwater we see the silvery underside. Good: DoubleSide, and in fragment flip normal with gl_FrontFacing.
+
+Water volume shell (tank interior walls + the "water body" tint): BoxGeometry(32, height, 26) positioned so top = waterLevel. BackSide, custom shader:
+- color: turquoise with vertical gradient (darker deeper), plus subtle caustic light shafts on the far walls.
+- fresnel: alpha higher at grazing.
+- Also the shell's top face (the water surface) is inside the box — BackSide top face is the underside of the top face, at waterLevel, facing down. That would render a surface from below — good for the underwater view (silvery surface). It's coplanar with the water surface mesh → z-fighting risk. Make the box top 0.02 below the surface mesh? Then from above, the box's top back-face is the underside — not visible from above (it faces down, camera above sees it as back-facing? BackSide renders faces facing away from camera: the top face's outward normal is +y; from a camera above, that face is front-facing → culled in BackSide mode. From a camera below (underwater), the top face is back-facing → rendered → we see the underside of the water. Perfect, no z-fighting from above. From underwater, the surface mesh (DoubleSide) and the shell top face are both visible near-coplanar → set shell top 0.03 below the surface mesh, and the shell top face alpha low. Fine.
+
+Also the tank walls: the far walls (back + left/right as seen) get the water tint. The near walls are culled → cutaway. The "cut" edges: add a thin frame — a set of thin boxes (edges) along the top rim of the tank at the cut faces, plus a base plinth. Also add a subtle "glass" plane on the near faces? The prompt says front and side faces reveal the water in cross-section "like aquarium walls" — so we should see a hint of glass at the near faces. I'll add near-face glass planes with very low alpha (0.06), strong fresnel edge glow, depthWrite false, renderOrder last (20) — this gives the aquarium feel. Risk of sorting issues: with depthWrite false and renderOrder 20 (drawn last), it just tints everything behind → safe. And it's culled when camera goes behind it (use side: FrontSide with normal pointing outward → from behind, culled). Nice: when the camera orbits to the back, the glass planes at front face away → culled, and the shell's BackSide then shows the new far walls. So the cutaway always faces the camera. 
+
+The tank walls (opaque, outside the water): the diorama's outer walls should be visible from outside as a solid base/rim? Let's design:
+- Base plinth: box (33 x 1.2 x 27) at y=-6.6..-5.4? Let's set seabed at y = -5.5. Plinth from y=-6.6 to -5.5, slightly larger than tank, warm concrete/wood color.
+- Rim: a frame at the top of the tank (y = 3.6) — thin wood/concrete edges around the top of the tank, giving the diorama a frame. Use 4 boxes; the near ones will be in front of the water. Rim at top only, so the view is unobstructed? A rim at the top front edge at y=3.6 is above the water (level 0) and below the island top (2.4)? Island top 2.4 < 3.6, so rim won't occlude the island from an isometric view at elevation ~35°. From a low angle it may occlude. Keep the rim thin (0.35 tall) and at the very top. Fine.
+
+Actually, to keep the "cutaway" clean, I'll skip a full rim and just do: base plinth (solid, opaque, extends a bit beyond), a thin top-edge cap on the far walls only? Simpler: plinth + a "glass edge" highlight along the top rim of all four sides (thin, 0.12 radius box frames, semi-transparent white, additive) → reads like a glass tank edge. Plus the near faces have the glass planes with edge glow, so the tank reads as glass. Good.
+
+Underwater terrain inside the tank: seabed plane at y=-5.5 with sand + caustics, extends to tank walls.
+
+Underwater life:
+- Rays: 4 rays. Body: custom geometry? Use a lathe/extruded shape. Simplest good-looking manta: build a "disc" from a parametric surface: for u ∈ [0,1] (span), v ∈ [0,1] (length): position = wing shape. I'll build a custom BufferGeometry for the manta: a flat diamond shape with wing taper, plus a tail (thin box/cylinder), plus a head with cephalic fins. Animate by displacing vertices in JS each frame (undulating wings) — with ~500 verts per ray × 4 rays = 2000 vertex updates/frame, fine. Better: do the undulation in the vertex shader via onBeforeCompile with a bone-less approach: displacement based on local x (span) and time → sin wave traveling outward. That's GPU-side, cheap, and smooth. Use MeshStandardMaterial onBeforeCompile with uniforms uTime, uSway. Ray geometry: local coordinates with span along x, length along z, thickness y. Wing flap: y += sin(uTime*speed + abs(x)*k) * abs(x)^1.5 * amp; tail wiggle: for x≈0, z>tail: x += sin(t + z*k)*amp2 — need to identify tail region: use a vertex attribute? Use position.z beyond -length: displacement in x = sin(t*2 + (z+L)*3)*0.15*smoothstep. Fine, do it in the shader with position-based conditions.
+
+Rays move along paths inside the lagoon (circular/figure-eight paths around the island at radius 8-10, depth -2..-4), oriented along velocity, banking. Keep inside tank: clamp.
+
+- Fish schools: 3 schools of ~30 fish using InstancedMesh per school. Fish geometry: a small cone/diamond (stretched octahedron) — cheap. Motion: boids-lite — each school follows a moving attractor point on a lissajous path inside the lagoon, with per-fish offset noise; compute per-instance matrices each frame (30×3 = 90 matrices → cheap).
+- Aquatic plants: kelp blades — instanced? Each blade is a tapered plane; use a custom shader with sway. Use InstancedMesh of a blade geometry with per-instance rotation/scale, and sway in vertex shader (onBeforeCompile with instanceMatrix-aware: use `instanceMatrix` in shader — available in the vertex shader for InstancedMesh). Sway based on world position + time.
+- Underwater rocks: instanced dodecahedron, scaled/rotated randomly, sunk into the seabed.
+- Bubbles: instanced small spheres rising, in a few columns; animate in JS (60 instances) — cheap.
+
+Above water:
+- Cabin A-frame: two roof planes (copper, MeshStandardMaterial with metalness 0.9, roughness 0.35, color copper #b87333 with slight patina), triangular walls (extruded triangle), glowing windows (emissive planes / boxes with emissive material + point lights? Use emissive material + one point light inside the cabin). Deck: box platform + plank instanced strips + railing posts (instanced) + steps.
+- Pier: planks (instanced) + pilings (instanced cylinders) + ladder (rails + rungs) + lanterns (small boxes with emissive glass + point light) + mooring rope (catenary curve via TubeGeometry).
+- Kayak: hull from a lathe or a scaled/curved box: build from a parametric geometry (a lens shape). Paddle, seat.
+- Bench: seat + legs + back.
+- Crates: instanced boxes with plank detail (use a box + edges).
+- Plants/pots: cylinder pot + instanced leaf blades.
+- Trees: 5-7 trees: trunk (tapered cylinder, slight bend) + foliage as 3-6 icosahedron clusters (palm-ish? Coastal island → pines + palms). I'll do stylized conifers (cone stacks) and a couple of palms (fronds as tapered planes with sway). Sway in vertex shader based on height.
+- Grass: InstancedMesh of small tapered blades, ~600 instances, placed on grass-height areas, sway in shader.
+- Rocks above water: instanced icosahedrons with noise.
+- Towels: 2 thin boxes with slight rotation on the deck/bench, bright stripes (use vertex colors? just solid colors: coral & teal).
+- Buoy + rope, a small campfire ring? Cozy: a fire pit with a flickering point light and instanced logs. Nice for evening.
+- Seagulls? A couple of birds circling above (instanced, simple V shape) — adds life. Optional, cheap. Yes, 3 gulls on circular paths with wing flap via shader.
+- Smoke from the cabin chimney: small sprite particles rising (instanced spheres with additive? use small planes/sprites). A-frame with a small chimney — cute. Let's add smoke as an instanced mesh of low-poly spheres with opacity fading, animated in JS.
+
+Lighting:
+- Hemisphere light (sky/ground) with colors lerped by time of day.
+- Directional "sun/moon" light with shadows (mapSize 2048, camera bounds ~ ±20), color/intensity lerped.
+- Ambient/rim light: a second directional (fill) low intensity, no shadow.
+- Lantern point lights (4-6): warm, intensity lerped with night factor.
+- Cabin interior point light.
+- Fire light flicker.
+- Fog: THREE.FogExp2 with color lerped (atmosphere).
+- Sky: a large sphere with gradient shader (BackSide), colors lerped; plus stars at night (instanced points with opacity by night factor). Sky sphere must be outside the tank and not clipped by fog... FogExp2 will affect the sky sphere; set material fog: false for the sky.
+
+Tone mapping: ACESFilmic, exposure ~1.0-1.15.
+
+Post: no composer (keep single file simple, avoid extra imports? EffectComposer is in addons, fine to import). Bloom would make lanterns glow beautifully at night. Risk: perf + complexity. I'll add UnrealBloomPass via addons with a quality toggle (on for high quality). Let's include it — it dramatically improves the "glow" requirement. Need to handle resize and the transparent background (bloom over a scene with alpha? We have a sky sphere so opaque). Use EffectComposer + RenderPass + UnrealBloomPass + OutputPass. In r160, OutputPass exists (added r156). Yes: `three/addons/postprocessing/OutputPass.js`.
+
+Careful with bloom + transparent water: bloom uses the rendered color; fine.
+
+Performance: bloom at devicePixelRatio capped 1.5, bloom resolution scaled. Add quality settings: Low (no bloom, dpr 1, shadow 1024, fewer grass), Medium, High.
+
+Camera presets:
+1. iso: pos (26, 20, 26) target (0, 0.5, 0) — isometric-ish.
+2. cabin: pos (10, 4.5, 12) target (1.5, 1.6, 2) near cabin/pier.
+3. underwater: pos (-9, -2.6, 9) target (0, -3, 0) — inside the tank looking at rays. Must be inside the tank bounds: tank x ∈ [-16,16], z ∈ [-13,13]. (-9,-2.6,9) is inside. Good.
+4. free orbit: enable OrbitControls always (with damping), presets just tween. Add limits: maxDistance 70, minDistance 4, maxPolarAngle ~ 1.6 (prevent going under the plinth? Allow going under for the underwater view? Underwater camera is above the seabed, so polar angle < 90° relative to target... For preset 3, camera y=-2.6, target y=-3 → nearly horizontal, fine.)
+
+Transitions: tween camera.position and controls.target over 1.4s with easeInOutCubic; disable controls during tween? Keep enabled but override; simplest: during tween set a flag, lerp, and set controls.target each frame; controls.update() after.
+
+UI: 
+- Header top-left: "Tidehaven" (Fraunces, big, letterspaced), subtitle "A tiny island diorama · tide, wind & weather at your fingertips".
+- Right side: camera preset buttons (vertical stack, small, translucent).
+- Bottom-left panel: "World" — Tide slider, Wind slider, Time of day segmented (Day/Sunset/Night), Pause + Reset buttons.
+- Bottom-right panel: "Actions" — Launch kayak / Return kayak, Ray leap.
+- Top-right (or bottom): "Audio" — music toggle, volume slider, plus SFX volume? Keep: music toggle + master volume + ambience toggle? Requirement: music on/off button and volume slider. I'll add master volume + music toggle + a "waves & breeze" ambience toggle.
+- Info readouts: tide level in cm, wind in knots, time label, FPS? A small "telemetry" strip adds a crafted feel: tide, wind, local time, kayak status. Nice touch.
+- Mobile: panels collapse into a bottom sheet with toggle buttons; use CSS media queries. Panels have a header with a chevron that toggles `.collapsed`.
+
+Loading overlay: a nice intro card with the title, "Enter Tidehaven" button (this doubles as the audio gesture start). Good UX and satisfies "start audio only after user interaction".
+
+Now, careful engineering details:
+
+1. onBeforeCompile shader injections: need `material.customProgramCacheKey`? Not needed. Must add uniforms and update them each frame via `material.userData.uniforms.x.value = t`.
+
+For MeshStandardMaterial caustics injection:
+```js
+mat.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime = uni.time; // shared uniform object
+  shader.uniforms.uWaterLevel = uni.waterLevel;
+  shader.uniforms.uCausticStrength = uni.causticStrength;
+  shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
+    .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\n vWPos = (modelMatrix * vec4(transformed,1.0)).xyz;');
+```
+Note: `worldpos_vertex` is only included when needed (shadows/etc). Safer to compute in `#include <project_vertex>`? Let's inject after `#include <begin_vertex>`: `vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`. Good.
+
+Fragment: inject into `#include <dithering_fragment>` (near the end) to add emissive caustics:
+```
+float c = caustic(vWPos.xz * 0.55, uTime*0.35);
+float under = smoothstep(uWaterLevel + 0.15, uWaterLevel - 1.2, vWPos.y); // 1 when underwater
+gl_FragColor.rgb += c * uCausticStrength * under * vec3(0.45,0.85,0.85) * lightFactorApprox;
+```
+Also apply underwater fog/tint to submerged objects: `gl_FragColor.rgb = mix(gl_FragColor.rgb, uDeepColor, 1.0 - exp(-depthDensity * depth))` — gives lovely underwater depth haze. Let's do it: depth = uWaterLevel - vWPos.y; fogUnder = 1 - exp(-0.10 * max(depth,0)) clamped, mix toward uWaterFogColor. This is a big visual win for the underwater view. Apply to island, seabed, rays, fish, rocks, plants.
+
+I'll write a helper `applyUnderwaterFog(material, opts)` that adds the onBeforeCompile with shared uniforms.
+
+2. Water surface shader as raw ShaderMaterial (not standard) — no lighting needed; compute specular from sun uniform.
+
+3. Height texture: bake island height. Island height function:
+
+```js
+function islandHeight(x, z) {
+  const r = Math.hypot(x, z);
+  const a = Math.atan2(z, x);
+  // silhouette radius with lobes
+  const R = 6.4 + 1.5*Math.sin(a*2 + 0.6) + 0.9*Math.sin(a*3 - 1.1) + 0.5*Math.sin(a*5 + 2.2);
+  // base: smooth from peak to shore
+  let h = 2.6 * (1 - smoothstep(0.55*R, R*1.02, r)); // plateau-ish
+  // Add a lagoon bay: reduce height near pier side
+  ...
+  // underwater slope to seabed
+  const t = smoothstep(R*1.0, 10.6, r);
+  h = h * (1-t) + (-5.4) * t;  // blend to seabed
+  // dunes & detail noise
+  h += noise2(x*0.35, z*0.35) * 0.25 * (1 - t);
+}
+```
+I need a noise function in JS. Write a small value-noise with hash + smoothstep interpolation, and a matching GLSL noise? The shader only needs the baked texture, so JS noise is enough. Good — bake a 192×192 float texture over the tank rect [-16,16]×[-13,13].
+
+Ensure the island has a flat-ish plateau for the cabin and a beach on the pier side. Let me design the island shape: 
+- Center at (0,0). Peak around (-2, -2) height 2.8.
+- Beach on the +x/+z side (front-right) where the pier goes out toward +x.
+- Pier extends from shore at around (5.5, 3.5) out to (12, 5.5)? Tank x max 16 → pier to x=12.5 is fine.
+
+Let me place:
+- Cabin at (-1.5, 0, -1.0) on the plateau, facing +z/+x (toward the pier).
+- Deck in front of the cabin (+z side).
+- Pier: starts at shore around (4.5, 3.0), runs to (11.5, 6.0). Direction normalized. Kayak moored at the pier end.
+- Bench at (2.5, ~1.0, 4.0) facing the water.
+- Fire pit near (0.5, 1.2, 3.0).
+- Trees scattered on the plateau, palms near the beach.
+- Rocks on the beach and in the water.
+
+To keep it simple, I'll make the island's shore radius larger on the pier side.
+
+Height function design (JS):
+```js
+const shoreRadius = (a) => 6.2 + 1.9*Math.sin(a*1.0 + 0.4) + 1.1*Math.sin(a*2.0 - 1.0) + 0.55*Math.sin(a*3.0 + 2.0);
+```
+With a=atan2(z,x). This gives a lobed island. Then:
+```js
+function terrainHeight(x,z){
+  const r = Math.hypot(x,z), a = Math.atan2(z,x);
+  const R = shoreRadius(a);
+  const sea = -5.4;
+  // beach profile: above water from r < R
+  let land = 3.0 * smoothstep(R, R*0.35, r); // 0 at R, 3.0 at r<0.35R
+  land += 0.9 * smoothstep(R*0.9, R*0.55, r) ; // plateau step
+  // flatten the cabin plateau
+  const flat = smoothstep(4.6, 2.2, Math.hypot(x+1.2, z+0.8)); // near cabin
+  ...
+}
+```
+This is getting complicated. Let me write it more carefully with a clear layering:
+
+```js
+function terrainHeight(x, z) {
+  const r = Math.hypot(x, z);
+  const a = Math.atan2(z, x);
+  const R = shoreRadius(a);           // ~5.5..9
+  const sea = -5.4;
+
+  // 1. base radial profile: -5.4 far out, 0 at shoreline, rising inland
+  const shore = r / R;                       // 1 at shoreline
+  let h = sea + (0 - sea) * smoothstep(1.45, 1.0, shore);      // slope from seabed up to 0 at shore
+  h += 3.1 * smoothstep(1.02, 0.30, shore);  // land rise inland
+  // 2. plateau for the cabin (flatten around center-north)
+  const d0 = Math.hypot(x + 1.0, z + 0.6);
+  h = mix(h, 2.55, 0.75 * smoothstep(4.2, 1.6, d0));
+  // 3. gentle rolling noise on land
+  h += (fbm(x*0.22, z*0.22) - 0.5) * 0.9 * smoothstep(1.05, 0.7, shore);
+  // 4. beach scallops + dune ridge
+  h += 0.18 * Math.sin(a*7.0) * smoothstep(1.15, 0.95, shore) * smoothstep(0.8, 0.95, shore);
+  // 5. seabed undulation under water
+  h += (fbm(x*0.14+11, z*0.14-7) - 0.5) * 1.1 * smoothstep(1.1, 1.5, shore);
+  return h;
+}
+```
+Need to ensure h ≤ -5.4 near tank edges: at r = 1.45R ≈ 9-13, h = sea + noise. With tank half-extent 13 in z and 16 in x, corners are at r up to 20 → h = sea + noise*1.1 → around -5.4±0.55 → could poke below the seabed plane (-5.5) → holes. Fix: clamp h to max -5.42 (i.e., `h = Math.max(h, -5.42)`) and set seabed plane at -5.5. Then terrain never goes below -5.42, so it's always above the seabed plane. 
+
+Island geometry: I'll build a grid over the tank rect (32×26) at 0.28 spacing → 114×93 ≈ 10.6k verts, 20k tris. That's fine and gives a smooth terrain with clean edges at the tank walls (matching the cutaway). Grid geometry (PlaneGeometry rotated) is simplest and aligns with the height texture. 114*93 = 10602 verts → OK. Use non-indexed? PlaneGeometry is indexed; I'll create PlaneGeometry(32, 26, 112, 90), rotate -90° X, then set y from terrainHeight. Compute vertex colors by height/slope. computeVertexNormals.
+
+Vertex colors:
+- underwater (h < -0.15): pale sand #d9c9a3 mixed with a bit of grey-green, darker in deep.
+- wet sand band (-0.15..0.35): #e8d7b0 darker.
+- dry sand (0.3..0.9): #f0e0bb
+- grass (h > 0.9, low slope): #6f9a53 / #557f43 with noise variation
+- rock on steep slopes: #8a8377
+Blend smoothly.
+
+Also add a "grass patch" noise for variation.
+
+4. Water surface geometry: PlaneGeometry(32,26,180,150) at y = level (group y). Wave displacement in vertex shader.
+
+5. Foam ring: I'll do foam in the water shader (shore foam) + a separate thin "waterline scum line" mesh? The shader foam is enough, plus add foam crests. Also add a shoreline foam "ring" mesh hugging the island for extra definition: sample shore positions from terrainHeight to build a ribbon at the waterline that follows the tide. Let's do it: build a ring geometry with N=180 segments, radius found by marching outward from the island center along each angle until terrainHeight crosses the current level. Precompute the crossing for level 0 and store the base radius + the terrain gradient so the JS can update the ring y and radius as the tide changes: for tide Δ, radius shifts by Δ/slope. Simpler: for each angle, precompute a small table of (level → radius) for levels -0.8..1.2. Then the ring geometry positions update per tide change (180 verts, cheap, update on tide change only). Ribbon: two rings (inner at radius, outer at radius+0.55 with alpha fade), animated with waves. Foam mesh: transparent white, additive-ish, depthWrite false, renderOrder 12. Nice.
+
+Simplify: foam ring = a strip between r(θ) and r(θ)+w(θ) with w varying by noise, alpha from noise & time. Update positions when tide changes; animate alpha via shader time. I'll write a small ShaderMaterial for the foam with uTime, uWind, and per-vertex attribute `aSide` (0 inner, 1 outer) for alpha falloff, plus wave displacement.
+
+6. Ripples: on ray splash, spawn expanding rings — use a pool of 6 ring meshes (RingGeometry) with a shader (alpha = expanding band). Position at splash point, y = water level. Animate scale + fade.
+
+7. Droplets: instanced spheres (pool of 60) with gravity, spawned at splash; small splash column mesh.
+
+8. Bubbles: instanced spheres, 80, rising from vents; reset at top → they should disappear at the water level. Use per-bubble speed/phase; alpha via material opacity (uniform for all) — with InstancedMesh, per-instance scale handles size; when y > level, reset to vent.
+
+9. Kayak: parametric hull. Build with a custom BufferGeometry: for u ∈[0,1] along length, v ∈[0,1] around: cross-section is a rounded V. Let me do a simpler approach: hull = a lathe? A kayak: take a "leaf" profile: length L=2.6, width W=0.55. Build as a grid: i along length (u: -1..1), j across (v: -1..1):
+```
+x = u * L/2
+halfW = W/2 * sqrt(1-u*u) * (1 - 0.25*u*u)
+z = v * halfW
+y = -0.22*(1 - v*v) * (1 - 0.3*u*u)   // V-shaped hull depth
+deckY = +0.06 ... 
+```
+Make it a single surface (open top) with DoubleSide, plus a cockpit rim (torus segment) and a seat, plus a paddle. That's convincing at diorama scale. Add a slight keel line. Use DoubleSide + flatShading? Smooth.
+
+Kayak trip: path = a circle/ellipse around the island at radius ~9.5, y = water level + 0.05, with bobbing and yaw along the path, and a gentle roll. Kayak state: 'docked' | 'out' | 'returning'. Use a param t along a closed path; when launching, animate from dock position onto the path (lerp), then travel; on return, travel to the dock and lerp into docked pose.
+
+Implementation: define `kayakPath` as a CatmullRomCurve3 closed loop around the island, passing through the dock point. Then progress u ∈ [0,1) advances. Docked: kayak sits at the dock with a rope; when launching, it eases into motion. Simplest: kayak always follows the curve; when docked, u is fixed at uDock with a small bob; launching → u advances with eased speed; returning → advance until reaching uDock, then stop. Speed lerps 0→cruise. Elegant: single system. The rope: only visible when docked (fade/hide when away; show a rope from the dock cleat to the kayak always — a tube that stretches? Simpler: hide rope when the kayak is out).
+
+10. Lanterns: 4 on the pier + 1 by the cabin door + 1 hanging on the deck post. Each: post (cylinder), cap (cone), glass box (emissive material, color lerp by night), plus a PointLight (limit to 4 point lights for perf: pier 2, door 1, cabin interior 1, fire 1 = 5). Use `light.distance` ~ 8, decay 2.
+
+Emissive intensity: animate with a flicker (noise) at night.
+
+11. Time of day presets: define 3 "sky states": day, sunset, night, each with: skyTop, skyBottom, sunColor, sunIntensity, sunPos, hemiSky, hemiGround, hemiIntensity, fogColor, fogDensity, waterDeep, waterShallow, nightFactor, exposure. Smooth transitions: lerp current state toward target state each frame (rate ~ 1/2.2s). All materials' uniforms updated from the lerped state.
+
+12. Stars: THREE.Points with a small circular sprite texture (generated canvas) — opacity by nightFactor; also a moon mesh visible at night.
+
+13. Audio (Web Audio API):
+- Master gain → destination.
+- Music: two detuned triangle/sine oscillators playing a slow pad chord progression + a gentle marimba-ish arpeggio (sine with fast decay envelope) on a pentatonic scale, plus a sub bass. Use a scheduler with setTimeout/lookahead. Chords: e.g., Amaj9-ish progression: [A2,E3,C#4,B3]... Keep simple: a set of 4 chords, each 8 seconds, arpeggio notes at 0.5s intervals with randomization, pentatonic scale.
+- Reverb: ConvolverNode with a generated impulse response (noise decay). Nice.
+- Delay for the arpeggio.
+- Breeze: white noise buffer (2s, looping) → bandpass filter (400-900 Hz, LFO on frequency & gain) → gain.
+- Water: brown/pink noise → lowpass (600 Hz) with LFO on the frequency and gain (0.15 Hz) → gain; plus occasional gentle "lap" transients? Keep the LFO-based swell. Add a subtle "wave crash" using a second noise → bandpass 1200 with a slow LFO.
+- SFX: splash (noise burst through a bandpass sweep + a low thud), kayak launch (short wood knock: a filtered triangle burst with quick decay), UI clicks (soft sine blip).
+- Music toggle, master volume slider, ambience toggle.
+
+Audio must start after a user gesture → the "Enter" button.
+
+14. Pause: freeze time accumulation (dt = 0 for world updates) but keep rendering & camera transitions running. Show "Paused" state on the button.
+
+15. Reset: restore tide/wind/time/kayak/camera/pause to defaults, reset ray positions.
+
+16. Mobile: media query < 860px → panels become bottom-anchored, collapsible; header smaller; canvas full. Panels start collapsed on mobile.
+
+17. Quality settings: a segmented control (Low/Med/High) → sets pixelRatio cap (1 / 1.35 / min(dpr,2)), shadow map size (1024/2048, off for low), bloom on/off, grass count? Changing grass count at runtime: set `instancedMesh.count` (works — just reduce count). Also reduce fish count via count. Good and simple.
+
+18. Shadows: directional light with shadow camera covering the tank (±18). Bias tuning: shadow.bias = -0.0008, normalBias = 0.03.
+
+19. Fog: FogExp2. The tank glass planes: fog: false? They're inside the scene; fog applies. Keep fog: true for consistency, low density.
+
+Let me now also handle the "avoid harsh intersections between water and shore": the water surface plane is a flat quad at the water level intersecting the terrain → the intersection line is a hard geometric edge. Mitigations:
+- Foam band in the shader around terrain height ≈ level → hides the seam.
+- Water alpha increases with depth so shallow areas are nearly transparent → the intersection is soft.
+- The water surface extends to the tank walls; at the walls, the shell's far walls meet the surface — the shell's top edge is at the level → aligned. Good.
+
+Also, the water surface mesh at the shoreline: since the terrain rises above the level, the surface is occluded there by depth test. Fine.
+
+One more: the water surface is transparent with depthWrite false, so the sky (drawn first) blends. Sky is opaque. Good.
+
+20. Underwater view: camera inside the tank below the level. The water surface (DoubleSide) shows a silvery ceiling. The near walls are the shell's back faces (all walls visible from inside) — the shell alpha should be low from inside so we don't see a heavy wall. Fresnel handles it: looking at walls at a steep angle → low alpha; grazing → high. Fine.
+
+Also, the glass planes at the near faces: from underwater inside, the camera is inside the tank, and the glass planes' normals point outward → from inside, they're back-facing → culled (FrontSide) → we see through them. Good, no interference.
+
+21. Instanced grass sway: vertex shader injection using `instanceMatrix` (available in the vertex shader for InstancedMesh when using the standard material). In the vertex shader, `transformed` is in local space; `#include <begin_vertex>` gives `vec3 transformed = vec3(position)`. I want to sway based on world position → compute world pos after `project_vertex`? Easier: use `#include <begin_vertex>` and inject:
+```
+vec4 wInstance = instanceMatrix * vec4(position,1.0);
+float ph = wInstance.x*0.7 + wInstance.z*0.6;
+float sway = sin(uTime*1.6 + ph) * uWind * pow(max(position.y,0.0)/0.5, 2.0) * 0.12;
+transformed.x += sway; transformed.z += sway*0.6;
+```
+Since instanceMatrix is applied later (in project_vertex), adding to local x/z is in the instance's local space (rotation applied after) — acceptable.
+
+For trees, same approach with the trunk's local y.
+
+22. Fish InstancedMesh: per-frame matrix updates for ~90 fish: use a dummy Object3D. Fine.
+
+23. The rays' jump: pick ray index 0. State machine: idle (follows path), jump (parabolic: y = level + v0*t - 0.5g t², position along a straight tangent direction, rotate pitch), land (splash, spawn droplets/ripples, resume path). Ensure it happens in an open area of the lagoon (choose the ray whose position is farthest from the island, i.e., in open water).
+
+Implementation: give each ray a `path` (center, radius, y, speed, phase). During the jump, override position/y with physics; pitch = atan2(vy, speed); roll to 0; fins flap faster. On y < level → splash.
+
+24. Ripple pool: 8 rings.
+
+25. Caustic strength should fade at night (uCausticStrength *= sunFactor).
+
+Now, let's think about the UI/CSS design quality. I want it to feel crafted, not templated:
+- Background: the canvas fills the screen with a subtle vignette overlay + a very subtle film grain (CSS radial gradient + SVG noise?) Use a CSS overlay with a radial vignette and a fine noise via a repeating conic? Use an SVG feTurbulence data URI for grain at low opacity. Nice.
+- Typography: Fraunces (display, wght 300-700, opsz) for the title; Manrope 400/600/800 for UI. Load from Google Fonts.
+- Panels: `background: linear-gradient(180deg, rgba(18,32,34,.72), rgba(12,24,26,.62))`, `backdrop-filter: blur(14px) saturate(1.2)`, `border: 1px solid rgba(255,255,255,.10)`, `border-radius: 14px`, inset highlight. I'll vary the radii so it feels hand-built: 14px panels, 8px buttons, pill toggles.
+- Accent colors: sea glass `#7fd6c4`, copper `#e08b52`, sand `#f2dfb6`, deep teal ink `#0b1a1d`.
+- Sliders: custom-styled range inputs with a copper thumb and a track showing the filled portion (use a CSS var updated by JS via `--fill: %`).
+- Buttons: solid for actions, ghost for camera presets, active state with a copper glow and a left accent bar.
+- Micro-interactions: hover lift, active press scale, focus ring, transitions, a subtle "pulse" on the Ray leap button when idle.
+- Telemetry strip: monospace-ish numbers using Manrope with tabular-nums, letter-spacing.
+- A small legend of keyboard shortcuts (1/2/3 cameras, Space pause, J jump, K kayak, T night cycle). Implement keys!
+- Scroll reveals: not applicable (single viewport). Instead: entrance animation — panels slide/fade in staggered after Enter.
+
+Loading overlay: full-screen with the title, a small animated tide line (CSS), and "Enter Tidehaven" button. Also a "Start with audio" note.
+
+Let me now write the code. I'll be systematic and complete.
+
+For the info/legend, add a small "keys" line in the World panel footer.
+
+For the foam ring geometry: I need shore radii per angle for the current level. Precompute a lookup: for each of N=200 angles, march r from 0 to 15.5 in steps of 0.06, find r where terrainHeight(x,z) crosses 0 (the base level). Store r0[θ] and the local slope s[θ] = dH/dr at the crossing. Then for a tide level L, the shore radius r(L) ≈ r0 + (L - 0)/s (with s negative → for L>0, radius increases: r = r0 + L/|s|... Let's define s = |dH/dr| at the crossing (positive). Then H(r) ≈ H(r0) + s*(r - r0) with H increasing inward → H decreases as r increases. So H(r) = -s*(r - r0). Setting H = L → r = r0 - L/s. For L>0 (high tide), r < r0 → the shore moves inward (the beach narrows). Correct!
+Clamp r to [0.5, 15.4].
+
+Foam ribbon vertices: for each θ: inner point at r(θ) - 0.05, outer at r(θ) + w(θ) (w ~ 0.5..1.3 with noise). y = level + 0.02 + wave. Build as a triangle strip (2 verts per angle, 200*2 verts, 398 triangles). Update on tide change.
+
+Foam shader: alpha = (1 - aSide)^1.5 * noise * uStrength, color white-sand; additive blending? Use normal blending with white color and alpha, depthWrite false. Additive looks glowy at night; use normal.
+
+Also add foam "in the water" in the shader (subtle) — done via the shore depth test.
+
+For the water surface shader, I need to sample the height texture. Uniform `uHeightTex` (sampler2D, RedFormat float). Mapping: world x ∈ [-16,16] → u = (x+16)/32; z ∈ [-13,13] → v = (z+13)/26.
+
+DataTexture setup:
+```js
+const HW = 160, HD = 130;
+const data = new Float32Array(HW*HD);
+for (j...) for(i...) data[j*HW+i] = terrainHeight(x, z);
+const tex = new THREE.DataTexture(data, HW, HD, THREE.RedFormat, THREE.FloatType);
+tex.minFilter = tex.magFilter = THREE.LinearFilter; tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+tex.needsUpdate = true;
+```
+RedFormat + FloatType requires EXT_color_buffer_float for render targets, but for sampling as a texture, R32F requires OES_texture_float_linear for linear filtering (WebGL2 core? In WebGL2, R32F texture filtering with linear requires OES_texture_float_linear — it's an extension, widely supported). Safer: use `THREE.RGBAFormat` with `THREE.UnsignedByteType` and encode height into 2 channels (high/low byte) → precise and universally filterable. Encoding:
+```
+const v = (h + 12) / 24; // 0..1
+const hi = Math.floor(v*255)/255; const lo = Math.floor((v*255 - Math.floor(v*255))*255)/255;
+r = hi, g = lo
+```
+Decode: `h = (r + g/255)*24 - 12`. Bilinear filtering across channels is problematic (byte wrap), but height is smooth, so channel hi varies slowly; lo is noise → interpolation of lo is harmless. Good enough.
+
+Simpler: use FloatType with NearestFilter (no linear filtering needed for foam at 160×130 over 32 units → 0.2 unit per texel; foam band 0.4 → blocky). Use linear with float: I'll try `HalfFloatType` with RedFormat — R16F linear filtering is core in WebGL2 (OES_texture_half_float_linear is core in WebGL2? In WebGL2, half-float textures are filterable by default — yes, EXT_color_buffer_float is needed for rendering, but sampling half-float with linear filtering is core in WebGL2). So use `THREE.RedFormat` + `THREE.HalfFloatType`. Three's DataTexture with HalfFloatType expects a Uint16Array of half-float bits. I'd need a float→half converter. Three provides `THREE.DataUtils.toHalfFloat`. Yes! `THREE.DataUtils.toHalfFloat(v)` exists (r128+). 
+
+So: `const data = new Uint16Array(HW*HD); data[i] = THREE.DataUtils.toHalfFloat(h);` with RedFormat + HalfFloatType. Half float precision at ~5 is 2^-8 ≈ 0.004 → plenty. 
+
+Now, terrain mesh vertex colors: build a color attribute.
+
+Let me write the material for terrain: MeshStandardMaterial({vertexColors:true, roughness:0.95, metalness:0, flatShading:false}) + underwater fog + caustics injection.
+
+Seabed: PlaneGeometry(32,26,1,1) at y=-5.5 with a sand material + caustics (strong) + fog. Add ripples: use a plane with segments 60x50 and displace y by a gentle dune noise, with sand color. Good — seabed dunes with caustics look great.
+
+Now, the tank glass planes: PlaneGeometry per face (front z=+13, back z=-13, left x=-16, right x=+16), from y=-5.5 to y=3.6. Material: ShaderMaterial with fresnel edge glow:
+```
+alpha = 0.05 + 0.35*pow(1.0 - abs(dot(N, V)), 3.0)
+```
+Plus a subtle vertical gradient. Side: FrontSide (normal outward), transparent, depthWrite false, renderOrder 20.
+When the camera is outside in front, the front glass is visible (facing camera) → tint + edge glow. The back glass faces away from the camera → culled. 
+
+Also the top of the glass: y=3.6 (tank top). Below the plinth: the plinth covers y < -5.5.
+
+Also, the glass planes will tint the scene when the camera is inside the tank (underwater preset at (-9,-2.6,9) is inside → the front glass (z=13) is in front of the camera? Camera at z=9, glass at z=13 with normal +z pointing toward the camera → dot(N,V) > 0 → front-facing → rendered → tints the view! That's bad for the underwater view (a haze over everything). Fix: in the glass shader, discard when the camera is inside the tank. Pass a uniform `uCamInside` (computed in JS: |cam.x|<16 && |cam.z|<13 → 1) and multiply alpha by (1-uCamInside). Also fade the glass when the camera is very close to a wall. Good.
+
+Also: when the camera is inside the tank, the shell's BackSide shows all walls (fine).
+
+Edge case: the iso camera at (26,20,26) is outside → the front (z+) and right (x+) glass planes face the camera → visible as aquarium glass. The prompt: "The front and side faces must reveal the water in cross-section, like aquarium walls." So glass on the front + right (the two faces the iso camera sees) is exactly right. With the fresnel edge glow, at a steep viewing angle the glass is nearly invisible (transmission-like) and the cross-section reads through the water tint. 
+
+Now the "cross-section" reading: the water body visible at the cut face. With the shell rendering only the far walls, the water volume between is empty (nothing rendered) → we see the tint from the shell's far walls + the surface. To emphasize the cross-section, add a "water slice" plane just inside the front and right glass faces: a vertical plane at z = 12.9 (and x = 15.9) with a shader showing the water gradient (turquoise, darker with depth), a moving surface line at the water level, internal light shafts, and a subtle grain. Alpha ~0.55 above the seabed, fading near the edges. This makes the cutaway read beautifully as a solid block of water. Rendered FrontSide facing outward (toward +z), depthWrite false, renderOrder 15, alpha blended, and culled when the camera is on the other side. Yes! This is the money detail. It also gives the "tide line" visible on the glass.
+
+Careful: this slice plane will occlude the interior (fish behind it) — with alpha 0.55, it tints them → that's exactly the aquarium look (like looking through the water at the front face). Keep alpha moderate (0.35-0.5) with a stronger tint near the surface line, and a bright meniscus line at the water level.
+
+Also the slice should show the surface line at the current water level (uniform uLevel) with a slight wave.
+
+Add the same slice on the right face (x=+15.9). Only two faces (front + right) to match the iso view from +x+z; and cull when the camera is on the opposite side (side: FrontSide handles it).
+
+Now, the plinth: a box (33.2 × 1.3 × 27.2) centered at y = -6.15 (top at -5.5) with a chamfered look: use a box + a slightly larger thin box on top? Add a "stone/teak" material: warm dark wood color, roughness 0.8. Add corner posts? Keep it simple: plinth + a thin brass rim at the top of the glass (a frame of 4 thin boxes at y=3.6). The frame at the top of the front/right faces will be in front of the water at y=3.6 — above the island? The island peaks at 3.15, close. The frame is at the tank's top edge (y=3.6), and the camera at iso elevation ~37° → looking down; the front frame at z=13, y=3.6 projects to screen y ≈ (3.6-0)/dist... it will appear below the island in screen space (since the island is farther and higher). Should be fine.
+
+Let me set the tank top y = 4.0 to be safe, and the frame at 3.9-4.0.
+
+Now the shell box: from y=-5.5 to y=uLevel. Height = uLevel+5.5, center y = (uLevel-5.5)/2.
+
+Now, the underwater view camera at (-9,-2.6,9): the water slice planes are at z=15.85 and x=15.85; the camera is inside → the slice's FrontSide normal +z faces the camera at z=9 < 15.85 → front-facing → rendered → tints. Need to hide slices when the camera is inside: multiply alpha by (1-uCamInside) like the glass. Good — share the uniform.
+
+Now the sun/moon: add a visible sun disc (a circle sprite) at the sun direction, and a moon at night. Position at distance 120 from the center, following the sun direction; the sky sphere has radius 400. Sun: a Mesh with CircleGeometry(6) + MeshBasicMaterial (fog:false, toneMapped:false), always facing the camera (billboard via lookAt in the render loop, or use a Sprite). Use THREE.Sprite with a generated radial-gradient texture. Simple.
+
+Stars: THREE.Points with size attenuation, positions on a sphere of radius 300 (upper hemisphere), material with opacity = night.
+
+Let me finalize the sun/moon positions: day: elevation 52°, azimuth 125°; sunset: elevation 6°, azimuth 205°; night: elevation 40°, azimuth 300° (moon). The directional light follows.
+
+Shadow camera: ortho left/right ±20, top/bottom ±20, near 1, far 90, mapSize per quality.
+
+At sunset, long shadows (elevation 6°) → the shadow camera needs to cover a long throw; ±22 and far 120.
+
+Now, the water surface shader needs the sun direction & colors as uniforms (uSunDir, uSunColor, uSkyColor, uDeep, uShallow, uFoamColor, uLevel, uTime, uWind, uNight, uCamPos).
+
+Water fragment:
+```
+vec3 N = normalize(vNormal);
+vec3 V = normalize(uCamPos - vWorld);
+float fres = pow(1.0 - max(dot(N,V),0.0), 5.0);
+float depth = uLevel - vTerrain;   // water depth
+float depthT = 1.0 - exp(-depth*0.55);
+vec3 col = mix(uShallow, uDeep, depthT);
+// sun specular
+vec3 L = normalize(uSunDir);
+vec3 H = normalize(L+V);
+float spec = pow(max(dot(N,H),0.0), 180.0) * uSunSpec;
+col += uSunColor * spec;
+// sky reflection
+col = mix(col, uSkyColor, fres*0.75);
+// sparkle
+col += uSunColor * pow(max(dot(reflect(-L,N),V),0.0), 40.0)*0.12*uSunSpec;
+// foam
+float shoreD = smoothstep(0.55, 0.0, depth);
+float wnoise = snoise(vWorld.xz*1.4 + vec2(uTime*0.25, uTime*0.1));
+float foam = shoreD * smoothstep(0.15, 0.75, wnoise*0.6+0.6 + uWind*0.4);
+foam += smoothstep(0.55, 1.0, vWaveH*2.0) * 0.25 * uWind;
+col = mix(col, uFoam, clamp(foam,0.0,1.0));
+float alpha = mix(0.42, 0.94, depthT);
+alpha = mix(alpha, 1.0, fres*0.6);
+alpha = mix(alpha, 0.9, clamp(foam,0.,1.));
+alpha *= smoothstep(-0.35, 0.05, depth);  // fade out at the shoreline
+```
+Need a GLSL noise: use a simple 2D value noise (hash-based) — cheap.
+
+Underwater (camera below, gl_FrontFacing false): flip N; increase alpha; add a silvery fresnel.
+
+Water surface vertex waves:
+```
+float h = 0.0; vec3 d = vec3(0.);
+h += wave(pos, dir1, amp1, steep1, speed1);
+...
+```
+Use simple sine waves with analytic normals:
+```
+float w1 = sin(dot(p, k1)*f1 + t*s1) * a1;
+```
+Sum 4 directions; normal from the derivative. Amplitude scaled by uWind (0.3..1.6) and by a "shallow dampening" (waves flatten near the shore): amp *= smoothstep(0.3, 1.6, depth) using the terrain texture sampled in the vertex shader (vertex texture fetch is fine in WebGL2).
+
+Also, the wave amplitude must be 0 at the tank walls? Not necessary.
+
+Now, the shell shader:
+```
+varying vec3 vWorld; varying vec3 vNormal;
+float depth = uLevel - vWorld.y;   // negative above the water
+// the box extends above the water (to y=4) for the glass walls; tint only below the level
+float under = smoothstep(0.0, 0.25, depth);
+vec3 col = mix(uShallow, uDeep, 1.0-exp(-max(depth,0.)*0.5));
+// light shafts
+float shafts = ...
+alpha = 0.55 * under + 0.05;
+// caustic glow on the far walls
+```
+The shell's top face (back-facing from underwater) → alpha low, silvery.
+
+Also the shell's bottom face at y=-5.5 is under the seabed → not visible.
+
+The shell's far walls get caustic patterns projected? The caustic projection on the walls would need 3D projection; skip, use vertical gradient + subtle animated horizontal light shafts (from the surface):
+```
+float shaft = pow(max(0.0, sin(vWorld.x*0.7 + uTime*0.35)*0.5+0.5), 3.0) * exp(-max(depth,0.)*0.25);
+col += uSunColor*shaft*0.06;
+```
+Nice.
+
+Now, the shell must not be visible above the water as a box (the part above the water level: alpha 0.05 → a faint glass wall above the water, which is the tank glass — good, consistent).
+
+Now the "glass" planes at the near faces and the "slice" planes: I realize the shell already provides the water tint from the far walls; the slice adds the cross-section. Combined alpha: the slice (0.4) over the shell (0.5) → the water looks deep/dark at the front. Careful: the slice is at the front, so we see: slice (front) → everything → shell (far walls). The slice alpha 0.35 max, tuned to look like looking through the front wall of the aquarium. Keep the slice alpha ~0.28 with a strong meniscus line and a bright edge at the bottom, so it reads as glass+water.
+
+Alright. Time to write. I'll write the code in one go, carefully.
+
+Additional details for "lived-in": 
+- Towels: 2 thin boxes draped on the deck railing + one on the bench.
+- Crate stack: 3 crates + 1 open crate with a plant.
+- Barrel? A small barrel near the pier.
+- A signpost with a "Tidehaven" plank? Cute. Add a small sign at the pier entrance with a plank (no text, or text via a canvas texture — a canvas texture with "TIDEHAVEN" painted on it is a lovely touch!). Yes: create a CanvasTexture for the sign. Also for the doormat? Keep the sign.
+- A clothesline between two posts with 3 small cloths (swaying with the wind)! Very cozy. Use thin planes with a wave in the vertex shader. Yes, add it near the cabin.
+- A lantern hanging from the deck post (with a chain).
+- A coffee mug on the deck table. Add a small table + 2 stools.
+- A buoy ring on a post.
+- A fire pit with 3 logs + a stone ring.
+
+That's a rich scene. Let me be efficient in code: helper functions.
+
+Seagulls: 3 sprites/meshes circling.
+
+Let me write the code.
+
+For the info/legend, add a small "keys" line in the World panel footer.
+
+For the foam ring geometry: (already covered above)
+
+For the ray geometry (manta). Parametric grid: i along span (u from -1 to 1), j along length (v from 0 to 1).
+```
+span(u,v): width profile
+x = u * wingSpan(v)
+z = (v - 0.45) * bodyLen
+y = thickness(v) * (1 - u*u)^0.6 * cos-ish + cephalic
+```
+Manta shape: wingSpan(v) = W * sin(pi * (1-v))^1.2 for v ∈ [0,1] where v=0 is the head, v=1 the tail. Let's define: v=0 head (front), v=1 tail. Wing span peaks at v≈0.35.
+```
+spanAt(v) = W * pow(sin(PI*pow(v,0.55)), 1.0)  // 0 at v=0 and v=1
+```
+Simpler: span = W * (1-v)^0.9 * sqrt(min(v/0.18,1)) — front taper fast, back taper slow. Let's do:
+```
+const front = smoothstep(0.0, 0.22, v);
+const back = Math.pow(1 - v, 0.85);
+span = W * front * back;
+```
+Thickness: y = T * (1 - (u*u)) * front bulge, top and bottom surfaces. To keep it simple, build a single sheet (the disc) with DoubleSide and a small thickness by extruding: build the top surface at +y and the bottom at -y, mirrored, joined at the rim. That's 2× the verts. Grid 24×16 → 384 verts per side. Fine, do top+bottom, plus the head/cephalic fins as two small cones, plus the tail as a tapered cylinder, plus 2 small "shoulder" bumps.
+
+Simpler and effective: build the disc as a single surface (DoubleSide) with a slight 3D curvature (cephalic lobes), and give it a "belly" by offsetting the bottom surface. I'll write a function that generates a closed-ish shape:
+
+Grid: NU=17 (u: -1..1), NV=25 (v: 0..1). For each (u,v):
+```
+const w = span(v);
+x = u*w;
+const edge = 1 - Math.abs(u);           // 0 at rim
+const thick = 0.16 * Math.pow(edge, 0.7) * (0.35 + 0.65*front) * (1-v*0.7);
+yTop = thick + camber(x,v) ;  // arch up in the middle
+yBot = -thick*0.75;
+```
+Then output vertices: for the top grid and the bottom grid, and index the rim.
+
+To reduce complexity, I'll generate a single grid with the y interpolating from top at the center to a sharp rim (like a leaf), and use DoubleSide. Rays are dark and stylized, so a leaf-like sheet reads perfectly as a manta. Add a separate body: a rounded "capsule" along the center (a scaled sphere) + a head + a tail. That's the classic low-poly manta. Good: sheet (DoubleSide, dark slate with a lighter underside via a two-tone shader using the normal's y sign) + a body ellipsoid + a tail (tapered, curved) + 2 cephalic fins + 2 gill ridges.
+
+The ray material: MeshStandardMaterial, dark charcoal-blue #2f4756 top, belly lighter. Use onBeforeCompile to tint based on the normal: `col = mix(belly, top, smoothstep(-0.1,0.35, vNormal.y))` — with DoubleSide, the back-face normal is flipped by Three (yes, `#include <normal_fragment_begin>` flips for backfaces). So the belly (seen from below) is lighter. 
+
+The undulation shader for the ray:
+```
+float ax = abs(position.x);
+float flap = sin(uTime*uFlapSpeed - ax*2.2 + position.z*0.4) * pow(ax, 1.6) * uFlapAmp;
+transformed.y += flap;
+// tail sway
+transformed.x += sin(uTime*uFlapSpeed*0.8 + position.z*1.6) * 0.09 * smoothstep(0.2, 1.0, -position.z);
+```
+Need the geometry oriented with the head at +z, the tail at -z, the span along x.
+
+Fish: geometry = a small elongated octahedron (a stretched Icosahedron? use a custom 6-vertex diamond: ConeGeometry(0.09, 0.4, 5) rotated + a tail fin (a tiny plane)). For instancing, one geometry per school: merge a cone (body) + a flat cone (tail) using BufferGeometryUtils.mergeGeometries (in addons). I'll import BufferGeometryUtils. Colors per instance via instanceColor.
+
+Kelp: a tapered plane strip (4 segments tall), 2-sided, with a sway shader. Instanced 60 with random rotations/scales.
+
+Seagrass patches near the seabed: instanced blades (like grass but longer, green).
+
+Underwater rocks: instanced icosahedron with vertex jitter (one geometry, random per-instance scale/rotation).
+
+OK, time to write. I'll aim for clean, organized, commented code.
+
+For the kayak path: a closed CatmullRomCurve3 with points around the island at radius ~9.5, avoiding the pier. Points: (11,0,2), (7,0,9), (-2,0,10.5), (-9.5,0,6), (-10.5,0,-3), (-4,0,-9.5), (5,0,-9), (10.5,0,-3) → closed. Dock point near the pier end (11.6, 0, 6.4): include a point (11.6,0,6.4) in the curve so the dock is on the path. Then uDock = the parameter of that point. CatmullRomCurve3 doesn't give the parameter of a point directly; I can find it by sampling: sample 400 points, find the closest to the dock → uDock. Good.
+
+Kayak y = level + 0.10 + bob; yaw = atan2 of the tangent; roll = sin(t)*0.06*wind.
+
+Rope from the cleat to the kayak: a Line (dashed?) — a TubeGeometry rebuilt each frame is expensive. Use a `THREE.Line` with 8 points updated each frame (a sagging curve). Cheap. Visible only when docked (fade opacity).
+
+The "Launch kayak" button label toggles to "Return kayak".
+
+Ray leap: button triggers; disabled during the jump (with a "…" state).
+
+Camera transitions: `flyTo(pos, target, dur)`.
+
+Now, the UI HTML. Let me draft:
+
+```html
+<div id="app">
+  <canvas id="scene"></canvas>
+  <div class="grain"></div>
+  <header class="brand">
+    <div class="mark">◈</div>
+    <div>
+      <h1>Tidehaven</h1>
+      <p class="sub">Island diorama №4 · tide, wind &amp; lamplight</p>
+    </div>
+  </header>
+  <nav class="cams">... camera buttons ...</nav>
+  <section class="panel" id="panel-world"> ... </section>
+  <section class="panel" id="panel-actions"> ... </section>
+  <section class="panel" id="panel-audio"> ... </section>
+  <div class="telemetry"> tide / wind / time / status </div>
+  <div id="loader"> ... </div>
+</div>
+```
+
+Layout: 
+- Top-left: brand.
+- Top-right: camera presets (vertical) + quality select.
+- Bottom-left: World panel (tide, wind, time, pause/reset).
+- Bottom-right: Actions panel (kayak, ray leap) + Audio panel below.
+- Bottom-center: telemetry strip.
+On mobile: brand top-left compact; panels become a bottom sheet stack, collapsed by default, toggled by a "Controls" FAB; camera presets become a horizontal row at the top.
+
+I'll implement collapsibility generically: each panel header has a button toggling `.is-collapsed` (max-height transition). On mobile, initialize collapsed except... all collapsed.
+
+Let me write CSS with a `@media (max-width: 900px)`.
+
+Now write everything. I'll be thorough. Let me produce the final file.
+
+One thing about the water surface plane size: the tank is 32 × 26 (x × z). The water plane must match exactly.
+
+The terrain grid plane: 32 × 26 too, at y from terrainHeight. Both aligned.
+
+The seabed plane at y = -5.5, size 32×26.
+
+Tank shell box: 32 × 26 wide, from -5.5 to level.
+
+The terrain edges at the tank boundary: the terrain mesh's edge vertices are at x=±16 exactly, coplanar with the shell walls → no z-fighting with the shell's far walls (perpendicular). The shell's far wall is at x=-16 (backface) and the terrain edge vertex is at x=-16 → the terrain's edge is exactly at the wall → fine.
+
+The water plane's edge at x=±16 is coplanar with the shell's side walls → the water surface's edge line coincides with the wall. No z-fighting (perpendicular). Good.
+
+The glass planes at z=+13, x=±16 exactly at the boundary; the water surface's edge is coplanar with them → the water plane's edge and the glass plane intersect at 90° → fine.
+
+The slices at z=15.85? No — the slices should be AT the cut face, i.e., at z = 13 - 0.15 = 12.85 (just inside the glass). And the glass at z=13.05 (just outside). Let me set: glass planes at the exact tank boundary (z=13, x=±16) and the slices 0.12 inside (z=12.88, x=15.88). Good.
+
+Now the plinth: 33.4 × 27.4, top at y=-5.5, bottom at y=-7.0. Plus a chamfer: add a second thinner box (34.4 × 28.4) from -7.0 to -7.4 in a darker tone (a base). Plus small brass corner feet? Keep 2 layers.
+
+Add a subtle "Tidehaven" nameplate on the plinth front? A CanvasTexture plane on the front of the plinth at y=-6.2, z=13.75 → visible in the iso view. Cute! Yes, add an engraved nameplate: a plane with a canvas texture (transparent bg, cream text "TIDEHAVEN" in Fraunces — the font may not be loaded in canvas... use `document.fonts.ready` before creating the texture, or use a generic serif). I'll create it after `document.fonts.ready` and set `texture.needsUpdate`. Simpler: use a bold serif fallback and it's fine. I'll do: create the canvas texture, and re-render it once fonts are ready.
+
+Let me now write the code for real. I'll write it linearly with sections.
+
+Also: performance of many onBeforeCompile materials — each unique shader program compiles. Count: terrain, seabed, sand-beach (same as terrain), ray, fish (3 schools share 1-2 materials), kelp, seagrass, grass, tree foliage, tree trunk, palm frond, copper, wood, dark wood, fabric, leaf, glass, slice, water, shell, foam, stars, sun, ripples, bubbles, droplets, gulls. ~25 programs. Fine.
+
+I'll share materials aggressively.
+
+Let me write the final code.
+
+For the wood material: MeshStandardMaterial with a subtle procedural stripe? Use a canvas texture generator for wood planks (stripes) — a small canvas 128×128 with stripes and noise, reused with different repeats. Yes, `makeWoodTexture(baseColor, streaks)` → CanvasTexture. Also a `makeNoiseTexture` for foam/grain. These add a lot of material richness cheaply. Let's do:
+- woodTex (warm cedar planks, stripes along x)
+- copperTex (subtle hammered patches → use as roughnessMap)
+- sandTex (fine grain noise → use as a bump-ish roughness map / multiply into color? For the terrain, vertex colors + a noise map as roughnessMap is enough.)
+- signTex (text)
+- nameplateTex
+
+Keep the texture count small: wood, copperRough, grain, sign, nameplate.
+
+Canvas texture generation: straightforward.
+
+Now writing. I'll produce the final answer with the complete file and a short intro.
+
+Let me make sure about `THREE.PlaneGeometry(w,h,seg,seg)` then `.rotateX(-Math.PI/2)` → the position attribute y is 0, x/z vary. For the terrain I set `pos.setY(i, h)`.
+
+Vertex colors: `geo.setAttribute('color', new THREE.BufferAttribute(colors,3))`.
+
+For the water plane, I need the terrain height at each vertex in the vertex shader → sample the texture in the vertex shader: `texture2D(uHeightTex, uv).r` — the plane's uv is available as `uv` in the vertex shader (with `<uv_vertex>` included in ShaderMaterial? For a raw ShaderMaterial I define attributes myself: `attribute vec2 uv;` — Three provides `uv` as a built-in attribute for ShaderMaterial (auto-bound). Yes, ShaderMaterial gets position/normal/uv attributes automatically declared? In Three, for ShaderMaterial, the built-in attributes position, normal, uv are automatically declared in the vertex shader prefix. Yes (the prefixVertex includes `attribute vec3 position; attribute vec3 normal; attribute vec2 uv;`). Good.
+
+For the foam ribbon, I need a custom attribute `aSide` → declare `attribute float aSide;` in my vertex shader (fine for ShaderMaterial).
+
+For the terrain's UV: PlaneGeometry uv goes 0..1 across the tank → matches the height texture mapping. 
+
+Let me write the water vertex shader:
+```glsl
+uniform float uTime, uWind, uLevel;
+uniform sampler2D uHeightTex;
+varying vec3 vWorld; varying vec3 vNorm; varying float vWave; varying float vDepth;
+float wsum(vec2 p, vec2 dir, float f, float a, float s, out vec3 dN){
+  float ph = dot(p, dir)*f + uTime*s;
+  dN.x += dir.x*f*a*cos(ph); dN.z += dir.y*f*a*cos(ph);
+  return sin(ph)*a;
+}
+void main(){
+  vec3 pos = position;
+  vec2 p = pos.xz;
+  float tH = texture2D(uHeightTex, uv).r;
+  float depth = uLevel - tH;
+  float sh = smoothstep(0.15, 1.8, depth);      // waves flatten in shallow water
+  float amp = (0.055 + 0.16*uWind) * sh;
+  vec3 dN = vec3(0.0);
+  float h = 0.0;
+  h += wsum(p, normalize(vec2(1.0,0.35)), 1.15, amp*1.0, 1.25, dN);
+  h += wsum(p, normalize(vec2(-0.4,1.0)), 1.7, amp*0.7, 1.6, dN);
+  h += wsum(p, normalize(vec2(0.7,-0.8)), 2.9, amp*0.35, 2.3, dN);
+  h += wsum(p, normalize(vec2(-1.0,-0.2)), 4.3, amp*0.18, 3.1, dN);
+  pos.y += h;
+  vWave = h; vDepth = depth;
+  vNorm = normalize(vec3(-dN.x, 1.0, -dN.z));
+  vec4 wp = modelMatrix * vec4(pos,1.0);
+  vWorld = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+```
+Note: the mesh's y position is 0 and the level is applied via uLevel in the fragment (for the depth) — the actual surface y = h (with the mesh at y=0) → the mesh's position.y must be set to the water level! Then vWorld.y = level + h. I'll set `waterMesh.position.y = level` in JS and use uLevel = level in the shader for depth. Good, and floating objects read `state.level`.
+
+The foam ribbon also needs the wave height at its position → replicate a simplified wave function in the foam shader (2 waves) with the same params, using world xz. Approximation is fine.
+
+Let me define a shared GLSL chunk string `WAVE_GLSL` used by both.
+
+Now, writing the final code. Also add `renderer.setAnimationLoop`.
+
+For the ray jump, the ray's base path: circle around the island at radius 8.6, y = -2.4 + sin(t*0.3)*0.6, angular speed 0.06 rad/s. Ray 1: radius 9.6, y -3.4, speed -0.045. Ray 2: radius 7.4, y -1.9, speed 0.07, ellipse. Ray 3: radius 10.4, y -4.2, speed 0.05. Keep within the tank: radius 10.4 in z (half 13) OK, in x (half 16) OK. Ellipse: x = cx + rx*cos, z = cz + rz*sin with rx ≤ 11, rz ≤ 9.5, plus offsets to avoid the island (the island's shore radius is ~5.5-9 → rays at radius 7.4 might intersect the island!). The island's shore radius R(θ) = 6.2+1.9+1.1+0.55 → up to 9.75 max. That's big. Let me reduce: R = 5.6 + 1.3*sin(a+0.4) + 0.8*sin(2a-1) + 0.4*sin(3a+2) → range ~3.1..8.1. Typical ~5.6±2.5. Rays should swim at radius ≥ 9 to stay in open water; the tank's z half is 13, so at radius 9-11 in the z direction there's only 2-4 units of clearance. Make the tank bigger: 38 × 30 (x half 19, z half 15). Then the water volume is bigger and the rays have room. The island's shore radius max ~8 → rays at radius 9.5-12.5 in x, 9.5-12 in z → clearance 3-5.5. OK, let's set the tank to 38 × 30 and the island shore radius base 5.4.
+
+Camera iso: distance ~40 to see a 38-wide tank. Position (30, 24, 30), target (0,0,0). FOV 38.
+
+Underwater camera: (-12, -2.8, 11) target (0,-3,0). Inside the tank (|x|<19, |z|<15) ✓.
+
+Cabin camera: (13, 5.5, 15) target (0, 1.6, 1).
+
+Seabed at y=-6.0 for more water depth (water 0 → depth 6). Tank from -6 to 4.
+
+Rays at y -2 to -4.5 → fine.
+
+Let me finalize dimensions:
+- TANK: X = 38 (x ∈ [-19,19]), Z = 30 (z ∈ [-15,15]), Y from -6 to 4.
+- Water level default 0, range -0.9..1.1.
+- Island: shore radius base 5.4, lobes up to ~7.8; terrain grid 38×30 with 150×120 segments → 18k verts, 36k tris. Acceptable. Use 132×104 → 13.9k verts.
+- Height texture: 192×152.
+- Pier: from the shore at ~θ=35° out to x=13.5.
+
+Pier layout: along direction d = normalize(0.86, 0.51) (θ=30.5°). Shore at r ≈ R(30.5°) ≈ 5.4 + 1.3*sin(30.5°+0.4rad)... let me just compute in JS at runtime: march outward from the cabin along the pier direction to find where the terrain height = 0.35, and start the pier there; end at r = 14.5. All computed at build time in JS. 
+
+Pier deck y = 1.05 (above the max tide 1.1? At the highest tide 1.1, the deck at 1.05 would be underwater. Set the deck y = 1.5. Ladder from the deck down to the water.
+
+Kayak docked at the pier end, at the water surface, offset to the side.
+
+Let me compute the pier start: I'll hardcode after estimating. R(a) with a = atan2(z,x). For the pier direction (0.866, 0.5): a = 0.5236 rad. R = 5.4 + 1.3*sin(0.5236+0.4) + 0.8*sin(1.0472-1.0) + 0.4*sin(1.5708+2.0)
+= 5.4 + 1.3*sin(0.9236)=1.3*0.7976=1.037 + 0.8*sin(0.0472)=0.0377 + 0.4*sin(3.5708)=0.4*(-0.4147)=-0.166 → R ≈ 6.31. The shoreline (h=0) is at r ≈ 6.31. So the pier starts at r=5.6 (on the beach, h>0) and ends at r=15.5 → x = 13.4, z = 7.75. Tank x half = 19 → fine. Kayak at (13.4, 0, 7.75) + offset.
+
+The kayak path circle radius ~11.5 around (0,0) → passes near (13.4, 7.75)? |(13.4,7.75)| = 15.45. So the path should pass through r=15.45 at that angle. Make the path an ellipse: rx=15.5, rz=12.5, centered at (0.5, 1.0), and include the dock point in the curve points so it's on the path. I'll construct the curve with the dock point explicitly as the first point, then a closed CatmullRom through ellipse points. 
+
+Path points: dock (13.4,0,7.75), (10,0,11.5), (2,0,12.8), (-8,0,11), (-14,0,4), (-13,0,-5), (-6,-9.8), (3,-11.5), (11,-8), (15.5,-2) → closed. Check |x| ≤ 15.5 < 19 ✓, |z| ≤ 12.8 < 15 ✓. Distance from the island (max shore radius 7.8) → the closest path point is at r ≈ 11.5-12 → clearance ~4. Good, the kayak circles the island.
+
+Rays: radius 9.5-12.5 → the kayak at 11.5-15.5 is above them, fine.
+
+Now the "island inside a tank" composition: the island (r ~7) in a 38×30 tank leaves a wide lagoon — good for rays and the kayak.
+
+Beach: the sand band from h=-0.3 to 0.9.
+
+Trees on the plateau (r < 4.5, h > 1.6).
+
+Let me write the tree positions manually for good composition:
+Conifers: (-5.5,-6.5), (-7.5,-1.5), (-3,-7.5), (2.5,-6), (-8.5,3), (5,-3.5) — check they're on land (h>1.2). I'll place them programmatically: sample random points, keep those with h>1.3 and slope<0.35, min distance 1.6, and near the island center. Deterministic RNG → stable. Plus the cabin clearing: exclude points within 4.5 of the cabin center.
+
+Palms: 3 on the beach side near (3.5, 4.5) with h between 0.6 and 1.4.
+
+Grass: sample points with h>1.0, slope<0.5 → 900 instances.
+
+Rocks above water: sample h between -0.5 and 2.5 → 60 instances.
+
+Underwater rocks: h between -5 and -0.5 → 45 instances.
+
+Kelp: h between -4.5 and -1 → 70.
+
+Seagrass: h between -3 and -0.8 → 120.
+
+OK. Writing the final code now. I'll include everything and keep comments meaningful.
+
+One more: the "Pause" should pause the world animations (time), and the button shows ⏸/▶. Reset restores defaults.
+
+Telemetry: tide (cm), wind (kn), time (Day/Sunset/Night), kayak (Docked/Sailing/Returning), ray (Idle/Leaping), FPS.
+
+Let me write it.
+
+Regarding `renderer.info` for FPS: compute from dt.
+
+Let me write the code in full now, carefully checking GLSL.
+
+GLSL noise (value noise):
+```glsl
+float hash21(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  float a = hash21(i), b = hash21(i+vec2(1,0)), c = hash21(i+vec2(0,1)), d = hash21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+float fbm2(vec2 p){ float s=0., a=0.5; for(int i=0;i<4;i++){ s += a*vnoise(p); p*=2.03; a*=0.5; } return s; }
+```
+
+Caustic GLSL (the classic):
+```glsl
+float caustic(vec2 p){
+  vec2 i = p; float c = 1.0; const float inten = 0.0045;
+  for (int n = 0; n < 4; n++){
+    float t = uTime * 0.28 * (1.0 - (3.5 / float(n+1)));
+    i = p + vec2(cos(t - i.x) + sin(t + i.y), sin(t - i.y) + cos(t + i.x));
+    c += 1.0/length(vec2(p.x / (sin(i.x+t)/inten), p.y / (cos(i.y+t)/inten)));
+  }
+  c /= 4.0; c = 1.17 - pow(c, 1.4);
+  return clamp(pow(abs(c), 9.0), 0.0, 1.5);
+}
+```
+Careful with division by zero → length could be 0 → inf. Add small epsilon: `p.x/(sin(i.x+t)/inten + 1e-5)`. It's the standard version; it works in practice. I'll add `+1e-5`.
+
+Now the code. Let me write it.
+
+Also: `material.customProgramCacheKey` — not needed since each material instance has its own program.
+
+For materials with onBeforeCompile, if I reuse the same material across meshes, fine.
+
+Let me write the helper:
+```js
+function shaderify(mat, {caustics=0, fog=1, sway=0, extra=null, defs={}} = {}){
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, {
+      uTime: U.time, uLevel: U.level, uCaustic: U.caustic,
+      uWaterDeep: U.waterDeep, uWaterShallow: U.waterShallow,
+      uWind: U.wind, uSway: U.sway
+    });
+    ...
+  };
+  return mat;
+}
+```
+Using shared uniform objects (U.time = {value:0}) so all materials update from one place. 
+
+Note: assigning the same uniform object into multiple shaders is fine.
+
+Injection code:
+```js
+shader.vertexShader = shader.vertexShader
+  .replace('#include <common>', `#include <common>
+    uniform float uTime; uniform float uWind; uniform float uSway;
+    varying vec3 vWPos;`)
+  .replace('#include <begin_vertex>', `#include <begin_vertex>
+    ${swayCode}
+    vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+shader.fragmentShader = shader.fragmentShader
+  .replace('#include <common>', `#include <common>
+    uniform float uTime; uniform float uLevel; uniform float uCaustic;
+    uniform vec3 uWaterDeep; uniform vec3 uWaterShallow;
+    varying vec3 vWPos;
+    ${causticGLSL}`)
+  .replace('#include <dithering_fragment>', `#include <dithering_fragment>
+    ${underwaterCode}
+    ${causticCode}`);
+```
+`#include <dithering_fragment>` exists in MeshStandardMaterial's fragment shader (yes, it's the last include). Good.
+
+In the fragment, gl_FragColor is used in r160 (not `pc_fragColor`)? In r160, the shader chunk uses `gl_FragColor` for WebGL1/2 compatibility (Three defines `gl_FragColor` in the GLSL3 conversion? For WebGL2, Three uses GLSL1 shaders with a prefix that defines `out highp vec4 pc_fragColor; #define gl_FragColor pc_fragColor`). Yes, Three's WebGL2 prefix includes `#define gl_FragColor pc_fragColor`. So writing `gl_FragColor.rgb += ...` works. Good.
+
+Now the sway code for grass:
+```glsl
+#ifdef USE_INSTANCING
+  vec4 iw = instanceMatrix * vec4(position, 1.0);
+  float ph = iw.x * 0.9 + iw.z * 1.1;
+  float k = pow(clamp(position.y / 0.55, 0.0, 1.0), 2.0);
+  float s = sin(uTime*2.1 + ph) * 0.5 + sin(uTime*3.7 + ph*1.7) * 0.25;
+  transformed.x += s * k * uSway * 0.18;
+  transformed.z += cos(uTime*1.7 + ph) * k * uSway * 0.12;
+#endif
+```
+For trees (non-instanced, per-mesh): use the object's world position for the phase → pass via a uniform? Use `modelMatrix[3].xyz` in the shader: `float ph = modelMatrix[3].x*0.6 + modelMatrix[3].z*0.8;` — available in the vertex shader. 
+
+For the foliage sway, k = 1 (whole canopy moves) with the trunk bending: for the trunk geometry, k = (position.y/height)^2.
+
+I'll write a `makeSwayCode(type)` helper.
+
+Palm fronds: a group that rotates slightly + the frond tips bend. Use the same sway with k based on distance from the trunk axis: k = clamp((length(position.xz))/1.6,0,1)^1.5 for the frond geometry in local space where the frond extends along +x from the origin.
+
+OK, writing now for real. I'll produce the final file.
+
+Final check on the audio scheduler: use `setInterval(schedule, 200)` with a 0.6s lookahead.
+
+Chords (Am pentatonic-ish, cozy): 
+```
+const CHORDS = [
+  [220.00, 261.63, 329.63, 392.00],  // Am add? A3 C4 E4 G4
+  [174.61, 220.00, 261.63, 349.23],  // F A C F
+  [196.00, 246.94, 293.66, 392.00],  // G B D G
+  [164.81, 220.00, 261.63, 329.63],  // E A C E
+];
+```
+Pad: for each chord (10s), play 4 sine/triangle voices with slow attack (3s) and release (4s), detuned ±3 cents, through a lowpass at 900Hz, gain 0.05 each, into the reverb.
+Melody: pentatonic scale from the chord tones, one note every 1.4-2.4s, randomly, with a sine + a soft attack, decay 1.2s, gain 0.06, through the delay.
+Bass: a sine at chord[0]/2, 10s, gain 0.05.
+Occasional "water drop" bell: a high sine with a fast decay.
+
+Good.
+
+Splash SFX: noise burst 0.5s through a bandpass sweeping 1800→300, gain 0.35, plus a lowpass thud.
+Wood SFX: a triangle at 180Hz with a 0.08s decay + noise click.
+UI click: a sine at 880, 0.05s decay, gain 0.05.
+
+Master gain from the volume slider (0..1, default 0.7). Music gain 0.9 with the toggle ramping to 0.
+
+Now write.
+
+Regarding the `#loader` overlay: show the title, subtitle, a loading progress bar (fake progress tied to build steps), then the "Enter Tidehaven" button. Since the scene builds synchronously, I'll show the overlay, build, then reveal the button.
+
+Let me write the code.
+
+I'll now write the final answer. Length is large; that's expected.
+
+One more consideration: `THREE.CapsuleGeometry` exists in r160 ✓.
+
+For the deck planks instanced: DeckGeometry = BoxGeometry(1, 0.08, 0.28) scaled per instance.
+
+Let me write the pier: 
+```js
+function buildPier(){
+  const g = new THREE.Group();
+  const dir = new THREE.Vector2(0.866, 0.5);
+  const start = 5.2, end = 15.2, w = 2.0, deckY = 1.5;
+  // planks along the pier
+  const n = Math.round((end-start)/0.34);
+  for (i) { const r = start + i*0.34; center = dir*r; plank box (w, 0.09, 0.3) rotated to face dir }
+  // pilings: 2 per 2m, cylinders from deck to the terrain/seabed
+  // railing on the far side, posts + top rail
+  // lanterns at the end + mid
+  // ladder at the end, going down into the water
+  // cleats, coil of rope, barrel, crate
+}
+```
+Rotation: the plank's long axis is along the pier's perpendicular. If the pier direction is d=(0.866,0.5), the angle = atan2(d.y, d.x) = 30°. The planks run perpendicular: rotation.y = -angle (Three's y-rotation maps +x toward -z). I'll set the group's rotation.y = -atan2(dir.y, dir.x) and build everything in local space along +x. That's much easier: build the pier in a local frame where it extends along +x, then rotate the group by -atan2(dir.y, dir.x) and position it at the origin. 
+
+Same for the kayak's dock position: compute in world via the group transform. I'll compute the dock world position manually: dockR = 13.6, plus a lateral offset of 1.4 in the perpendicular direction → world = (dir*dockR) + perp*1.4.
+
+The ladder at the pier end: at r = end, on the side. World position for the kayak: fine.
+
+Let me define the pier group rotation: `pierGroup.rotation.y = -Math.atan2(dir.y, dir.x)` — with a rotation.y of θ, the local +x axis maps to world (cos θ, 0, -sin θ). We want local +x → world (0.866, 0, 0.5) → cos θ = 0.866, -sin θ = 0.5 → θ = -30° = -0.5236. And -atan2(0.5, 0.866) = -0.5236 ✓.
+
+Good.
+
+The cabin: build in a local frame, rotate by the desired yaw.
+
+Let me write the code now. Final answer time. I'll keep the code organized with section banners.
+
+Also handle: `window.addEventListener('resize')` and `orientationchange`.
+
+For the pixel ratio: `Math.min(devicePixelRatio, cap)`.
+
+Let me write out the HTML/CSS/JS.
+
+CSS details for the range inputs:
+```css
+input[type=range]{ -webkit-appearance:none; appearance:none; width:100%; height:22px; background:transparent; }
+input[type=range]::-webkit-slider-runnable-track{ height:4px; border-radius:99px; background:linear-gradient(90deg, var(--sea) var(--fill,50%), rgba(255,255,255,.14) var(--fill,50%)); }
+input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:14px;height:14px;border-radius:50%;background:var(--sand); border:2px solid #0d1e22; margin-top:-5px; box-shadow:0 0 0 3px rgba(127,214,196,.18); transition:transform .15s; }
+input[type=range]:hover::-webkit-slider-thumb{ transform:scale(1.15); }
+input[type=range]::-moz-range-track{...}
+```
+Update `--fill` on input.
+
+Time-of-day segmented control: 3 buttons with a sliding indicator (a `.seg-ind` positioned via a CSS var). Nice micro-interaction.
+
+OK writing.
+
+For the telemetry strip, place it bottom-center on desktop, hidden on small screens (or moved).
+
+Let me finalize the panel placement:
+- `.panel.world` bottom-left
+- `.panel.actions` bottom-right (contains kayak + ray leap)
+- `.panel.audio` bottom-right above actions? Stack them in a right column: `.dock.right { display:flex; flex-direction:column; gap:12px; align-items:flex-end; }` containing actions + audio.
+- `.dock.left` contains the world panel.
+- Top-right: camera rail + quality.
+- Bottom-center: telemetry.
+
+On mobile: `.dock.left, .dock.right` become a single bottom sheet: `position:fixed; left:8px; right:8px; bottom:8px; flex-direction:column;` with panels collapsed by default and a scrollable container `max-height:46vh; overflow:auto`. The camera rail becomes a horizontal row under the header. The telemetry hides.
+
+I'll implement the mobile layout by moving the docks into a single `#sheet` container? CSS-only: make `.dock.left` and `.dock.right` both `position:static` inside a flex container... They're separate elements. Simplest: on mobile, `.dock.left{left:8px;right:8px;bottom:auto;top:64px}` and `.dock.right{left:8px;right:8px;bottom:8px;top:auto}`. Panels stack, collapsible. The camera rail goes to the top-right, horizontal, wrapping. Telemetry hidden. That works with pure CSS.
+
+Good. Writing the final answer now.
+
+I need to double check the InstancedMesh + onBeforeCompile + `USE_INSTANCING` define: Three defines `USE_INSTANCING` for InstancedMesh, and `#ifdef USE_INSTANCING` works in the vertex shader. ✓
+
+For the fish InstancedMesh, I set instanceColor via `mesh.setColorAt(i, color)` → requires `material.vertexColors`? No: instanceColor works automatically when set (Three defines USE_INSTANCING_COLOR). ✓
+
+Let me write.
+
+Also: `THREE.Color` and color management: `THREE.ColorManagement.enabled = true` (default). Colors set with hex are treated as sRGB → converted to linear. Good.
+
+Final code writing — go.
+
+For the sky sphere: SphereGeometry(400, 32, 16) with a ShaderMaterial (side: BackSide, depthWrite: false, fog: false). Attach it to the scene; the camera's far plane must be > 400 → far = 900.
+
+Stars: a Points at radius 380.
+
+Sun sprite at distance 300.
+
+Fog: FogExp2 density ~0.008 at day, 0.014 at night. With a sky sphere at 400 and fog, the sky material must have fog:false ✓. The terrain at 20 units from the camera with density 0.008 → factor 1-exp(-(0.008*20)^2)= tiny. FogExp2: f = 1 - exp(-(d*density)^2) → at d=40, density 0.01: (0.4)^2=0.16 → 15%. Subtle. Good.
+
+Writing now — final.
+
+Regarding the water surface and the "camera inside the water" for the underwater view: the water surface mesh is transparent with depthWrite false; the camera is below → it renders the underside ✓.
+
+Also, when the camera is underwater, the foam ribbon and the surface are visible from below ✓.
+
+Underwater camera fog: add a scene-level "underwater haze"? The per-object underwater fog handles it. Also set the renderer's clear color? The sky is behind. From underwater looking at the far walls: the shell covers them ✓.
+
+Let me write!
+
+Final detail: the `uCamInside` uniform for the glass/slice materials, updated each frame.
+
+And `uCamPos` for the water/shell shaders.
+
+Writing the answer now.
