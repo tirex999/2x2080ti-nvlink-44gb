@@ -11,7 +11,8 @@
 > и работают прямо в браузере**.
 >
 > - [**Какие модели работают, а какие нет**](https://tirex999.github.io/2x2080ti-nvlink-44gb/models.html) — с замерами и причинами отказа
-> - [**Хомяки: как справились разные модели**](https://tirex999.github.io/2x2080ti-nvlink-44gb/hamsters/) — каждая сцена открывается, рядом лежит рассуждение модели
+> - [**Галерея: пять задач, как справились разные модели**](https://tirex999.github.io/2x2080ti-nvlink-44gb/hamsters/) — хомяки, аквариум, воксельный мир, хомяки-физика, Tidehaven; каждая сцена открывается, рядом лежит рассуждение модели
+> - [**Flash-Next 125B на своём движке DACAN**](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html) · [Своё квантование из BF16](https://tirex999.github.io/2x2080ti-nvlink-44gb/quantize.html)
 > - [Купил карты — что дальше](https://tirex999.github.io/2x2080ti-nvlink-44gb/start-here.html) · [Замеры](https://tirex999.github.io/2x2080ti-nvlink-44gb/results.html) · [Грабли](https://tirex999.github.io/2x2080ti-nvlink-44gb/pitfalls.html) · [Форки](https://tirex999.github.io/2x2080ti-nvlink-44gb/forks.html)
 
 Здесь только то, что **замерено на живом стенде**, с методикой и датами — не пересказ советов из интернета. Где вывод оказался неверным, это написано прямо, вместе с тем, что его опровергло.
@@ -350,7 +351,7 @@ Hermes подмешивает `extra_body` провайдера в каждый 
 <!-- dacan-2809 -->
 ### Свой движок: DACAN (Дацан) — втрое быстрее
 
-Лучшее, что мы получили на этой модели, — наш форк Strata, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN) (веса — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN),
+Лучшее, что мы получили на этой модели, — наш движок DACAN, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN) (веса — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN),
 смесь **NVFP4 + Q8 (DACAN)**: маршрутные эксперты NVFP4, плотная часть и таблица n-грамм Q8_0), собранный под одну модель и эту машину: две карты, два сокета Ice Lake с AVX-512 VNNI, черновики MTP.
 
 | | |

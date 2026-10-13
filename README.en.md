@@ -11,7 +11,8 @@ How to make large models run on two RTX 2080 Ti modded to 22 GB.
 > documents in [`docs/`](docs/) are in Russian.
 >
 > - [**Which models work and which do not**](https://tirex999.github.io/2x2080ti-nvlink-44gb/models.html) — with measurements and the reasons for failure
-> - [**Hamsters: how different models coped**](https://tirex999.github.io/2x2080ti-nvlink-44gb/hamsters/) — every scene opens, the model's reasoning lies next to it
+> - [**Gallery: five tasks, how different models coped**](https://tirex999.github.io/2x2080ti-nvlink-44gb/hamsters/) — hamsters, aquarium, voxel world, hamster physics, Tidehaven; every scene opens, the model's reasoning lies next to it
+> - [**Flash-Next 125B on our own engine DACAN**](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html) · [Quantizing from BF16 yourself](https://tirex999.github.io/2x2080ti-nvlink-44gb/quantize.html)
 > - [Bought the cards — what next](https://tirex999.github.io/2x2080ti-nvlink-44gb/start-here.html) · [Measurements](https://tirex999.github.io/2x2080ti-nvlink-44gb/results.html) · [Pitfalls](https://tirex999.github.io/2x2080ti-nvlink-44gb/pitfalls.html) · [Forks](https://tirex999.github.io/2x2080ti-nvlink-44gb/forks.html)
 
 Only what was **measured on a live rig** goes here, with the method and the dates — not a retelling of advice from
@@ -360,7 +361,7 @@ is open on v0.28.0) nor in the 2080Ti fork. It fails while parsing `config.json`
 
 ### Our own engine: DACAN — three times faster
 
-The best we got on this model is our fork of Strata, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN)
+The best we got on this model is our own engine DACAN, [github.com/tirex999/DACAN](https://github.com/tirex999/DACAN)
 (weights — [huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN),
 the **NVFP4 + Q8 (DACAN)** mix: NVFP4 routed experts, the dense part and the n-gram table in Q8_0), built for one model
 and this machine: two cards, two Ice Lake sockets with AVX-512 VNNI, MTP drafts.

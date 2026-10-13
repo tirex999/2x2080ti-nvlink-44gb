@@ -356,4 +356,4 @@ Qwen3.8-Flash-Next (125B MoE, 512 экспертов) в 44 ГБ карт не �
 - [`docs/forks.md`](forks.md) — какие бывают форки, какой брать, как запускать
 - [`docs/pitfalls.md`](pitfalls.md) — грабли, каждая оплачена нашим временем
 - [`docs/results.md`](results.md) — все замеры с методикой
-- [`docs/data/`](data/) — сырые данные, чтобы пересчитать самому
+- [`docs/data/`](https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/docs/data) — сырые данные, чтобы пересчитать самому

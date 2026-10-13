@@ -119,7 +119,7 @@ RestartSec=30
 KillMode=mixed
 ```
 
-Готовый файл — [`../vllm/qwen38-02x-production/`](../vllm/qwen38-02x-production/).
+Готовый файл — [`vllm/qwen38-02x-production/`](https://github.com/tirex999/2x2080ti-nvlink-44gb/tree/main/vllm/qwen38-02x-production).
 
 ### 3. Переменные окружения бьют всё остальное
 
