@@ -1,5 +1,7 @@
 # 2×2080Ti + NVLink (44 GB)
 
+[DACAN 0.43 for Linux x86-64 and RTX 2080 Ti](https://github.com/tirex999/DACAN/releases/tag/v0.43). The conversation cache now has a default lifetime of 480 minutes. The release includes the engine binary and its checksum.
+
 ## 8 November 2026 — DACAN build 6
 
 Four simultaneous clients reached **90.86 / 96.18 aggregate API tokens/s** in two Russian runs (512 output tokens each), approximately 23–25 tokens/s per client. Hardware: 2×22 GiB RTX 2080 Ti with NVLink, 2×Xeon 8358, 16 DDR4-2666 channels. These are short-prompt results including prompt admission. [Method, repeats and scope](https://tirex999.github.io/2x2080ti-nvlink-44gb/multiuser-20261108.html) · [Windows / Linux build 6](https://github.com/tirex999/DACAN/releases/tag/v0.1.42-build6).
